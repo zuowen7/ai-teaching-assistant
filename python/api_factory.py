@@ -660,6 +660,9 @@ def create_app(*, cloud_only: bool = False) -> FastAPI:
         state_translate = (
             app.state._state_translate if hasattr(app.state, "_state_translate") else {}
         )
+        state_literature = (
+            app.state._state_literature if hasattr(app.state, "_state_literature") else {}
+        )
         startup_editor = state_editor.get("startup")
         if startup_editor:
             await _run_lifecycle(startup_editor)
@@ -682,28 +685,36 @@ def create_app(*, cloud_only: bool = False) -> FastAPI:
                     )
         except Exception as e:
             logger.error("config validation failed: %s", e)
-        yield
-        # shutdown
-        state_agent = getattr(app.state, "_state_agent", {})
-        state_editor2 = getattr(app.state, "_state_editor", {})
-        shutdown_fn = state_agent.get("shutdown")
-        if shutdown_fn:
-            try:
-                await shutdown_fn()
-            except Exception:
-                logger.exception("Agent shutdown failed")
-        shutdown_editor = state_editor2.get("shutdown")
-        if shutdown_editor:
-            try:
-                await _run_lifecycle(shutdown_editor)
-            except Exception:
-                logger.exception("Editor shutdown failed")
-        shutdown_translate = state_translate.get("shutdown")
-        if shutdown_translate:
-            try:
-                await _run_lifecycle(shutdown_translate)
-            except Exception:
-                logger.exception("Translate shutdown failed")
+        try:
+            yield
+        finally:
+            # shutdown
+            state_agent = getattr(app.state, "_state_agent", {})
+            state_editor2 = getattr(app.state, "_state_editor", {})
+            shutdown_fn = state_agent.get("shutdown")
+            if shutdown_fn:
+                try:
+                    await shutdown_fn()
+                except Exception:
+                    logger.exception("Agent shutdown failed")
+            shutdown_editor = state_editor2.get("shutdown")
+            if shutdown_editor:
+                try:
+                    await _run_lifecycle(shutdown_editor)
+                except Exception:
+                    logger.exception("Editor shutdown failed")
+            shutdown_translate = state_translate.get("shutdown")
+            if shutdown_translate:
+                try:
+                    await _run_lifecycle(shutdown_translate)
+                except Exception:
+                    logger.exception("Translate shutdown failed")
+            shutdown_literature = state_literature.get("shutdown")
+            if shutdown_literature:
+                try:
+                    await _run_lifecycle(shutdown_literature)
+                except Exception:
+                    logger.exception("Literature shutdown failed")
 
     app = FastAPI(title=_app_title, version=__version__, lifespan=_lifespan)
 
@@ -713,6 +724,7 @@ def create_app(*, cloud_only: bool = False) -> FastAPI:
         return JSONResponse(
             status_code=exc.status_code,
             content={"detail": exc.detail, "trace_id": trace_id},
+            headers=exc.headers,
         )
 
     @app.exception_handler(Exception)
@@ -957,6 +969,18 @@ def create_app(*, cloud_only: bool = False) -> FastAPI:
         data_root=data_root,
     )
 
+    from routers.literature import ProjectSourceManifestStore, register_literature_routes
+    from src.literature.providers.arxiv import ArxivProvider
+    from src.literature.service import LiteratureService
+
+    state_literature = register_literature_routes(
+        app,
+        service=LiteratureService(
+            providers=[ArxivProvider()],
+            project_store=ProjectSourceManifestStore(),
+        ),
+    )
+
     # ── Debug / observability endpoints ─────────────────────────────────────
 
     @app.get("/api/logs")
@@ -976,5 +1000,6 @@ def create_app(*, cloud_only: bool = False) -> FastAPI:
     app.state._state_agent = state_agent
     app.state._state_editor = state_editor
     app.state._state_translate = state_translate
+    app.state._state_literature = state_literature
 
     return app

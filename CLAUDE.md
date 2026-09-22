@@ -4,6 +4,10 @@
 
 Scholar Assistant — privacy-first academic AI writing assistant (v0.5.2). Core paradigm: **"Claude Code for papers"** — Agent directly reads/writes workspace files (PDF/drafts/bib/data). Translates PDFs (parse -> clean -> chunk -> translate -> format via SSE), AI editor (Monaco + Agent chat with workspace file tools), exports to LaTeX/Word. Runs as Tauri desktop app or standalone Python API. Bilingual UI (zh-CN / en-US).
 
+## Current Thesis PoC Contract
+
+For thesis planning or implementation after 2026-09-20, `docs/literature-research-poc-plan.md` is the single source of truth. `docs/development-direction.md` and `docs/audit-verification.md` are historical only; do not derive current scope or priorities from them. Update the contract and its decision log before deviating from it.
+
 ## Build Commands
 
 ```bash

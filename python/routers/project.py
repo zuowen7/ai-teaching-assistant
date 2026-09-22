@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import tempfile
 import uuid
+from copy import deepcopy
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
@@ -18,7 +19,7 @@ from typing import Any, Literal
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel, Field
 
-from src.utils.atomic_io import atomic_write_json
+from src.utils.atomic_io import atomic_write_json, locked_path
 
 logger = logging.getLogger(__name__)
 
@@ -279,12 +280,25 @@ def _add_recent(data_root: Path, project_path: str, name: str, template_id: str)
 
 
 def _source_manifest(project_path: Path) -> Path:
-    return project_path / ".yanmo" / "sources.json"
+    return _project_internal_path(project_path, ".yanmo", "sources.json")
+
+
+def _project_internal_path(project_path: Path, *parts: str) -> Path:
+    """Resolve a project-owned path and reject symlink/junction escapes."""
+
+    project = project_path.resolve()
+    target = project.joinpath(*parts).resolve(strict=False)
+    try:
+        target.relative_to(project)
+    except ValueError:
+        raise HTTPException(403, "项目内部路径指向项目目录之外")
+    return target
 
 
 def _require_project(project_path: str) -> Path:
     resolved = _validate_project_path(project_path)
-    if not (resolved / ".yanmo" / "project.json").is_file():
+    metadata_path = _project_internal_path(resolved, ".yanmo", "project.json")
+    if not metadata_path.is_file():
         raise HTTPException(404, f"项目元数据不存在: {project_path}")
     return resolved
 
@@ -296,37 +310,61 @@ def _read_sources(project_path: Path) -> list[dict[str, Any]]:
     try:
         payload = json.loads(manifest.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError) as exc:
-        raise HTTPException(500, f"读取项目文献清单失败: {exc}")
-    sources = payload.get("sources", []) if isinstance(payload, dict) else []
-    return [item for item in sources if isinstance(item, dict)]
+        raise HTTPException(500, "读取项目文献清单失败") from exc
+    if not isinstance(payload, dict):
+        raise HTTPException(500, "项目文献清单结构无效")
+    version = payload.get("version")
+    if type(version) is not int or version != 1:
+        raise HTTPException(409, f"不支持的项目文献清单版本: {version!r}")
+    sources = payload.get("sources")
+    if not isinstance(sources, list) or any(not isinstance(item, dict) for item in sources):
+        raise HTTPException(500, "项目文献清单结构无效")
+    return sources
 
 
 def _upsert_source(req: ProjectSourceUpsert) -> dict[str, Any]:
     project_path = _require_project(req.project_path)
-    sources = _read_sources(project_path)
-    now = datetime.now(UTC).isoformat()
-    source_id = req.source_id or f"src_{uuid.uuid4().hex[:16]}"
-    existing = next((item for item in sources if item.get("id") == source_id), None)
-    created_at = existing.get("created_at", now) if existing else now
-    source = {
-        "id": source_id,
-        "title": req.title.strip(),
-        "original_path": req.original_path,
-        "translated_path": req.translated_path,
-        "translation_task_id": req.translation_task_id,
-        "rag_status": req.rag_status,
-        "reading_status": req.reading_status,
-        "cited": req.cited,
-        "metadata": req.metadata,
-        "created_at": created_at,
-        "updated_at": now,
-    }
-    if existing:
-        sources[sources.index(existing)] = source
-    else:
-        sources.insert(0, source)
-    atomic_write_json(_source_manifest(project_path), {"version": 1, "sources": sources})
-    return source
+    manifest = _source_manifest(project_path)
+    with locked_path(manifest):
+        sources = _read_sources(project_path)
+        now = datetime.now(UTC).isoformat()
+        source_id = req.source_id or f"src_{uuid.uuid4().hex[:16]}"
+        existing = next((item for item in sources if item.get("id") == source_id), None)
+        requested_metadata = deepcopy(req.metadata)
+        existing_metadata = existing.get("metadata") if existing else None
+        metadata = deepcopy(existing_metadata) if isinstance(existing_metadata, dict) else {}
+        metadata.update(requested_metadata)
+        requested_literature = requested_metadata.get("literature")
+        existing_literature = (
+            existing_metadata.get("literature") if isinstance(existing_metadata, dict) else None
+        )
+        if existing_literature is None:
+            if "literature" in requested_metadata:
+                raise HTTPException(409, "literature metadata 只能由文献服务维护")
+        else:
+            if "literature" in requested_metadata and requested_literature != existing_literature:
+                raise HTTPException(409, "literature metadata 只能由文献服务维护")
+            metadata["literature"] = deepcopy(existing_literature)
+        created_at = existing.get("created_at", now) if existing else now
+        source = {
+            "id": source_id,
+            "title": req.title.strip(),
+            "original_path": req.original_path,
+            "translated_path": req.translated_path,
+            "translation_task_id": req.translation_task_id,
+            "rag_status": req.rag_status,
+            "reading_status": req.reading_status,
+            "cited": req.cited,
+            "metadata": metadata,
+            "created_at": created_at,
+            "updated_at": now,
+        }
+        if existing:
+            sources[sources.index(existing)] = source
+        else:
+            sources.insert(0, source)
+        atomic_write_json(manifest, {"version": 1, "sources": sources})
+        return source
 
 
 def _find_source(project_path: Path, source_id: str) -> dict[str, Any]:
@@ -967,7 +1005,7 @@ def register_project(
         if not content:
             raise HTTPException(422, "文献文件为空")
 
-        references = project / "references"
+        references = _project_internal_path(project, "references")
         references.mkdir(parents=True, exist_ok=True)
         target = references / original_name
         if target.exists():
@@ -1000,28 +1038,31 @@ def register_project(
             metadata["parse_error"] = str(exc.detail)
 
         try:
-            existing = _find_source(project, source_id) if source_id else None
-            return _upsert_source(
-                ProjectSourceUpsert(
-                    project_path=str(project),
-                    source_id=source_id,
-                    title=str(existing["title"]) if existing else Path(original_name).stem,
-                    original_path=str(target),
-                    translated_path=existing.get("translated_path") if existing else None,
-                    translation_task_id=(existing.get("translation_task_id") if existing else None),
-                    rag_status=existing.get("rag_status", "unavailable")
-                    if existing
-                    else "unavailable",
-                    reading_status=existing.get("reading_status", "unread")
-                    if existing
-                    else "unread",
-                    cited=bool(existing.get("cited", False)) if existing else False,
-                    metadata={
-                        **(dict(existing.get("metadata") or {}) if existing else {}),
-                        **metadata,
-                    },
+            with locked_path(_source_manifest(project)):
+                existing = _find_source(project, source_id) if source_id else None
+                return _upsert_source(
+                    ProjectSourceUpsert(
+                        project_path=str(project),
+                        source_id=source_id,
+                        title=str(existing["title"]) if existing else Path(original_name).stem,
+                        original_path=str(target),
+                        translated_path=existing.get("translated_path") if existing else None,
+                        translation_task_id=(
+                            existing.get("translation_task_id") if existing else None
+                        ),
+                        rag_status=existing.get("rag_status", "unavailable")
+                        if existing
+                        else "unavailable",
+                        reading_status=existing.get("reading_status", "unread")
+                        if existing
+                        else "unread",
+                        cited=bool(existing.get("cited", False)) if existing else False,
+                        metadata={
+                            **(dict(existing.get("metadata") or {}) if existing else {}),
+                            **metadata,
+                        },
+                    )
                 )
-            )
         except Exception:
             with contextlib.suppress(OSError):
                 target.unlink()
@@ -1033,34 +1074,35 @@ def register_project(
         req: ProjectSourceTranslationAttach,
     ):
         project = _require_project(req.project_path)
-        source = _find_source(project, source_id)
-        try:
-            output = Path(req.output_path).resolve(strict=True)
-        except (OSError, RuntimeError):
-            raise HTTPException(404, "翻译输出文件不存在")
-        allowed_roots = [project.resolve(), runtime_dir.resolve()]
-        if not any(output == root or root in output.parents for root in allowed_roots):
-            raise HTTPException(403, "翻译输出不在项目或研墨运行目录内")
-        translations = project / "references" / "translations"
-        translations.mkdir(parents=True, exist_ok=True)
-        original_stem = Path(str(source.get("original_path") or source["title"])).stem
-        target = translations / f"{original_stem}.translated{output.suffix or '.md'}"
-        if output != target:
-            shutil.copy2(output, target)
-        return _upsert_source(
-            ProjectSourceUpsert(
-                project_path=str(project),
-                source_id=source_id,
-                title=str(source["title"]),
-                original_path=source.get("original_path"),
-                translated_path=str(target),
-                translation_task_id=req.task_id,
-                rag_status=req.rag_status,
-                reading_status=source.get("reading_status", "unread"),
-                cited=bool(source.get("cited", False)),
-                metadata=dict(source.get("metadata") or {}),
+        with locked_path(_source_manifest(project)):
+            source = _find_source(project, source_id)
+            try:
+                output = Path(req.output_path).resolve(strict=True)
+            except (OSError, RuntimeError):
+                raise HTTPException(404, "翻译输出文件不存在")
+            allowed_roots = [project.resolve(), runtime_dir.resolve()]
+            if not any(output == root or root in output.parents for root in allowed_roots):
+                raise HTTPException(403, "翻译输出不在项目或研墨运行目录内")
+            translations = _project_internal_path(project, "references", "translations")
+            translations.mkdir(parents=True, exist_ok=True)
+            original_stem = Path(str(source.get("original_path") or source["title"])).stem
+            target = translations / f"{original_stem}.translated{output.suffix or '.md'}"
+            if output != target:
+                shutil.copy2(output, target)
+            return _upsert_source(
+                ProjectSourceUpsert(
+                    project_path=str(project),
+                    source_id=source_id,
+                    title=str(source["title"]),
+                    original_path=source.get("original_path"),
+                    translated_path=str(target),
+                    translation_task_id=req.task_id,
+                    rag_status=req.rag_status,
+                    reading_status=source.get("reading_status", "unread"),
+                    cited=bool(source.get("cited", False)),
+                    metadata=dict(source.get("metadata") or {}),
+                )
             )
-        )
 
     @app.get("/api/project/sources/{source_id}/content")
     def read_project_source(
@@ -1088,24 +1130,26 @@ def register_project(
         delete_file: bool = False,
     ):
         project = _require_project(project_path)
-        sources = _read_sources(project)
-        source = next((item for item in sources if item.get("id") == source_id), None)
-        if source is None:
-            raise HTTPException(404, f"项目文献不存在: {source_id}")
-        if delete_file and source.get("original_path"):
-            attachment = _resolve_source_attachment(project, source)
-            managed_root = (project / "references").resolve()
-            try:
-                attachment.relative_to(managed_root)
-            except ValueError:
-                raise HTTPException(403, "只能删除项目 references 目录中的托管附件")
-            attachment.unlink()
-        remaining = [item for item in sources if item.get("id") != source_id]
-        atomic_write_json(
-            _source_manifest(project),
-            {"version": 1, "sources": remaining},
-        )
-        return {"status": "ok", "deleted": source_id}
+        manifest = _source_manifest(project)
+        with locked_path(manifest):
+            sources = _read_sources(project)
+            source = next((item for item in sources if item.get("id") == source_id), None)
+            if source is None:
+                raise HTTPException(404, f"项目文献不存在: {source_id}")
+            if delete_file and source.get("original_path"):
+                attachment = _resolve_source_attachment(project, source)
+                managed_root = (project / "references").resolve()
+                try:
+                    attachment.relative_to(managed_root)
+                except ValueError:
+                    raise HTTPException(403, "只能删除项目 references 目录中的托管附件")
+                attachment.unlink()
+            remaining = [item for item in sources if item.get("id") != source_id]
+            atomic_write_json(
+                manifest,
+                {"version": 1, "sources": remaining},
+            )
+            return {"status": "ok", "deleted": source_id}
 
     @app.get("/api/project/exports")
     def list_project_exports(project_path: str):
