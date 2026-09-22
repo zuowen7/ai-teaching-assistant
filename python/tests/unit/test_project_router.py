@@ -158,6 +158,41 @@ class TestProjectSources:
         )
         assert response.status_code == 404
 
+    def test_import_rejects_references_link_outside_project(
+        self,
+        client,
+        location: Path,
+        tmp_path: Path,
+    ):
+        project_path = self._create_project(client, location)
+        references = project_path / "references"
+        outside = tmp_path / "outside-references"
+        outside.mkdir()
+        if references.exists():
+            references.rmdir()
+        try:
+            references.symlink_to(outside, target_is_directory=True)
+        except OSError as exc:
+            if os.name != "nt":
+                pytest.skip(f"directory symlink unavailable: {exc}")
+            junction = subprocess.run(
+                ["cmd", "/c", "mklink", "/J", str(references), str(outside)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if junction.returncode != 0:
+                pytest.skip(f"directory link unavailable: {junction.stderr or junction.stdout}")
+
+        response = client.post(
+            "/api/project/sources/import",
+            data={"project_path": str(project_path)},
+            files={"file": ("escape.txt", b"must stay inside project", "text/plain")},
+        )
+
+        assert response.status_code == 403
+        assert not (outside / "escape.txt").exists()
+
     def test_import_source_copies_file_and_extracts_readable_content(self, client, location: Path):
         project_path = self._create_project(client, location)
         response = client.post(

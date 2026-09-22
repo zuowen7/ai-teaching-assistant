@@ -138,6 +138,84 @@ def test_create_app_preserves_agent_lifecycle_callbacks(tmp_path, monkeypatch):
     assert callable(app.state._state_agent.get("startup"))
     assert callable(app.state._state_agent.get("shutdown"))
     assert callable(app.state._state_agent.get("ensure_rag_store"))
+    assert callable(app.state._state_literature.get("shutdown"))
+    assert app.state._state_literature.get("service") is not None
+
+
+def test_create_app_preserves_retry_after_header_from_http_exception(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+
+    import api_factory
+    from src.literature.providers.base import (
+        LiteratureProviderError,
+        ProviderErrorCode,
+        ProviderOperation,
+    )
+
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    config_path = config_dir / "default.yaml"
+    config_path.write_text("translator:\n  engine: ollama\n", encoding="utf-8")
+    monkeypatch.setattr(api_factory, "CONFIG_PATH", config_path)
+    monkeypatch.setattr(api_factory, "RUNTIME_DIR", tmp_path)
+    app = api_factory.create_app()
+    service = app.state._state_literature["service"]
+
+    async def rate_limited(*_args, **_kwargs):
+        raise LiteratureProviderError(
+            ProviderErrorCode.RATE_LIMITED,
+            "controlled test failure",
+            provider="arxiv",
+            operation=ProviderOperation.SEARCH,
+            retry_after_seconds=3.2,
+        )
+
+    monkeypatch.setattr(service, "search", rate_limited)
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/literature/search",
+            json={
+                "provider": "arxiv",
+                "query": {"query": 'all:"test"'},
+                "plan": {
+                    "research_question": "What evidence exists?",
+                    "suggested_query": 'all:"test"',
+                    "generation_method": "user",
+                    "generation_model": None,
+                    "generation_config": {},
+                },
+            },
+        )
+
+    assert response.status_code == 429
+    assert response.headers["retry-after"] == "4"
+
+
+def test_literature_provider_closes_when_lifespan_body_raises(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+
+    import api_factory
+    from src.literature.providers.arxiv import ArxivProvider
+
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    config_path = config_dir / "default.yaml"
+    config_path.write_text("translator:\n  engine: ollama\n", encoding="utf-8")
+    monkeypatch.setattr(api_factory, "CONFIG_PATH", config_path)
+    monkeypatch.setattr(api_factory, "RUNTIME_DIR", tmp_path)
+    closed: list[ArxivProvider] = []
+
+    async def record_close(provider: ArxivProvider) -> None:
+        closed.append(provider)
+
+    monkeypatch.setattr(ArxivProvider, "aclose", record_close)
+    app = api_factory.create_app()
+
+    with pytest.raises(RuntimeError, match="lifespan body failure"):
+        with TestClient(app):
+            raise RuntimeError("lifespan body failure")
+
+    assert len(closed) == 1
 
 
 def test_create_app_installs_one_file_log_handler_per_runtime(tmp_path, monkeypatch):

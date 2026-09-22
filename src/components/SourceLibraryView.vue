@@ -5,11 +5,19 @@
       :subtitle="t('sources.subtitle', { count: library.sources.value.length })"
       :icon="Library"
     >
+      <UiButton
+        variant="primary"
+        size="sm"
+        data-testid="open-literature-discovery"
+        @click="openLiteratureDiscovery"
+      >
+        <Search :size="14" /> {{ t('sources.discoverLiterature') }}
+      </UiButton>
       <UiButton variant="secondary" size="sm" @click="openZotero">
         <BookOpen :size="14" /> {{ t('sources.fromZotero') }}
       </UiButton>
       <UiButton
-        variant="primary"
+        variant="secondary"
         size="sm"
         :loading="library.saving.value"
         @click="pickReference()"
@@ -239,6 +247,179 @@
       </aside>
     </div>
 
+    <div
+      v-if="literatureOpen"
+      class="zotero-overlay"
+      data-testid="literature-discovery-dialog"
+      @click.self="literatureOpen = false"
+    >
+      <section
+        class="zotero-dialog literature-dialog"
+        role="dialog"
+        :aria-label="t('sources.literatureDiscovery')"
+      >
+        <div class="dialog-heading">
+          <div>
+            <span>{{ selectedLiteratureProvider }}</span>
+            <h2>{{ t('sources.literatureDiscovery') }}</h2>
+          </div>
+          <button type="button" :aria-label="t('general.close')" @click="literatureOpen = false">
+            <X :size="18" />
+          </button>
+        </div>
+
+        <form
+          class="literature-plan"
+          data-testid="literature-search-form"
+          @submit.prevent="executeLiteratureSearch"
+        >
+          <label class="literature-field question-field">
+            <span>{{ t('sources.researchQuestion') }}</span>
+            <textarea
+              v-model="researchQuestion"
+              rows="2"
+              data-testid="literature-research-question"
+              :placeholder="t('sources.researchQuestionPlaceholder')"
+            />
+          </label>
+          <label class="literature-field provider-field">
+            <span>{{ t('sources.literatureProvider') }}</span>
+            <select v-model="selectedLiteratureProvider">
+              <option
+                v-for="provider in discovery.providers.value"
+                :key="provider.provider"
+                :value="provider.provider"
+              >
+                {{ provider.provider }}
+              </option>
+              <option v-if="!discovery.providers.value.length" value="arxiv">arXiv</option>
+            </select>
+          </label>
+          <label class="literature-field query-field">
+            <span>{{ t('sources.confirmedQuery') }}</span>
+            <div class="query-editor">
+              <input
+                v-model="confirmedLiteratureQuery"
+                data-testid="literature-confirmed-query"
+                spellcheck="false"
+                :placeholder="t('sources.confirmedQueryPlaceholder')"
+              />
+              <UiButton type="button" variant="secondary" size="sm" @click="buildLiteratureQuery">
+                {{ t('sources.buildQuery') }}
+              </UiButton>
+            </div>
+            <small>{{ t('sources.queryConfirmationHint') }}</small>
+          </label>
+          <div class="literature-plan-action">
+            <UiButton
+              type="submit"
+              variant="primary"
+              size="sm"
+              :loading="discovery.searching.value"
+              :disabled="!researchQuestion.trim() || !confirmedLiteratureQuery.trim()"
+            >
+              <Search :size="14" /> {{ t('sources.confirmAndSearch') }}
+            </UiButton>
+          </div>
+        </form>
+
+        <div v-if="discovery.error.value" class="literature-error" role="alert">
+          {{ discovery.error.value }}
+        </div>
+
+        <template v-if="discovery.page.value">
+          <div class="query-receipt" data-testid="literature-query-receipt">
+            <div>
+              <span>{{ t('sources.searchReceipt') }}</span>
+              <b :class="`mode-${discovery.page.value.result_mode}`">
+                {{ t(`sources.resultMode.${discovery.page.value.result_mode}`) }}
+              </b>
+            </div>
+            <code>{{ discovery.page.value.query.query }}</code>
+            <small>
+              {{
+                t('sources.searchResultSummary', {
+                  returned: discovery.page.value.records.length,
+                  total: discovery.page.value.total_results ?? '—',
+                })
+              }}
+            </small>
+          </div>
+
+          <div class="literature-selection-bar">
+            <label>
+              <input
+                type="checkbox"
+                :checked="discovery.allVisibleSelected.value"
+                :disabled="!discovery.page.value.records.length"
+                @change="toggleAllLiteratureRecords"
+              />
+              {{ t('sources.selectAllResults') }}
+            </label>
+            <span>{{
+              t('sources.selectedResultCount', { count: discovery.selectedCount.value })
+            }}</span>
+          </div>
+
+          <div v-if="discovery.page.value.records.length" class="literature-results">
+            <label
+              v-for="record in discovery.page.value.records"
+              :key="record.paper_id"
+              class="literature-result"
+              :class="{ selected: discovery.selectedPaperIds.value.includes(record.paper_id) }"
+            >
+              <input
+                type="checkbox"
+                :data-testid="`literature-select-${record.paper_id}`"
+                :checked="discovery.selectedPaperIds.value.includes(record.paper_id)"
+                @change="toggleLiteratureRecord(record.paper_id, $event)"
+              />
+              <span class="literature-result-copy">
+                <strong>{{ record.title }}</strong>
+                <small>
+                  {{
+                    [record.authors.join(', '), record.year, record.venue]
+                      .filter(Boolean)
+                      .join(' · ')
+                  }}
+                </small>
+                <p>{{ record.abstract || t('sources.noAbstract') }}</p>
+              </span>
+              <span class="literature-result-side">
+                <i :class="`access-${literatureAccessStatus(record)}`">
+                  {{ t(`sources.access.${literatureAccessStatus(record)}`) }}
+                </i>
+                <a :href="record.record_url" target="_blank" rel="noopener" @click.stop>
+                  {{ t('sources.viewRecord') }}
+                </a>
+              </span>
+            </label>
+          </div>
+          <EmptyState
+            v-else
+            :title="t('sources.noLiteratureResults')"
+            :description="t('sources.noLiteratureResultsDescription')"
+          />
+
+          <footer class="literature-footer">
+            <span>{{ t('sources.snapshotImportHint') }}</span>
+            <UiButton
+              type="button"
+              variant="primary"
+              size="sm"
+              data-testid="literature-import-selected"
+              :loading="discovery.importing.value"
+              :disabled="!discovery.selectedCount.value"
+              @click="importLiteratureSelection"
+            >
+              <Plus :size="14" />
+              {{ t('sources.importSelected', { count: discovery.selectedCount.value }) }}
+            </UiButton>
+          </footer>
+        </template>
+      </section>
+    </div>
+
     <div v-if="zoteroOpen" class="zotero-overlay" @click.self="zoteroOpen = false">
       <section class="zotero-dialog" role="dialog" :aria-label="t('sources.fromZotero')">
         <div class="dialog-heading">
@@ -309,7 +490,13 @@ import {
 } from '../composables/useSourceLibrary'
 import { useTranslate } from '../composables/useTranslate'
 import { useToast } from '../composables/useToast'
+import { useFileTree } from '../composables/useFileTree'
 import { useEditorCitation, type ZoteroItem } from '../composables/useEditorCitation'
+import {
+  suggestArxivQuery,
+  useLiteratureDiscovery,
+  type LiteraturePaperRecord,
+} from '../composables/useLiteratureDiscovery'
 
 defineProps<{
   healthOk: boolean
@@ -327,6 +514,7 @@ type LibraryFilter = 'all' | 'unread' | 'translated' | 'indexed' | 'cited'
 const { t } = useI18n()
 const { pushError, success } = useToast()
 const library = useSourceLibrary()
+const discovery = useLiteratureDiscovery()
 const translate = useTranslate()
 const citation = useEditorCitation()
 const filter = ref<LibraryFilter>('all')
@@ -344,6 +532,11 @@ const zoteroQuery = ref('')
 const zoteroItems = ref<ZoteroItem[]>([])
 const zoteroSearching = ref(false)
 const zoteroSearched = ref(false)
+const literatureOpen = ref(false)
+const researchQuestion = ref('')
+const suggestedLiteratureQuery = ref('')
+const confirmedLiteratureQuery = ref('')
+const selectedLiteratureProvider = ref('arxiv')
 
 const selectedSource = computed(
   () => library.sources.value.find((source) => source.id === selectedSourceId.value) ?? null,
@@ -408,6 +601,22 @@ watch(selectedSource, (source) => {
   const tags = Array.isArray(source?.metadata.tags) ? source?.metadata.tags : []
   tagDraft.value = tags.filter((tag): tag is string => typeof tag === 'string').join(', ')
 })
+
+watch(researchQuestion, () => {
+  suggestedLiteratureQuery.value = ''
+})
+
+// The view is kept alive across project switches, so a snapshot discovered for
+// one project must not stay importable into another one.
+watch(
+  () => useFileTree().rootDir.value,
+  () => {
+    discovery.resetDiscoveryState()
+    researchQuestion.value = ''
+    suggestedLiteratureQuery.value = ''
+    confirmedLiteratureQuery.value = ''
+  },
+)
 
 function ragLabel(status: SourceRagStatus) {
   return t(`sources.rag.${status}`)
@@ -593,6 +802,89 @@ async function removeSelected() {
     success(t('sources.deleted'))
   } catch (cause) {
     pushError(cause instanceof Error ? cause.message : t('sources.deleteFailed'))
+  }
+}
+
+async function openLiteratureDiscovery() {
+  literatureOpen.value = true
+  if (discovery.providers.value.length) return
+  try {
+    const providers = await discovery.loadProviders()
+    if (!providers.some((provider) => provider.provider === selectedLiteratureProvider.value)) {
+      selectedLiteratureProvider.value = providers[0]?.provider ?? 'arxiv'
+    }
+  } catch (cause) {
+    pushError(cause instanceof Error ? cause.message : t('sources.providerLoadFailed'))
+  }
+}
+
+function buildLiteratureQuery() {
+  const query = suggestArxivQuery(researchQuestion.value)
+  if (!query) {
+    pushError(t('sources.researchQuestionRequired'))
+    return
+  }
+  suggestedLiteratureQuery.value = query
+  confirmedLiteratureQuery.value = query
+}
+
+async function executeLiteratureSearch() {
+  if (!researchQuestion.value.trim()) {
+    pushError(t('sources.researchQuestionRequired'))
+    return
+  }
+  if (!confirmedLiteratureQuery.value.trim()) {
+    pushError(t('sources.confirmedQueryRequired'))
+    return
+  }
+  const generatedFromTemplate = Boolean(suggestedLiteratureQuery.value)
+  try {
+    await discovery.searchLiterature(
+      selectedLiteratureProvider.value,
+      confirmedLiteratureQuery.value,
+      {
+        researchQuestion: researchQuestion.value,
+        suggestedQuery: suggestedLiteratureQuery.value || confirmedLiteratureQuery.value,
+        generationMethod: generatedFromTemplate ? 'template' : 'user',
+        generationModel: null,
+        generationConfig: generatedFromTemplate ? { template: 'arxiv_all_phrase_v1' } : {},
+      },
+    )
+  } catch (cause) {
+    pushError(cause instanceof Error ? cause.message : t('sources.literatureSearchFailed'))
+  }
+}
+
+function toggleLiteratureRecord(paperId: string, event: Event) {
+  discovery.setPaperSelected(paperId, (event.target as HTMLInputElement).checked)
+}
+
+function toggleAllLiteratureRecords(event: Event) {
+  discovery.selectAllVisible((event.target as HTMLInputElement).checked)
+}
+
+function literatureAccessStatus(record: LiteraturePaperRecord) {
+  if (record.access_locations.some((location) => location.access_status === 'open')) return 'open'
+  if (record.access_locations.some((location) => location.access_status === 'restricted')) {
+    return 'restricted'
+  }
+  return 'unknown'
+}
+
+async function importLiteratureSelection() {
+  try {
+    const batch = await discovery.importSelected()
+    selectedSourceId.value = batch.results[0]?.source_id ?? selectedSourceId.value
+    await library.loadSources().catch(() => undefined)
+    success(
+      t('sources.literatureImported', {
+        created: batch.created_count,
+        reused: batch.reused_count,
+        updated: batch.metadata_updated_count,
+      }),
+    )
+  } catch (cause) {
+    pushError(cause instanceof Error ? cause.message : t('sources.literatureImportFailed'))
   }
 }
 
@@ -1003,6 +1295,236 @@ async function addZoteroItem(item: ZoteroItem) {
   color: var(--c-text-3);
   text-align: center;
 }
+.literature-dialog {
+  width: min(860px, 100%);
+}
+.literature-plan {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 180px;
+  gap: 12px;
+  padding: 4px 20px 16px;
+}
+.literature-field {
+  min-width: 0;
+  display: grid;
+  gap: 6px;
+}
+.literature-field > span {
+  color: var(--c-text-2);
+  font-size: 11px;
+  font-weight: 650;
+}
+.literature-field textarea,
+.literature-field select,
+.query-editor input {
+  width: 100%;
+  border: 1px solid var(--c-border);
+  border-radius: 8px;
+  outline: 0;
+  background: var(--c-surface-1);
+  color: var(--c-text-1);
+  font: inherit;
+}
+.literature-field textarea {
+  min-height: 62px;
+  padding: 9px 10px;
+  resize: vertical;
+  line-height: 1.45;
+}
+.literature-field select,
+.query-editor input {
+  height: 36px;
+  padding: 0 10px;
+}
+.literature-field textarea:focus,
+.literature-field select:focus,
+.query-editor input:focus {
+  border-color: var(--c-accent-ring);
+  box-shadow: 0 0 0 3px var(--c-accent-soft);
+}
+.query-field {
+  grid-column: 1 / -1;
+}
+.query-editor {
+  display: flex;
+  gap: 8px;
+}
+.query-editor input,
+.query-receipt code {
+  font-family: var(--font-mono);
+}
+.literature-field small,
+.query-receipt small,
+.literature-footer > span {
+  color: var(--c-text-3);
+  font-size: 10px;
+  line-height: 1.5;
+}
+.literature-plan-action {
+  grid-column: 1 / -1;
+  display: flex;
+  justify-content: flex-end;
+}
+.literature-error {
+  margin: 0 20px 12px;
+  padding: 9px 11px;
+  border: 1px solid var(--c-danger);
+  border-radius: 8px;
+  background: var(--c-danger-bg);
+  color: var(--c-danger);
+  font-size: 11px;
+}
+.query-receipt {
+  display: grid;
+  gap: 6px;
+  margin: 0 20px 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--c-border);
+  border-left: 3px solid var(--c-accent);
+  border-radius: 7px;
+  background: var(--paper-0);
+}
+.query-receipt > div {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+/* The receipt is a paper-coloured panel in both themes, so its badge and label
+   colours must be paper-safe ink instead of the surface-oriented --c-* tokens:
+   --c-success/--c-warn on --paper-0 measured ~1.5:1 in the dark token set. */
+.query-receipt > div > span {
+  color: #4a4438;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.query-receipt b,
+.literature-result-side i {
+  padding: 2px 6px;
+  border-radius: 999px;
+  font-size: 9px;
+  font-style: normal;
+  font-weight: 650;
+}
+.query-receipt small {
+  color: #4a4438;
+}
+.query-receipt .mode-live {
+  background: rgba(49, 148, 90, 0.16);
+  color: #1f5a34;
+}
+.query-receipt .mode-cache,
+.query-receipt .mode-fixture {
+  background: rgba(196, 122, 27, 0.18);
+  color: #7a4d0c;
+}
+.literature-result-side .access-open {
+  background: var(--c-success-bg);
+  color: var(--c-success);
+}
+.literature-result-side .access-restricted {
+  background: var(--c-warn-bg);
+  color: var(--c-warn);
+}
+.literature-result-side .access-unknown {
+  background: var(--c-surface-3);
+  color: var(--c-text-3);
+}
+.query-receipt code {
+  overflow-wrap: anywhere;
+  color: #2f2a22;
+  font-size: 11px;
+}
+.literature-selection-bar,
+.literature-footer {
+  min-height: 42px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 20px;
+  border-top: 1px solid var(--c-border);
+  color: var(--c-text-3);
+  font-size: 11px;
+}
+.literature-selection-bar label {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--c-text-2);
+}
+.literature-selection-bar input,
+.literature-result > input {
+  accent-color: var(--c-accent);
+}
+.literature-results {
+  min-height: 160px;
+  max-height: 350px;
+  overflow: auto;
+  border-top: 1px solid var(--c-border);
+}
+.literature-result {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) 92px;
+  gap: 11px;
+  align-items: start;
+  padding: 13px 20px;
+  border-bottom: 1px solid var(--c-border);
+  background: transparent;
+  cursor: pointer;
+}
+.literature-result:hover,
+.literature-result.selected {
+  background: var(--c-accent-soft);
+}
+.literature-result > input {
+  margin-top: 3px;
+}
+.literature-result-copy {
+  min-width: 0;
+  display: grid;
+  gap: 4px;
+}
+.literature-result-copy strong {
+  color: var(--c-text-1);
+  font-family: var(--font-serif);
+  font-size: 13px;
+  line-height: 1.35;
+}
+.literature-result-copy small {
+  overflow: hidden;
+  color: var(--c-text-3);
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.literature-result-copy p {
+  display: -webkit-box;
+  margin: 2px 0 0;
+  overflow: hidden;
+  color: var(--c-text-2);
+  font-size: 10px;
+  line-height: 1.5;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+.literature-result-side {
+  display: grid;
+  justify-items: end;
+  gap: 9px;
+}
+.literature-result-side a {
+  color: var(--c-accent);
+  font-size: 10px;
+  text-decoration: none;
+}
+.literature-result-side a:hover {
+  text-decoration: underline;
+}
+.literature-footer {
+  margin-top: auto;
+}
 .zotero-overlay {
   position: fixed;
   z-index: 1000;
@@ -1131,6 +1653,27 @@ async function addZoteroItem(item: ZoteroItem) {
   }
   .job-progress {
     display: none;
+  }
+  .literature-plan {
+    grid-template-columns: 1fr;
+  }
+  .provider-field,
+  .query-field,
+  .literature-plan-action {
+    grid-column: 1;
+  }
+  .literature-result {
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+  .literature-result-side {
+    grid-column: 2;
+    grid-template-columns: auto auto;
+    justify-content: start;
+    justify-items: start;
+  }
+  .literature-footer {
+    align-items: flex-start;
+    flex-direction: column;
   }
 }
 @media (max-height: 650px) {
