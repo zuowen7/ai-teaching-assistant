@@ -159,31 +159,34 @@ describe('agent execution presentation', () => {
     expect(steps[0].resultDetail).toBe(longResult)
   })
 
-  it('renders a literature answer as citations and other tools as raw text', () => {
+  it('renders a literature answer as citations using the real SSE event shape', () => {
+    const quote = 'evidence sentence. '.repeat(70)
+    const evidence = [1, 2, 3].map((index) => ({
+      evidence_id: `evidence_${String(index).padStart(24, '0')}`,
+      source_id: `src_demo_${index}`,
+      title: `Demo Paper ${index}`,
+      page: index,
+      exact_quote: quote,
+      context_before: '',
+      context_after: '',
+    }))
     const answer = JSON.stringify({
       status: 'answered',
       insufficient_reason: null,
       claims: [
         {
           text: '评估使用了留出集。',
-          evidence_ids: [`evidence_${'a'.repeat(24)}`],
+          evidence_ids: evidence.map((item) => item.evidence_id),
           evidence_status: 'supported',
         },
       ],
-      evidence: [
-        {
-          evidence_id: `evidence_${'a'.repeat(24)}`,
-          source_id: 'src_demo_0001',
-          title: 'Demo Paper A',
-          page: 2,
-          exact_quote: 'Only this page mentions the held-out split.',
-          context_before: '',
-          context_after: '',
-        },
-      ],
+      evidence,
       rejected_claims: [],
       unresolved_count: 0,
     })
+    // The SSE adapter sends the collapsed preview as `content` and the whole
+    // result as `result_detail`; a multi-paper answer exceeds 4000 characters.
+    expect(answer.length).toBeGreaterThan(4_000)
     const literatureEvents: AgentEvent[] = [
       {
         type: 'tool_call',
@@ -193,9 +196,9 @@ describe('agent execution presentation', () => {
       },
       {
         type: 'tool_result',
-        content: answer,
+        content: `${answer.slice(0, 200)}...`,
         event_id: 'lit-1',
-        metadata: { tool_name: 'literature_answer' },
+        metadata: { tool_name: 'literature_answer', result_detail: answer },
       },
     ]
 
@@ -203,6 +206,7 @@ describe('agent execution presentation', () => {
 
     expect(wrapper.find('[data-testid="literature-answer"]').exists()).toBe(true)
     expect(wrapper.get('[data-testid="literature-claim"]').text()).toContain('评估使用了留出集。')
+    expect(wrapper.findAll('[data-testid="literature-evidence"]')).toHaveLength(3)
     // The result is rendered as citations, not as raw JSON.
     expect(wrapper.find('[data-testid="literature-raw"]').exists()).toBe(false)
     expect(wrapper.text()).not.toContain('"exact_quote"')

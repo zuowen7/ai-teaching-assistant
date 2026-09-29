@@ -94,10 +94,8 @@ const insufficientResult = {
   ...answeredResult,
   status: 'insufficient',
   insufficient_reason: 'no_retrieval_hits',
-  claims: [],
-  evidence: [],
-  rejected_claims: [],
-  unresolved: [],
+  // Deliberately violating payload: an insufficient answer that still carries
+  // claims and evidence, so the "no conclusions" rule is actually exercised.
   retrieved_chunk_count: 0,
 }
 

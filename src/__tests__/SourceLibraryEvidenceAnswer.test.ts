@@ -2,7 +2,10 @@ import { flushPromises, mount } from '@vue/test-utils'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import SourceLibraryView from '../components/SourceLibraryView.vue'
 import { useFileTree } from '../composables/useFileTree'
-import { _resetLiteratureAnswerForTesting } from '../composables/useLiteratureAnswer'
+import {
+  _resetLiteratureAnswerForTesting,
+  useLiteratureAnswer,
+} from '../composables/useLiteratureAnswer'
 import { _resetSourceLibraryForTesting } from '../composables/useSourceLibrary'
 
 // The real composer keeps locale keys honest: a missing key renders as the raw
@@ -67,6 +70,16 @@ const plainSource = {
   id: 'src_plain_1',
   title: 'Hand written notes',
   metadata: {},
+}
+
+// Entered through the literature flow but never indexed: it cannot contribute
+// evidence, so its checkbox must be disabled.
+const pendingSource = {
+  ...literatureSource,
+  id: 'src_lit_pending',
+  title: 'Demo Paper C',
+  rag_status: 'unavailable',
+  metadata: { literature: { schema_version: 1, fulltext: { status: 'metadata_only' } } },
 }
 
 const answered = {
@@ -143,8 +156,8 @@ const insufficient = {
   ...answered,
   status: 'insufficient',
   insufficient_reason: 'no_resolvable_evidence',
-  claims: [],
-  evidence: [],
+  // Deliberately violating payload: a claim and its quote are present even
+  // though the answer is insufficient; the UI must not render either.
   rejected_claims: [],
   unresolved: [],
   retrieved_chunk_count: 1,
@@ -160,45 +173,56 @@ function mountView() {
   })
 }
 
+interface RecordedCall {
+  url: string
+  method: string
+}
+
 function mockApi(answerPayload: unknown) {
-  let sourcesCalls = 0
-  const fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementation((input) => {
-    const target = String(input)
-    if (target.includes('/api/project/sources?')) {
-      sourcesCalls += 1
-      return Promise.resolve(
-        new Response(JSON.stringify({ sources: [literatureSource, plainSource] }), {
-          status: 200,
-        }),
-      )
-    }
-    if (target.endsWith('/api/literature/answer')) {
-      return Promise.resolve(new Response(JSON.stringify(answerPayload), { status: 200 }))
-    }
-    if (target.endsWith('/api/literature/fulltext')) {
-      return Promise.resolve(
-        new Response(
-          JSON.stringify({
-            source_id: 'src_lit_1',
-            status: 'fulltext_ready',
-            reused: false,
-            local_path: 'D:/papers/project-a/references/alpha.pdf',
-            source_url: 'https://arxiv.org/pdf/2501.00001v2',
-            sha256: 'f'.repeat(64),
-            file_size_bytes: 2048,
-            mime_type: 'application/pdf',
-            acquired_at: '2026-09-29T00:00:00Z',
-            failure_reason: null,
-          }),
-          { status: 200 },
-        ),
-      )
-    }
-    throw new Error(`unexpected request: ${target}`)
-  })
+  const calls: RecordedCall[] = []
+  const fetchMock = vi
+    .spyOn(globalThis, 'fetch')
+    .mockImplementation((input, init?: RequestInit) => {
+      const target = String(input)
+      calls.push({ url: target, method: String(init?.method || 'GET').toUpperCase() })
+      if (target.includes('/api/project/sources')) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              sources: [literatureSource, pendingSource, plainSource],
+            }),
+            { status: 200 },
+          ),
+        )
+      }
+      if (target.endsWith('/api/literature/answer')) {
+        return Promise.resolve(new Response(JSON.stringify(answerPayload), { status: 200 }))
+      }
+      if (target.endsWith('/api/literature/fulltext')) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              source_id: 'src_lit_1',
+              status: 'fulltext_ready',
+              reused: false,
+              local_path: 'D:/papers/project-a/references/alpha.pdf',
+              source_url: 'https://arxiv.org/pdf/2501.00001v2',
+              sha256: 'f'.repeat(64),
+              file_size_bytes: 2048,
+              mime_type: 'application/pdf',
+              acquired_at: '2026-09-29T00:00:00Z',
+              failure_reason: null,
+            }),
+            { status: 200 },
+          ),
+        )
+      }
+      throw new Error(`unexpected request: ${target}`)
+    })
   return {
     fetchMock,
-    sourcesCalls: () => sourcesCalls,
+    calls,
+    sourcesCalls: () => calls.filter((call) => call.url.includes('/api/project/sources')).length,
   }
 }
 
@@ -279,7 +303,48 @@ describe('SourceLibraryView evidence answers', () => {
     const result = wrapper.get('[data-testid="answer-result"]')
     expect(result.text()).toContain('证据不足')
     expect(result.text()).toContain('检索到的片段无法核验回页码与原文')
+    // The payload carries a claim and a quote; neither may reach the UI.
     expect(wrapper.find('[data-testid="answer-claims"]').exists()).toBe(false)
+    expect(result.text()).not.toContain('评估使用了留出集。')
+    expect(result.text()).not.toContain('Only this page mentions the held-out split.')
+  })
+
+  it('disables literature sources that have no page-level index', async () => {
+    mockApi(answered)
+    const wrapper = mountView()
+    await flushPromises()
+
+    await openAnswerDialog(wrapper)
+
+    // Both literature sources are listed, but only the indexed one can be picked.
+    expect(wrapper.find('[data-testid="answer-source-src_lit_1"]').exists()).toBe(true)
+    const pending = wrapper.get('[data-testid="answer-source-src_lit_pending"]')
+    expect(pending.attributes('disabled')).toBeDefined()
+
+    await wrapper.get('[data-testid="answer-select-all"]').trigger('click')
+    await flushPromises()
+    expect(wrapper.get('[data-testid="answer-scope"]').text()).toContain('已选 1 篇')
+  })
+
+  it('drops the answer and the scope when the project changes', async () => {
+    mockApi(answered)
+    const wrapper = mountView()
+    await flushPromises()
+
+    await openAnswerDialog(wrapper)
+    await selectLiteratureSource(wrapper)
+    await wrapper.get('[data-testid="answer-question"]').setValue('Which protocol?')
+    await wrapper.get('[data-testid="answer-form"]').trigger('submit')
+    await flushPromises()
+    expect(wrapper.find('[data-testid="answer-result"]').exists()).toBe(true)
+
+    useFileTree().rootDir.value = 'D:/papers/project-b'
+    await flushPromises()
+
+    expect(wrapper.find('[data-testid="evidence-answer-dialog"]').exists()).toBe(false)
+    expect(wrapper.find('[data-testid="answer-result"]').exists()).toBe(false)
+    expect(useLiteratureAnswer().selectedSourceIds.value).toEqual([])
+    expect(useLiteratureAnswer().question.value).toBe('')
   })
 
   it('selects every answerable source and clears the scope', async () => {
@@ -315,7 +380,12 @@ describe('SourceLibraryView evidence answers', () => {
       source_id: 'src_lit_1',
       force: false,
     })
-    // The server owns metadata.literature, so the client must re-read it.
+    // The server owns metadata.literature, so the client must re-read it and
+    // never write a source back itself (D-022).
     expect(api.sourcesCalls()).toBeGreaterThan(callsBefore)
+    const sourceWrites = api.calls.filter(
+      (call) => call.url.includes('/api/project/sources') && call.method !== 'GET',
+    )
+    expect(sourceWrites).toEqual([])
   })
 })

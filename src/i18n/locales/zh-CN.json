@@ -99,9 +99,6 @@
     "newTask": "新建 Agent 任务",
     "you": "你",
     "untitled": "未命名文稿",
-    "newTask": "新建 Agent 任务",
-    "you": "你",
-    "untitled": "未命名文稿",
     "currentTask": "当前任务",
     "waiting": "等待研究任务",
     "steps": "步骤",
@@ -1423,7 +1420,6 @@
       "failed": "RAG 入库失败"
     },
     "acquireFullText": "获取开放全文",
-    "acquiringFullText": "正在获取开放全文…",
     "fullTextAcquired": "已获取开放全文",
     "fullTextAcquireFailed": "获取开放全文失败",
     "answerSection": "多文献证据问答",

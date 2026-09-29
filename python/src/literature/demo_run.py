@@ -25,6 +25,7 @@ from src.literature.models import canonical_hash
 
 RUN_RECORD_DIR = Path("methods") / "literature_poc" / "runs"
 _FORBIDDEN_KEY_PARTS = ("key", "token", "secret", "password", "authorization", "credential")
+_FORBIDDEN_VALUE_PREFIXES = ("sk-", "sk_", "ghp_", "github_pat_", "bearer ", "xoxb-")
 
 
 class StepStatus(StrEnum):
@@ -59,6 +60,8 @@ class DemoRun(BaseModel):
     steps: tuple[DemoStep, ...]
     totals: dict[str, int]
     answer_status: str | None = Field(default=None, max_length=32)
+    #: Model configuration the answering step actually used, secret-free (plan 5.9).
+    answer_model_config_hash: str | None = Field(default=None, max_length=64)
     started_at: datetime
     finished_at: datetime
     duration_ms: int = Field(ge=0)
@@ -79,6 +82,11 @@ def _assert_no_secret_keys(value: Mapping[str, Any], *, field: str) -> None:
             raise ValueError(f"{field} must not record secret-like keys: {key}")
         if isinstance(item, Mapping):
             _assert_no_secret_keys(item, field=field)
+        elif isinstance(item, str):
+            # A secret can also arrive as a value; the record must never carry one.
+            value_lowered = item.strip().casefold()
+            if any(value_lowered.startswith(prefix) for prefix in _FORBIDDEN_VALUE_PREFIXES):
+                raise ValueError(f"{field} must not record secret-like values: {key}")
 
 
 class DemoRunRecorder:
@@ -137,6 +145,7 @@ class DemoRunRecorder:
         self,
         *,
         answer_status: str | None = None,
+        answer_model_config_hash: str | None = None,
         finished_at: datetime | None = None,
     ) -> DemoRun:
         finished = (finished_at or datetime.now(UTC)).astimezone(UTC)
@@ -176,6 +185,7 @@ class DemoRunRecorder:
             steps=tuple(self._steps),
             totals=totals,
             answer_status=answer_status,
+            answer_model_config_hash=answer_model_config_hash,
             started_at=self._started_at,
             finished_at=finished,
             duration_ms=max(0, int((finished - self._started_at).total_seconds() * 1000)),
@@ -191,11 +201,20 @@ def run_record_filename(run: DemoRun) -> str:
 
 
 def write_run_record(run: DemoRun, directory: str | Path | None = None) -> Path:
-    """Persist one run record under the run history directory."""
+    """Persist one run record under the run history directory.
+
+    A repeated run has the same content-derived ``run_id``, so two runs inside the
+    same second would otherwise overwrite each other; the second one gets a
+    numeric suffix instead.
+    """
 
     target_dir = Path(directory) if directory is not None else RUN_RECORD_DIR
     target_dir.mkdir(parents=True, exist_ok=True)
     target = target_dir / run_record_filename(run)
+    suffix = 2
+    while target.exists():
+        target = target_dir / f"{run_record_filename(run)[:-5]}-{suffix}.json"
+        suffix += 1
     target.write_text(
         json.dumps(json.loads(run.model_dump_json()), ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",

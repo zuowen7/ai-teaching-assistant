@@ -107,7 +107,9 @@ const expanded = ref<string[]>([])
 
 /**
  * Only a well-formed literature answer is rendered as citations; anything else
- * falls back to the raw tool result so nothing is hidden or rewritten.
+ * falls back to the raw tool result so nothing is hidden or rewritten.  Claims
+ * and evidence are dropped unless the answer is actually answered, so an
+ * insufficient payload can never be shown as if it carried conclusions.
  */
 const parsed = computed<LiteratureAnswerPayload | null>(() => {
   try {
@@ -115,11 +117,12 @@ const parsed = computed<LiteratureAnswerPayload | null>(() => {
     if (!payload || typeof payload !== 'object') return null
     if (payload.status !== 'answered' && payload.status !== 'insufficient') return null
     if (!Array.isArray(payload.claims) || !Array.isArray(payload.evidence)) return null
+    const answered = payload.status === 'answered'
     return {
       status: payload.status,
       insufficient_reason: payload.insufficient_reason ?? null,
-      claims: payload.claims,
-      evidence: payload.evidence,
+      claims: answered ? payload.claims : [],
+      evidence: answered ? payload.evidence : [],
       rejected_claims: Array.isArray(payload.rejected_claims) ? payload.rejected_claims : [],
       unresolved_count: Number(payload.unresolved_count || 0),
     }

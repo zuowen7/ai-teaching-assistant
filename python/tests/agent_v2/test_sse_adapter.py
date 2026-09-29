@@ -66,6 +66,25 @@ class TestAdapter:
         assert result["metadata"]["original_chars"] == 12000
         assert result["metadata"]["returned_chars"] == 4000
 
+    def test_tool_result_detail_is_not_cut_below_the_tool_budget(self):
+        """A structured result must reach the UI in one piece (plan 5.12)."""
+
+        output = "y" * 9_000
+        event = AgentEvent.tool_result("t3", "literature_answer", output)
+
+        result = agent_event_to_sse(event)
+
+        assert result["metadata"]["result_detail"] == output
+        assert result["content"] == output[:200] + "..."
+
+    def test_tool_result_detail_respects_the_hard_ceiling(self):
+        output = "y" * 40_000
+        event = AgentEvent.tool_result("t4", "literature_answer", output)
+
+        result = agent_event_to_sse(event)
+
+        assert len(result["metadata"]["result_detail"]) == 32_000
+
     def test_tool_error_uses_tool_error_type(self):
         event = AgentEvent(
             type=AgentEventType.TOOL_ERROR,

@@ -23,9 +23,11 @@ from src.literature.demo_corpus import (
     resolve_corpus_path,
 )
 from src.literature.demo_run import (
+    DemoRun,
     DemoRunRecorder,
     StepStatus,
     run_record_filename,
+    write_run_record,
 )
 from src.literature.models import SearchQuery, SearchResultMode
 
@@ -207,6 +209,155 @@ class TestMaterializePdf:
         assert excinfo.value.code == "unknown_paper"
 
 
+class _StubResponse:
+    def __init__(self, payload: dict, status_code: int = 200) -> None:
+        self.status_code = status_code
+        self._payload = payload
+
+    def json(self) -> dict:
+        return self._payload
+
+
+class _StubClient:
+    """Minimal HTTP client for driving run_demo without a server."""
+
+    def __init__(self, responses: dict[str, _StubResponse]) -> None:
+        self._responses = responses
+        self.calls: list[str] = []
+
+    def post(self, url: str, json=None, data=None, files=None):
+        self.calls.append(url)
+        for suffix, response in self._responses.items():
+            if url.endswith(suffix):
+                return response
+        raise AssertionError(f"unexpected request: {url}")
+
+
+def _search_page(provider: str = "arxiv") -> _StubResponse:
+    return _StubResponse(
+        {
+            "search_execution_id": "search_exec_" + "c" * 32,
+            "page": {
+                "provider": provider,
+                "result_mode": "live" if provider == "arxiv" else "fixture",
+                "records": [
+                    {"paper_id": "paper_demo_0001", "title": "Demo Paper A", "access": "open"}
+                ],
+                "total_results": 1,
+            },
+        }
+    )
+
+
+class TestDemoRunFailureScenarios:
+    """Plan 5.10: each failure must be recorded with its own reason."""
+
+    def test_provider_failure_stops_the_run_with_its_code(self, tmp_path: Path) -> None:
+        from scripts.literature_demo import run_demo
+
+        client = _StubClient(
+            {
+                "/api/literature/search": _StubResponse(
+                    {"detail": {"code": "rate_limited", "message": "slow down"}}, status_code=429
+                )
+            }
+        )
+        run = run_demo(
+            client,
+            project_path=str(tmp_path),
+            provider="arxiv",
+            corpus=load_demo_corpus(REPO_CORPUS),
+            workspace=tmp_path / "workspace",
+        )
+
+        assert [step.name for step in run.steps] == ["search"]
+        assert run.steps[0].status is StepStatus.FAILED
+        assert run.steps[0].reason == "rate_limited"
+        assert run.totals == {"step": 1, "ok": 0, "failed": 1, "skipped": 0}
+        assert run.answer_status is None
+
+    def test_index_failure_skips_the_dependent_answer_step(self, tmp_path: Path) -> None:
+        from scripts.literature_demo import run_demo
+
+        client = _StubClient(
+            {
+                "/api/literature/search": _search_page(),
+                "/api/literature/import": _StubResponse(
+                    {
+                        "created_count": 1,
+                        "reused_count": 0,
+                        "results": [{"paper_id": "paper_demo_0001", "source_id": "src_demo_0001"}],
+                    }
+                ),
+                "/api/literature/fulltext": _StubResponse(
+                    {
+                        "source_id": "src_demo_0001",
+                        "status": "fulltext_ready",
+                        "local_path": "x.pdf",
+                    }
+                ),
+                "/api/literature/index": _StubResponse(
+                    {"detail": {"code": "source_artifact_missing", "message": "no pdf"}},
+                    status_code=409,
+                ),
+            }
+        )
+        run = run_demo(
+            client,
+            project_path=str(tmp_path),
+            provider="arxiv",
+            corpus=load_demo_corpus(REPO_CORPUS),
+            workspace=tmp_path / "workspace",
+        )
+
+        steps = {step.name: step for step in run.steps}
+        assert steps["index"].status is StepStatus.FAILED
+        assert steps["index"].reason == "source_artifact_missing"
+        assert steps["answer"].status is StepStatus.SKIPPED
+        assert steps["answer"].reason == "dependency_failed"
+        assert steps["resolve_evidence"].status is StepStatus.SKIPPED
+        assert steps["resolve_evidence"].reason == "no_evidence_to_resolve"
+        assert run.totals["failed"] == 1
+        # attach (live mode), answer and the dependent evidence step are skipped.
+        assert run.totals["skipped"] == 3
+        assert steps["attach_fulltext"].reason == "user_attachment_required"
+
+    def test_missing_full_text_leaves_nothing_to_index(self, tmp_path: Path) -> None:
+        from scripts.literature_demo import run_demo
+
+        client = _StubClient(
+            {
+                "/api/literature/search": _search_page(),
+                "/api/literature/import": _StubResponse(
+                    {
+                        "created_count": 1,
+                        "reused_count": 0,
+                        "results": [{"paper_id": "paper_demo_0001", "source_id": "src_demo_0001"}],
+                    }
+                ),
+                "/api/literature/fulltext": _StubResponse(
+                    {"detail": {"code": "access_unavailable", "message": "no open pdf"}},
+                    status_code=409,
+                ),
+            }
+        )
+        run = run_demo(
+            client,
+            project_path=str(tmp_path),
+            provider="arxiv",
+            corpus=load_demo_corpus(REPO_CORPUS),
+            workspace=tmp_path / "workspace",
+        )
+
+        steps = {step.name: step for step in run.steps}
+        assert steps["acquire_fulltext"].status is StepStatus.FAILED
+        assert steps["acquire_fulltext"].reason == "access_unavailable"
+        assert steps["attach_fulltext"].status is StepStatus.SKIPPED
+        assert steps["attach_fulltext"].reason == "user_attachment_required"
+        assert steps["index"].reason == "no_indexed_source"
+        assert steps["answer"].reason == "dependency_failed"
+
+
 class TestDemoRunRecorder:
     def test_steps_keep_order_and_totals_aggregate(self) -> None:
         recorder = DemoRunRecorder(
@@ -298,6 +449,45 @@ class TestDemoRunRecorder:
         )
         with pytest.raises(ValueError):
             recorder.record(name="search", status=StepStatus.FAILED)
+
+    def test_recording_is_rejected_when_a_secret_hides_in_a_value(self) -> None:
+        recorder = DemoRunRecorder(
+            mode="fixture", provider="fixture", confirmed_query='all:"q"', started_at=NOW
+        )
+        with pytest.raises(ValueError):
+            recorder.record(
+                name="answer",
+                status=StepStatus.OK,
+                detail={"note": "sk-abcdef0123456789"},
+            )
+
+    def test_answer_model_config_hash_is_recorded_when_available(self) -> None:
+        recorder = DemoRunRecorder(
+            mode="fixture", provider="fixture", confirmed_query='all:"q"', started_at=NOW
+        )
+        recorder.record(name="answer", status=StepStatus.OK)
+        run = recorder.finish(
+            answer_status="answered",
+            answer_model_config_hash="a" * 64,
+            finished_at=NOW + timedelta(seconds=1),
+        )
+
+        assert run.answer_model_config_hash == "a" * 64
+        assert "sk-" not in json.dumps(json.loads(run.model_dump_json()))
+
+    def test_same_second_repeats_do_not_overwrite_each_other(self, tmp_path: Path) -> None:
+        def build() -> DemoRun:
+            recorder = DemoRunRecorder(
+                mode="fixture", provider="fixture", confirmed_query='all:"q"', started_at=NOW
+            )
+            recorder.record(name="search", status=StepStatus.OK)
+            return recorder.finish(finished_at=NOW + timedelta(seconds=1))
+
+        first = write_run_record(build(), tmp_path)
+        second = write_run_record(build(), tmp_path)
+
+        assert first != second
+        assert len(list(tmp_path.glob("*.json"))) == 2
 
     def test_record_filename_is_unique_per_run(self) -> None:
         recorder = DemoRunRecorder(

@@ -998,3 +998,32 @@ def test_answer_route_reports_missing_wiring(tmp_path: Path) -> None:
         unwired = client.post("/api/literature/answer", json=answer_request(project, [source_id]))
         assert unwired.status_code == 503
         assert unwired.json()["detail"]["code"] == "retrieval_unavailable"
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"exact_quote": "a quote the caller invented"},
+        {"evidence_id": "evidence_" + "f" * 24},
+        {"char_start": 0, "char_end": 5},
+        {"page_start": 1, "page_end": 2},
+    ],
+    ids=["quote", "evidence-id", "char-coordinates", "page-coordinates"],
+)
+def test_evidence_route_refuses_client_supplied_quote_and_coordinates(
+    tmp_path: Path, extra: dict
+) -> None:
+    """The caller may only name a chunk; quotes and coordinates are derived."""
+
+    with TestClient(make_app(tmp_path, make_provider())) as client:
+        response = client.post(
+            "/api/literature/evidence",
+            json={
+                "project_path": str(tmp_path),
+                "source_id": "src_alpha",
+                "chunk_id": "chunk_alpha",
+                **extra,
+            },
+        )
+
+    assert response.status_code == 422

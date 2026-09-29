@@ -17,6 +17,13 @@ def _event_id() -> str:
     return f"evt_{uuid.uuid4().hex[:8]}"
 
 
+#: Hard ceiling for the expanded tool-result payload.  The tool registry already
+#: applies a per-tool budget (4000 characters by default, higher for structured
+#: results such as an evidence answer), so this only guards against an unbounded
+#: event reaching the browser.
+_RESULT_DETAIL_MAX = 32_000
+
+
 def agent_event_to_sse(event: AgentEvent) -> dict[str, Any]:
     """转换为前端 SSE dict: {"type": str, "content": str, "event_id": str}。"""
     t = event.type
@@ -57,7 +64,10 @@ def agent_event_to_sse(event: AgentEvent) -> dict[str, Any]:
     elif t == AgentEventType.TOOL_RESULT:
         out = data.get("output", "")
         out_short = out[:200] + "..." if len(out) > 200 else out
-        out_detail = out[:4000]
+        # The registry already limited the result to the tool's own budget, so the
+        # expanded view must not cut it further: a structured result (an evidence
+        # answer the UI parses) would otherwise arrive as invalid JSON.
+        out_detail = out[:_RESULT_DETAIL_MAX]
         content = out_short
         evt_type = "tool_result"
         metadata = {

@@ -42,6 +42,26 @@ EVIDENCE_ID_RE = re.compile(r"\[(evidence_[0-9a-f]{24})\]")
 OTHER_SOURCE = "src_other000000000000"
 
 
+class _BrokenIndexStore:
+    """Page index whose chunk lookup fails the way a broken store would."""
+
+    def __init__(self, delegate, code: LiteratureServiceErrorCode) -> None:
+        self._delegate = delegate
+        self._code = code
+
+    async def embedding_identity(self):
+        return await self._delegate.embedding_identity()
+
+    async def index_pages(self, **kwargs):
+        return await self._delegate.index_pages(**kwargs)
+
+    async def get_chunk(self, chunk_id, *, source_id=None):
+        raise LiteratureServiceError(self._code, "索引存储不可用")
+
+    async def get_document(self, doc_id):
+        return await self._delegate.get_document(doc_id)
+
+
 class FakeRetriever:
     """Deterministic stand-in for the scoped page-level retrieval channel."""
 
@@ -293,6 +313,36 @@ class TestInsufficientEvidence:
 
         assert result.insufficient_reason is InsufficientReason.NO_RESOLVABLE_EVIDENCE
         assert result.unresolved[0].reason == "missing_source_scope"
+        assert model.prompts == []
+
+    @pytest.mark.parametrize(
+        "code",
+        [
+            LiteratureServiceErrorCode.INDEX_STORE_UNAVAILABLE,
+            LiteratureServiceErrorCode.RETRIEVAL_UNAVAILABLE,
+        ],
+    )
+    async def test_a_broken_store_is_not_reported_as_insufficient_evidence(
+        self, tmp_path: Path, code: LiteratureServiceErrorCode
+    ) -> None:
+        """Plan 5.9 rule 7: an unavailable store must stay a failure, not a 200."""
+
+        _, store, index_store, source_id, _, retriever, model = await make_answerable(tmp_path)
+        retriever.hits = page_hits(index_store, source_id, [1])
+        broken = _BrokenIndexStore(index_store, code)
+        service = LiteratureService(
+            providers=[StaticProvider("alpha", [make_record("alpha", "2401.00001")])],
+            project_store=store,
+            index_store=broken,
+            retriever=retriever,
+            answer_model=model,
+            now_factory=lambda: NOW,
+        )
+
+        with pytest.raises(LiteratureServiceError) as excinfo:
+            await answer(service, source_id)
+
+        assert excinfo.value.code is code
         assert model.prompts == []
 
     async def test_unresolvable_hit_does_not_block_resolvable_ones(self, tmp_path: Path) -> None:

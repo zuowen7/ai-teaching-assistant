@@ -354,26 +354,36 @@ def client_and_patches():
     shutil.rmtree(test_dir, ignore_errors=True)
 
 
-def asgi_transport(app):
-    return httpx.ASGITransport(app=app)
+class CountingTransport(httpx.ASGITransport):
+    """ASGI transport that records which application paths were actually hit."""
+
+    def __init__(self, app) -> None:
+        super().__init__(app=app)
+        self.paths: list[str] = []
+
+    async def handle_async_request(self, request):
+        self.paths.append(request.url.path)
+        return await super().handle_async_request(request)
 
 
-def patch_tool_http(monkeypatch: pytest.MonkeyPatch, app) -> None:
+def patch_tool_http(monkeypatch: pytest.MonkeyPatch, app) -> CountingTransport:
     """Serve the tools' ``SCHOLAR_API_BASE`` calls from the app itself."""
 
     real_client = httpx.AsyncClient
+    transport = CountingTransport(app)
 
     def factory(**kwargs):
         forwarded = {
             key: value for key, value in kwargs.items() if key in {"timeout", "follow_redirects"}
         }
         return real_client(
-            transport=asgi_transport(app),
+            transport=transport,
             base_url="http://localhost:18088",
             **forwarded,
         )
 
     monkeypatch.setattr(httpx, "AsyncClient", factory)
+    return transport
 
 
 def tool_names(events: list, event_type: AgentEventType) -> list[str]:
@@ -479,6 +489,45 @@ def test_agent_runs_the_whole_literature_chain_with_confirmations(
     final = [e for e in events if e.type is AgentEventType.RESPONSE]
     assert final and "引用证据" in final[-1].data.get("text", "")
 
+    # §2.4: "the final evidence equals the plain service entry".  Replay the same
+    # question through the HTTP route and require an identical answer.
+    direct = client.post(
+        "/api/literature/answer",
+        json={
+            "project_path": project,
+            "question": corpus.question,
+            "source_ids": answer["source_ids"],
+            "top_k": 5,
+        },
+    )
+    assert direct.status_code == 200, direct.text
+    direct_body = direct.json()
+    assert direct_body["status"] == answer["status"]
+    assert [claim["claim_id"] for claim in direct_body["claims"]] == [
+        claim["claim_id"] for claim in answer["claims"]
+    ]
+    assert [
+        (item["span"]["evidence_id"], item["span"]["page_start"], item["span"]["exact_quote"])
+        for item in direct_body["evidence"]
+    ] == [(item["evidence_id"], item["page"], item["exact_quote"]) for item in answer["evidence"]]
+
+    # The frontend only ever sees the SSE payload, so the adapter must hand it the
+    # complete result: a second truncation here would turn the answer into
+    # unparseable JSON and silently drop the evidence cards.
+    from src.agent_v2.sse_adapter import agent_event_to_sse
+
+    answer_event = next(
+        event
+        for event in events
+        if event.type is AgentEventType.TOOL_RESULT
+        and event.data.get("tool_name") == "literature_answer"
+    )
+    sse = agent_event_to_sse(answer_event)
+    detail = sse["metadata"]["result_detail"]
+    assert sse["metadata"]["truncated"] is False
+    assert detail == answer_event.data["output"]
+    assert json.loads(detail)["evidence"]
+
 
 def test_denied_confirmation_stops_the_chain_without_calling_the_service(
     client_and_patches, monkeypatch: pytest.MonkeyPatch
@@ -487,7 +536,7 @@ def test_denied_confirmation_stops_the_chain_without_calling_the_service(
     project = create_project(client, test_dir / "deny", "A1 Deny")
     provider = LibraryAgentProvider(corpus, helpers)
     runtime = build_runtime(project, provider, roles)
-    patch_tool_http(monkeypatch, app)
+    transport = patch_tool_http(monkeypatch, app)
 
     events = run_turn_sync(runtime, "检索新文献", decisions={"literature_search": "deny"})
 
@@ -495,8 +544,10 @@ def test_denied_confirmation_stops_the_chain_without_calling_the_service(
     assert AgentEventType.APPROVAL_RECEIVED in types
     denial = output_for(events, "literature_search")
     assert "denied" in json.dumps(denial, ensure_ascii=False).lower()
-    # No search ever reached the service: no execution handle was produced.
     assert "search_exec_" not in denial
+    # Measured, not inferred: the only request that reached the application is the
+    # read-only source listing; the denied search never hit the service.
+    assert transport.paths == ["/api/project/sources"]
 
 
 def test_out_of_scope_source_is_refused_by_the_answer_tool(
@@ -608,6 +659,11 @@ def test_second_turn_reuses_existing_index_instead_of_reindexing(
     first = LibraryAgentProvider(corpus, helpers)
     first_events = run_turn_sync(build_runtime(project, first, roles), "建库并回答")
     assert "literature_index" in tool_names(first_events, AgentEventType.TOOL_RESULT)
+    built_sources = {
+        item["source_id"]
+        for item in json.loads(output_for(first_events, "literature_import"))["sources"]
+    }
+    assert len(built_sources) >= 2
 
     second = LibraryAgentProvider(corpus, helpers, mode="reuse_existing")
     second_events = run_turn_sync(build_runtime(project, second, roles), "再回答一次")
@@ -617,8 +673,9 @@ def test_second_turn_reuses_existing_index_instead_of_reindexing(
     assert "literature_acquire_fulltext" not in second_calls
     assert second_calls[-1] == "literature_answer"
 
+    # Non-vacuous: the sources this run built must report as already indexed.
     sources = json.loads(output_for(second_events, "literature_sources"))
-    assert sources["indexed_count"] >= 1
-    assert all(
-        item["already_indexed"] for item in sources["sources"] if item["rag_status"] == "ready"
-    )
+    by_id = {item["source_id"]: item for item in sources["sources"]}
+    assert built_sources <= set(by_id)
+    assert all(by_id[source_id]["already_indexed"] for source_id in built_sources)
+    assert sources["indexed_count"] >= len(built_sources)

@@ -54,13 +54,31 @@ const answered = JSON.stringify({
   unresolved_count: 1,
 })
 
+// Deliberately violating payload: status says insufficient while claims and
+// evidence are present.  The component must still render nothing as a conclusion.
 const insufficient = JSON.stringify({
   status: 'insufficient',
   insufficient_reason: 'no_resolvable_evidence',
   question: 'What protocol?',
   source_ids: ['src_demo_0001'],
-  claims: [],
-  evidence: [],
+  claims: [
+    {
+      text: 'This claim must never be rendered.',
+      evidence_ids: [EVIDENCE_ID],
+      evidence_status: 'supported',
+    },
+  ],
+  evidence: [
+    {
+      evidence_id: EVIDENCE_ID,
+      source_id: 'src_demo_0001',
+      title: 'Demo Paper A',
+      page: 2,
+      exact_quote: 'This quote must never be rendered.',
+      context_before: '',
+      context_after: '',
+    },
+  ],
   rejected_claims: [],
   unresolved_count: 2,
   next_actions: ['widen_scope_within_project', 'propose_new_query_for_confirmation'],
@@ -121,8 +139,11 @@ describe('AgentLiteratureEvidence', () => {
     expect(wrapper.get('[data-testid="literature-status"]').text()).toContain(
       '检索到的片段无法核验回页码与原文',
     )
+    // The payload carries a claim and a quote; neither may reach the UI.
     expect(wrapper.findAll('[data-testid="literature-claim"]')).toHaveLength(0)
     expect(wrapper.find('[data-testid="literature-evidence"]').exists()).toBe(false)
+    expect(wrapper.text()).not.toContain('This claim must never be rendered.')
+    expect(wrapper.text()).not.toContain('This quote must never be rendered.')
   })
 
   it('falls back to the raw tool result when it is not a literature answer', () => {
@@ -138,5 +159,48 @@ describe('AgentLiteratureEvidence', () => {
 
     expect(wrapper.find('[data-testid="literature-answer"]').exists()).toBe(false)
     expect(wrapper.get('[data-testid="literature-raw"]').text()).toContain('"answered"')
+  })
+
+  it('renders a real-shaped SSE payload larger than the old 4000 character cut', () => {
+    const quote = 'evidence sentence. '.repeat(70)
+    const evidence = [1, 2, 3].map((index) => ({
+      evidence_id: `evidence_${String(index).padStart(24, '0')}`,
+      source_id: `src_demo_${index}`,
+      title: `Demo Paper ${index}`,
+      page: index,
+      exact_quote: quote,
+      context_before: '',
+      context_after: '',
+    }))
+    const payload = JSON.stringify({
+      status: 'answered',
+      insufficient_reason: null,
+      claims: [
+        {
+          text: 'Three papers agree.',
+          evidence_ids: evidence.map((item) => item.evidence_id),
+          evidence_status: 'supported',
+        },
+      ],
+      evidence,
+      rejected_claims: [],
+      unresolved_count: 0,
+    })
+    expect(payload.length).toBeGreaterThan(4_000)
+    // The SSE adapter only shortens the collapsed `content` field, never the
+    // expanded detail, so the component always receives the whole payload.
+    const wrapper = mountWith(payload)
+
+    expect(wrapper.find('[data-testid="literature-raw"]').exists()).toBe(false)
+    expect(wrapper.findAll('[data-testid="literature-evidence"]')).toHaveLength(3)
+
+    return wrapper
+      .get('[data-testid="literature-evidence-toggle"]')
+      .trigger('click')
+      .then(() => {
+        expect(wrapper.get('[data-testid="literature-evidence-quote"]').text()).toContain(
+          quote.trim().slice(0, 40),
+        )
+      })
   })
 })

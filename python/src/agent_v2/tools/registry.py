@@ -174,6 +174,7 @@ class ToolSpec:
         network_scope: Iterable[str] | None = None,
         rollback_capability: str = "none",
         preflight: ToolPreflight | None = None,
+        max_output_chars: int = _TOOL_RESULT_MAX,
     ):
         self.definition = definition
         self.func = func
@@ -183,6 +184,10 @@ class ToolSpec:
         self.network_scope = frozenset(network_scope or ())
         self.rollback_capability = rollback_capability
         self.preflight = preflight
+        # Per-tool result budget. Tools whose payload is structured data (for
+        # example an evidence answer the UI renders) can raise it; the default
+        # stays the historical 4000 characters.
+        self.max_output_chars = int(max_output_chars)
 
     @property
     def requires_approval(self) -> bool:
@@ -247,6 +252,7 @@ class ToolRegistry:
         network_scope: Iterable[str] | None = None,
         rollback_capability: str = "none",
         preflight: ToolPreflight | None = None,
+        max_output_chars: int = _TOOL_RESULT_MAX,
     ) -> None:
         key = name.lower()
         if key in self._tools:
@@ -263,6 +269,7 @@ class ToolRegistry:
             network_scope=network_scope,
             rollback_capability=rollback_capability,
             preflight=preflight,
+            max_output_chars=max_output_chars,
         )
 
     def get(self, name: str) -> ToolSpec | None:
@@ -280,7 +287,7 @@ class ToolRegistry:
             return ToolResult(output=f"tool '{name}' not found", is_error=True)
         try:
             result = await spec.func(args)
-            return result.limit_output()
+            return result.limit_output(spec.max_output_chars)
         except Exception as e:
             return ToolResult(output=f"tool '{name}' error: {e}", is_error=True)
 

@@ -481,10 +481,11 @@
           </div>
           <ul class="scope-list">
             <li v-for="source in answerableSources" :key="source.id">
-              <label>
+              <label :class="{ unavailable: !canAnswer(source) }">
                 <input
                   type="checkbox"
                   :checked="answer.isSourceSelected(source.id)"
+                  :disabled="!canAnswer(source)"
                   :data-testid="`answer-source-${source.id}`"
                   @change="
                     answer.toggleSource(source.id, ($event.target as HTMLInputElement).checked)
@@ -538,6 +539,13 @@
                   model: answer.answer.value.model_name,
                 })
               }}
+            </span>
+          </div>
+
+          <div v-if="answer.claims.value.length" class="answer-evidence-heading">
+            <strong>{{ t('sources.answerEvidenceTitle') }}</strong>
+            <span>
+              {{ t('sources.answerEvidenceCount', { count: answer.evidence.value.length }) }}
             </span>
           </div>
 
@@ -719,10 +727,26 @@ const selectedLiteratureProvider = ref('arxiv')
 const answerOpen = ref(false)
 const answer = useLiteratureAnswer()
 
-/** Only sources that entered through the structured literature flow can answer. */
+/** Sources that entered through the structured literature flow. */
 const answerableSources = computed(() =>
   library.sources.value.filter((source) => isLiteratureSource(source)),
 )
+
+/**
+ * A source can only contribute evidence once the service has built its page-level
+ * index.  The UI field ``rag_status`` is set by this view after indexing, but the
+ * authoritative state lives in the literature metadata the service writes.
+ */
+function canAnswer(source: ProjectSource): boolean {
+  if (!isLiteratureSource(source)) return false
+  if (source.rag_status === 'ready') return true
+  const literature = source.metadata?.literature as
+    { index?: unknown; fulltext?: { status?: string } } | undefined
+  if (!literature) return false
+  return Boolean(literature.index) || literature.fulltext?.status === 'indexed'
+}
+
+const selectableSources = computed(() => answerableSources.value.filter(canAnswer))
 
 function isLiteratureSource(source: ProjectSource | null): boolean {
   return Boolean(source?.metadata?.literature)
@@ -737,13 +761,13 @@ function reasonLabel(
 }
 
 function openEvidenceAnswer() {
-  const available = answerableSources.value.map((source) => source.id)
+  const available = selectableSources.value.map((source) => source.id)
   answer.setSelection(answer.selectedSourceIds.value.filter((id) => available.includes(id)))
   answerOpen.value = true
 }
 
 function selectAllAnswerSources() {
-  answer.selectAll(answerableSources.value.map((source) => source.id))
+  answer.selectAll(selectableSources.value.map((source) => source.id))
 }
 
 async function submitAnswer() {
@@ -1990,6 +2014,21 @@ async function addZoteroItem(item: ZoteroItem) {
 }
 .answer-status[data-status='insufficient'] strong {
   color: var(--c-warn);
+}
+.answer-evidence-heading {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  margin-top: 10px;
+  font-size: 11px;
+  color: var(--c-text-3);
+}
+.answer-evidence-heading strong {
+  color: var(--c-text-1);
+  font-size: 12px;
+}
+.scope-list label.unavailable {
+  opacity: 0.55;
 }
 .answer-claims {
   display: grid;

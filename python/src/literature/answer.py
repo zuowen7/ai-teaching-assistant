@@ -125,14 +125,16 @@ class UnresolvedEvidence(BaseModel):
 
 
 _PAGE_RANGE_PATTERNS = (
-    re.compile(r"第\s*(\d{1,5})\s*[-–—~至到]\s*(\d{1,5})\s*页"),
-    re.compile(r"(?i)\bpp?\.\s*(\d{1,5})\s*[-–—~]\s*(\d{1,5})"),
-    re.compile(r"(?i)\bpages?\s+(\d{1,5})\s*[-–—~]\s*(\d{1,5})"),
+    re.compile(r"第\s*(\d{1,7})\s*[-–—~至到]\s*(\d{1,7})\s*[页頁]"),
+    # Long digit runs stay inside the range pattern so an absurd range is caught
+    # as unverifiable instead of leaking its first page as a plausible citation.
+    re.compile(r"(?i)\b(?:pp?|pg|pages?)\.?\s*(\d{1,7})\s*[-–—~]\s*(\d{1,7})"),
 )
 _PAGE_SINGLE_PATTERNS = (
-    re.compile(r"第\s*(\d{1,5})\s*页"),
-    re.compile(r"(?i)\bpp?\.\s*(\d{1,5})\b"),
-    re.compile(r"(?i)\bpages?\s+(\d{1,5})\b"),
+    re.compile(r"第\s*(\d{1,5})\s*[页頁]"),
+    # A bare "9 页" counts too: without it, dropping the 第 would evade the check.
+    re.compile(r"(\d{1,5})\s*[页頁]"),
+    re.compile(r"(?i)\b(?:pp?|pg|pages?)\.?\s*(\d{1,5})\b"),
 )
 
 

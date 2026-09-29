@@ -919,6 +919,8 @@ def register_academic_tools(registry: ToolRegistry) -> None:
                     "source_id": item.get("source_id"),
                     "title": item.get("title"),
                     "page": span.get("page_start"),
+                    "chunk_id": item.get("chunk_id") or span.get("chunk_id"),
+                    "artifact_sha256": span.get("artifact_sha256"),
                     "exact_quote": span.get("exact_quote"),
                     "context_before": span.get("context_before") or "",
                     "context_after": span.get("context_after") or "",
@@ -933,6 +935,9 @@ def register_academic_tools(registry: ToolRegistry) -> None:
             "source_ids": source_ids,
             "claims": [
                 {
+                    # The claim id is the same value the plain service entry
+                    # returns, so a session record can be compared with it.
+                    "claim_id": claim.get("claim_id"),
                     "text": claim.get("text"),
                     "evidence_ids": list(claim.get("evidence_ids") or []),
                     "evidence_status": claim.get("evidence_status"),
@@ -1157,6 +1162,9 @@ def register_academic_tools(registry: ToolRegistry) -> None:
         effects={"network"},
         approval_scope="exact-input",
         network_scope={"local-literature-api"},
+        # A multi-paper answer carries claims plus their page-level evidence;
+        # the default 4000-character budget would cut it into invalid JSON.
+        max_output_chars=24_000,
     )
 
     # ---- rag_search — 参考 claw-code retrieve_context_tool ----

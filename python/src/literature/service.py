@@ -232,6 +232,16 @@ class LiteratureServiceErrorCode(StrEnum):
     RETRIEVAL_UNAVAILABLE = "retrieval_unavailable"
 
 
+#: Failures that mean "the answer service cannot run right now", not "the corpus
+#: is silent"; they must not be folded into an honest insufficiency.
+_UNAVAILABLE_EVIDENCE_CODES = frozenset(
+    {
+        LiteratureServiceErrorCode.INDEX_STORE_UNAVAILABLE,
+        LiteratureServiceErrorCode.RETRIEVAL_UNAVAILABLE,
+    }
+)
+
+
 class LiteratureServiceError(RuntimeError):
     """Controlled application failure with no transport-specific status code."""
 
@@ -1511,6 +1521,10 @@ class LiteratureService:
                     chunk_id=hit.chunk_id,
                 )
             except LiteratureServiceError as exc:
+                # A broken store is not "the corpus cannot answer": it must stay
+                # distinguishable from an honest insufficiency (plan 5.9 rule 7).
+                if exc.code in _UNAVAILABLE_EVIDENCE_CODES:
+                    raise
                 unresolved.append(
                     UnresolvedEvidence(
                         source_id=hit.source_id,

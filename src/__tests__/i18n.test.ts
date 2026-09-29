@@ -1,4 +1,6 @@
 import { describe, it, expect } from 'vitest'
+import { readFileSync } from 'node:fs'
+import { resolve } from 'node:path'
 
 import { createAppI18n } from '../i18n'
 import zhMessages from '../i18n/locales/zh-CN.json'
@@ -15,6 +17,52 @@ function getAllKeys(obj: Record<string, unknown>, prefix = ''): string[] {
     }
   }
   return keys.sort()
+}
+
+/**
+ * `JSON.parse` silently keeps the last value of a duplicate member, so a locale
+ * file can carry two different translations for one key and pass every existing
+ * check.  This scanner reports duplicate member names inside the same object.
+ */
+function duplicateKeys(raw: string): string[] {
+  const duplicates: string[] = []
+  const stack: Array<{ keys: Set<string>; path: string }> = []
+  let lastKey = ''
+  let index = 0
+
+  while (index < raw.length) {
+    const char = raw[index]
+    if (char === '"') {
+      let end = index + 1
+      while (end < raw.length && !(raw[end] === '"' && raw[end - 1] !== '\\')) end += 1
+      const text = raw.slice(index + 1, end)
+      let probe = end + 1
+      while (probe < raw.length && /\s/.test(raw[probe])) probe += 1
+      if (raw[probe] === ':') {
+        const top = stack[stack.length - 1]
+        if (top) {
+          if (top.keys.has(text)) duplicates.push(top.path ? `${top.path}.${text}` : text)
+          top.keys.add(text)
+        }
+        lastKey = text
+      }
+      index = end + 1
+      continue
+    }
+    if (char === '{') {
+      const parent = stack[stack.length - 1]
+      const path = parent ? (parent.path ? `${parent.path}.${lastKey}` : lastKey) : ''
+      stack.push({ keys: new Set(), path })
+    } else if (char === '}') {
+      stack.pop()
+    }
+    index += 1
+  }
+  return duplicates
+}
+
+function readLocale(name: string): string {
+  return readFileSync(resolve(process.cwd(), 'src/i18n/locales', name), 'utf-8')
 }
 
 describe('i18n setup', () => {
@@ -48,5 +96,16 @@ describe('i18n setup', () => {
     expect(typeof i18n.global.t('mode.translate')).toBe('string')
     i18n.global.locale.value = 'en-US'
     expect(typeof i18n.global.t('mode.translate')).toBe('string')
+  })
+
+  it('declares no duplicate key inside the same object', () => {
+    expect(duplicateKeys(readLocale('zh-CN.json'))).toEqual([])
+    expect(duplicateKeys(readLocale('en-US.json'))).toEqual([])
+  })
+
+  it('detects a duplicate key when one is introduced', () => {
+    // Guards the guard: the scanner must fail on a deliberately duplicated key.
+    const broken = '{\n  "taskAgent": {\n    "you": "你",\n    "you": "你",\n  }\n}'
+    expect(duplicateKeys(broken)).toEqual(['taskAgent.you'])
   })
 })

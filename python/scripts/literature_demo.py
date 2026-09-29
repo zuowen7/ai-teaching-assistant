@@ -297,16 +297,18 @@ def run_demo(
             index_failures[source_id] = _error_code(response)
     step.count("indexed", len(indexed))
     step.count("failed", len(index_failures))
-    if not indexed:
-        step.failed("no_indexed_source")
-    elif index_failures:
+    if index_failures:
+        # Report the real cause; "nothing to index" is a different situation.
         step.failed(next(iter(index_failures.values())))
+    elif not indexed:
+        step.failed("no_indexed_source")
     else:
         step.ok()
 
     # 6. answer inside the scope of the indexed sources
     step = _Step(recorder, "answer")
     answer_status: str | None = None
+    answer_model_config_hash: str | None = None
     answer_payload: dict[str, Any] | None = None
     if not indexed:
         step.skipped("dependency_failed")
@@ -325,6 +327,7 @@ def run_demo(
         else:
             answer_payload = response.json()
             answer_status = str(answer_payload["status"])
+            answer_model_config_hash = answer_payload.get("model_config_hash")
             step.count("claims", len(answer_payload["claims"]))
             step.count("evidence", len(answer_payload["evidence"]))
             step.count("rejected_claims", len(answer_payload["rejected_claims"]))
@@ -353,7 +356,10 @@ def run_demo(
             step.count("quote_chars", len(span["exact_quote"]))
             step.ok()
 
-    run = recorder.finish(answer_status=answer_status)
+    run = recorder.finish(
+        answer_status=answer_status,
+        answer_model_config_hash=answer_model_config_hash,
+    )
     if write_records_to is not None:
         write_run_record(run, write_records_to)
     return run

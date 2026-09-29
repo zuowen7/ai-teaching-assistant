@@ -286,6 +286,13 @@ class TestReferencedPageNumbers:
             ("见第3页", {3}),
             ("no page reference here", set()),
             ("the study ran for 5 years", set()),
+            # Forms a model could use to smuggle a fabricated page past the check.
+            ("见 9 页", {9}),
+            ("第 9 頁", {9}),
+            ("see pg. 9", {9}),
+            ("see (p 9)", {9}),
+            ("see page9", {9}),
+            ("see pp 4-6", {4, 5, 6}),
         ],
     )
     def test_page_references_are_extracted(self, text: str, expected: set[int]) -> None:

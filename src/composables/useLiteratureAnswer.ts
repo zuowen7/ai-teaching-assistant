@@ -209,11 +209,10 @@ async function askQuestion(topK: number = DEFAULT_ANSWER_TOP_K): Promise<Literat
     error.value = message
     throw new Error(message)
   }
-  const project = projectPath()
-
   answering.value = true
   resetAnswer()
   try {
+    const project = projectPath()
     const response = await fetch(`${API_BASE}/api/literature/answer`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -268,8 +267,11 @@ export function useLiteratureAnswer() {
     error,
     expandedEvidenceIds,
     acquiringSourceId,
-    claims: computed(() => answer.value?.claims ?? []),
-    evidence: computed(() => answer.value?.evidence ?? []),
+    // Claims and evidence are only exposed for an answered result: an
+    // insufficient answer must never reach the UI as if it carried conclusions,
+    // whatever the server (or a stale cache) sends.
+    claims: computed(() => (answer.value?.status === 'answered' ? answer.value.claims : [])),
+    evidence: computed(() => (answer.value?.status === 'answered' ? answer.value.evidence : [])),
     rejectedClaims: computed(() => answer.value?.rejected_claims ?? []),
     unresolved: computed(() => answer.value?.unresolved ?? []),
     status: computed(() => answer.value?.status ?? null),

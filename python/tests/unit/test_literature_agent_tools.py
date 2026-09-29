@@ -754,6 +754,66 @@ class TestFullTextAndIndexTools:
         assert "source_artifact_missing" in result.output
 
 
+class TestAnswerPayloadBudget:
+    async def test_a_multi_paper_answer_is_not_truncated_into_invalid_json(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Regression: the 4000-character default cut real answers into broken JSON."""
+
+        quote = "evidence sentence. " * 70  # ~1330 characters, like a real page chunk
+        evidence = [
+            {
+                "source_id": f"src_demo_{index}",
+                "doc_id": f"project:src_demo_{index}",
+                "title": f"Demo Paper {index}",
+                "chunk_id": f"chunk_demo_{index}",
+                "paper_id": f"paper_demo_{index}",
+                "span": {
+                    "evidence_id": f"evidence_{index:024x}",
+                    "page_start": index,
+                    "page_end": index,
+                    "exact_quote": quote,
+                    "context_before": "before " * 20,
+                    "context_after": "after " * 20,
+                },
+            }
+            for index in range(1, 4)
+        ]
+        payload = {
+            **ANSWER_PAYLOAD,
+            "claims": [
+                {
+                    "claim_id": f"claim_{index:024x}",
+                    "text": f"Claim number {index} with its own evidence.",
+                    "evidence_ids": [item["span"]["evidence_id"] for item in evidence],
+                    "evidence_status": "supported",
+                }
+                for index in range(3)
+            ],
+            "evidence": evidence,
+        }
+        calls: list[tuple[str, dict]] = []
+        patch_client(monkeypatch, {"/api/literature/answer": _Response(payload)}, calls)
+        registry = build_registry(tmp_path)
+
+        result = await registry.execute(
+            "literature_answer", {"question": "Q?", "source_ids": ["src_demo_0001"]}
+        )
+
+        assert result.truncated is False
+        assert len(result.output) > 4_000
+        parsed = json.loads(result.output)
+        assert len(parsed["evidence"]) == 3
+        assert parsed["evidence"][0]["exact_quote"] == quote
+
+    def test_answer_tool_declares_a_larger_budget_than_the_default(self) -> None:
+        registry = build_registry()
+
+        assert registry.get("literature_answer").max_output_chars == 24_000
+        # Every other tool keeps the historical default.
+        assert registry.get("literature_search").max_output_chars == 4_000
+
+
 class TestRagSearchScope:
     async def test_rag_search_requires_explicit_sources(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

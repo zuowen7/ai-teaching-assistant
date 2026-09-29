@@ -1420,7 +1420,6 @@
       "failed": "RAG ingestion failed"
     },
     "acquireFullText": "Fetch open full text",
-    "acquiringFullText": "Fetching the open full text…",
     "fullTextAcquired": "Open full text acquired",
     "fullTextAcquireFailed": "Could not fetch the open full text",
     "answerSection": "Multi-paper evidence answers",

@@ -485,10 +485,10 @@ class LiteratureAnswerResult(BaseModel):
 2. **检索只走页级通道**。检索同时限定 `project_root` 与 `source_ids`；展平/翻译块即使被召回也不得作为证据，进入 `unresolved`（`missing_page_metadata`）。
 3. **先解析再生成**。每个命中块都必须经过与 `/api/literature/evidence` 相同的 `resolve_evidence` 路径（重新读文件、重新哈希、重新按页解析、坐标与块身份校验）。解析失败的块进入 `unresolved` 并保留子码（`artifact_hash_mismatch` / `stale_index` / `quote_mismatch` / `chunk_not_found` 等）。可用证据为 0 时**不调用模型**，直接返回 `insufficient`（`no_retrieval_hits` / `no_resolvable_evidence`）。没有来源标识的命中以 `missing_source_scope` 记为未解析，不静默丢弃。去重后的命中数不得超过 `top_k` 上限 20；超出属于检索实现违约，以 `answer_request_invalid` 显式失败，**不裁剪证据去凑答案**（裁剪可能丢掉唯一可核验的引文）。
 4. **生成约束**。`temperature=0`；模型只能使用服务端下发的 `evidence_id` 白名单；输出必须是单个 JSON 对象 `{"claims":[{"text","evidence_ids","evidence_status"}]}`（允许整体包在一个 ```` ```json ```` 围栏内，不允许夹带解释性文字）。非 JSON、缺字段、类型错误、单条结论文本超过 20 000 字符、单条结论引用超过 100 个证据 ID、或响应体超过 200 000 字符 → 显式 `answer_invalid_response`，不换模型、不静默重试制造成功。结论文本中的控制字符在进入合同模型前被剥离。证据集合超出提示预算（总长或单条引文上限）时以 `answer_request_invalid` 显式失败。
-5. **渲染前机器校验**。任一不通过即拒绝该结论并记入 `rejected_claims`：引用不在本轮白名单内（`unknown_evidence_id`）；结论文本出现的页码未落在其绑定证据的页码集合内（`fabricated_page_reference`，识别 `第 N 页`、`第 A-B 页`、`p.N`、`page N`）；supported/conflicting 却没有任何 `evidence_ids`（`missing_evidence`）；模型自述证据不足（`model_reported_insufficient`）；空文本（`empty_claim_text`）；结论数超过上限 20（`claim_limit_exceeded`）。**被拒结论不得降级为"无引用的结论"进入结果。**
+5. **渲染前机器校验**。任一不通过即拒绝该结论并记入 `rejected_claims`：引用不在本轮白名单内（`unknown_evidence_id`）；结论文本出现的页码未落在其绑定证据的页码集合内（`fabricated_page_reference`，识别 `第 N 页`、`N 页`、`第 N 頁`、`第 A-B 页`、`p.N`/`p N`/`pg. N`/`pageN`、`pp. A-B`；**这是有限枚举的正则识别，不是通用页码解析**，模型用未枚举写法（如 `página 9`）仍可能绕过，故本规则只降低而不能消除该风险）；supported/conflicting 却没有任何 `evidence_ids`（`missing_evidence`）；模型自述证据不足（`model_reported_insufficient`）；空文本（`empty_claim_text`）；结论数超过上限 20（`claim_limit_exceeded`）。**被拒结论不得降级为"无引用的结论"进入结果。**
 6. **结果一致性**。`claims[*].evidence_ids` 必须是 `evidence[*].evidence_id` 的子集，`evidence[*].source_id` 必须是请求 `source_ids` 的子集；完全相同的结论按 `claim_id` 去重。全部结论被拒或模型未给出结论时 `status=insufficient`。
-7. **失败即失败**。模型不可用 → `answer_model_unavailable`(503)；调用异常或超时 → `answer_generation_failed`(502)；索引存储不可用 → `index_store_unavailable`(503)。
-8. **不缓存答案**。每次请求都真实执行检索与解析；`model_config_hash` 由 provider、模型名、base_url、temperature、max_tokens 与提示版本 `evidence_answer_v1` 规范化哈希得到，**不得包含任何密钥**。
+7. **失败即失败**。模型不可用 → `answer_model_unavailable`(503)；调用异常或超时 → `answer_generation_failed`(502)；索引存储不可用 → `index_store_unavailable`(503)。`index_store_unavailable` 与 `retrieval_unavailable` 必须**穿透**证据解析循环向上抛出：向量库坏了不等于"语料答不了"，不得被折叠成 200 + `insufficient`；其余单块解析失败仍记为 `unresolved`。
+8. **不缓存答案**。每次请求都真实执行检索与解析；`model_config_hash` 由 provider、模型名、base_url、temperature、max_tokens 与提示版本 `evidence_answer_v1` 规范化哈希得到，**不得包含任何密钥**。注意：请求体确实发送 `temperature=0`，但若所选 provider 处于思考模式（如 DeepSeek reasoning），其客户端会丢弃该参数——此时"temperature=0"只成立于请求层，不成立于模型行为层，报告中不得写成"模型采样被冻结"。
 9. **证据展示（M9）**。`evidence` 条目必须携带 `source_id`、题名、`page_start`/`page_end`、`exact_quote`、`context_before`/`context_after`、`chunk_id` 与 `artifact_sha256`；前端不得渲染未出现在 `evidence` 中的引用，且必须显示 `rejected_claims` 与 `unresolved` 的条数与原因。
 
 分层验收：
@@ -509,7 +509,7 @@ class LiteratureAnswerResult(BaseModel):
 
 分层结果（2026-09-29）：
 
-- 单元层：`test_literature_answer.py` 43 例（提示只下发本轮白名单、响应解析的每个失败码、六类拒绝原因、结论去重与上限、无证据不调用模型）、`test_literature_answer_model.py` 16 例（身份与 `model_config_hash` 稳定、换密钥不改哈希、Provider 文本与异常）、`test_literature_answer_service.py` 30 例（范围校验、先解析再生成、模型/响应失败码、拒绝不降级、相同请求不被缓存）、`test_literature_answer_limits.py` 19 例（问题长度、来源与 `top_k` 上限、检索实现违约、结论洪泛、控制字符、并发、附件在回答中途被替换）、`test_literature_router.py` 新增 6 例 HTTP 契约（400/404/422/502/503 与"禁止客户端提交坐标或引文"）。Python 单元回归为 `1788 passed, 5 skipped`。
+- 单元层：`test_literature_answer.py` 67 例（提示只下发本轮白名单、响应解析的每个失败码、六类拒绝原因、结论去重与上限、无证据不调用模型）、`test_literature_answer_model.py` 16 例（身份与 `model_config_hash` 稳定、换密钥不改哈希、Provider 文本与异常）、`test_literature_answer_service.py` 34 例（范围校验、先解析再生成、模型/响应失败码、拒绝不降级、相同请求不被缓存、存储不可用不被降级为"证据不足"）、`test_literature_answer_limits.py` 19 例（问题长度、来源与 `top_k` 上限、检索实现违约、结论洪泛、控制字符、并发、附件在回答中途被替换）、`test_literature_router.py` 新增 6 例问答 HTTP 契约与 4 例"证据路由拒绝客户端引文/坐标"（400/404/422/502/503）。Python 单元回归为 `1788 passed, 5 skipped`（该数字为 P3 收口提交 `b856dcf` 上的实测值；例数为后续复核时用 `pytest --collect-only` 实测，早期本节误记为 43/30）。
 - 集成层：`test_literature_answer_integration.py` 2 例（真实 ChromaDB + 真实 PDF + 出货 `RagPageRetriever`，仅替换模型）：范围内问答的每条证据回链到重新解析的页文本切片，且不引用范围外来源；未索引来源返回 `insufficient` 且不调用模型。
 - 端到端层：`test_literature_evidence_e2e.py` 新增 1 例（真实应用 `create_app` + 离线 fixture provider + 经 `_create_provider` 注入的确定性答案模型）：检索 → 入库 → 附加 PDF → 页级索引 → 范围内问答 → 证据回链，且引文等于页文本切片；无范围问题返回 400 `scope_required`；语料无法回答的问题返回 `insufficient` + `model_reported_insufficient`，`claims` 与 `evidence` 均为空。
 - 集成层在首轮暴露一个单元层无法发现的真实缺陷并已修复（D-032）：页级 chunk 只用内容身份作为集合存储键，同一份 PDF 在两个来源或两个项目下索引时会互相覆盖页元数据，跨项目隔离失效。修复后同一份 PDF 的两个来源在真实 ChromaDB 中各自保持可检索，回归断言写入集成层。
@@ -549,9 +549,10 @@ M10 缓存路径规则：
 
 运行记录：
 
-- 每次运行写一份 JSON 记录，至少含 `run_id`、`mode`（`live` / `fixture`）、`provider`、`confirmed_query`、`steps`、`totals`（step/ok/failed/skipped）、`started_at`、`finished_at`、`duration_ms`、`answer_status`、`git_commit`。
-- 同一语料与同一确认检索式下重复运行必须产生**结构相同、逐字段可比**的记录（时间戳与 `run_id` 除外）；记录写入 `methods/literature_poc/runs/`（运行记录，不是方法协议）。
-- 记录不得包含任何密钥；`model_config_hash` 沿用 §5.9 的无密钥口径。
+- 每次运行写一份 JSON 记录，至少含 `run_id`、`mode`（`live` / `fixture`）、`provider`、`confirmed_query`、`steps`、`totals`（step/ok/failed/skipped）、`started_at`、`finished_at`、`duration_ms`、`answer_status`、`answer_model_config_hash`（答案步实际使用的模型配置哈希，取自该步应答）、`git_commit`。
+- 同一语料与同一确认检索式下重复运行必须产生**结构相同、逐字段可比**的记录（时间戳与 `run_id` 除外）；记录写入 `methods/literature_poc/runs/`（运行记录，不是方法协议）。由于 `run_id` 由内容派生、重复运行相同，同一秒内的两次运行必须靠文件名后缀区分，**不得互相覆盖**。
+- 记录不得包含任何密钥：既拒绝密钥类**键名**，也拒绝以 `sk-`、`ghp_`、`Bearer ` 等前缀开头的**值**；`answer_model_config_hash` 沿用 §5.9 的无密钥口径。
+- 四类失败场景都必须有独立原因码并使用户可读：`rate_limited`/`unavailable`（provider 失败 → 检索步 failed）、`access_unavailable`（无开放全文 → 获取步 failed 后仍继续）、`source_artifact_missing` 等（解析/索引失败 → 该步 failed，依赖步 `dependency_failed`）、`no_indexed_source`（确实没有可索引来源）。
 
 分层验收：
 
@@ -609,7 +610,7 @@ M10 缓存路径规则：
 - 移除 `arxiv_search`（原始 Atom XML）与无范围 `rag_search`：`rag_search` 现在必须显式给出 `source_ids`，并以工作区为 `project_root` 发送 `project_scoped=true`；缺工作区时 `literature_import` / `literature_answer` / `rag_search` 以 `project_scope_unavailable` 显式失败，而 `literature_search` 本身不含项目范围、不发送任何项目路径。
 - 工具结果结构化：检索返回 `result_mode`、`search_execution_id`、`total_results` 与每条记录的 `paper_id`/题名/作者/年份/访问状态；入库返回 `created`/`reused` 计数；应答返回 `status`、`insufficient_reason`、结论及其证据（题名、页码、精确原文）与未解析计数。服务端错误码（如 `rate_limited`、`source_not_found`）原样进入 `is_error` 结果，不重试、不降级。
 - 单元层 `python/tests/unit/test_literature_agent_tools.py` 19 例覆盖上述全部规则，包括"入参伪造 `project_path` 不生效""入库缺执行句柄/空选择被拒""应答缺 `source_ids` 或空问题被拒""`arxiv_search` 已不存在"。
-- 按 D-031 重写的既有用例：`tests/agent_v2/test_academic_tools.py` 的 arXiv 工具用例改为结构化服务用例；`tests/agent_v2/test_router_prompt.py` 的工具自省与 skill 工具契约表改用 `literature_search` / `literature_answer`；`runtime/conversation.py` 的选择期安全工具集与 `skills.py` 的 nature_citation 文本同步更新。`tests/agent_v2/` 全量为 `860 passed`。
+- 按 D-031 重写的既有用例：`tests/agent_v2/test_academic_tools.py` 的 arXiv 工具用例改为结构化服务用例；`tests/agent_v2/test_router_prompt.py` 的工具自省与 skill 工具契约表改用 `literature_search` / `literature_answer`；`runtime/conversation.py` 的选择期安全工具集与 `skills.py` 的 nature_citation 文本同步更新。`tests/agent_v2/` 全量为 `843 passed`（该目录单独运行；早期本节误把"该目录 + 新工具测试文件"合计的 860 写成目录全量）。
 - 全量后端为 `2998 passed, 14 skipped, 8 failed`；8 个失败仍是 §5.3–5.5 已记录且可在 `071c6b0` 复现的既存/环境问题，未出现 A1 工具层改造引入的新失败；前端全量为 `862 passed` 并通过 Prettier、ESLint 与 `vue-tsc`。
 - **仍未完成（A1 剩余部分）**：Agent 前端侧的计划展示、确认交互、状态与引用渲染未改造（`AgentExecutionGroup.vue` 只补了工具名到标签的映射：`literature_search` → 检索项目文献、`literature_answer` → 基于证据回答）；连续追问的会话级编排、证据不足时由 Agent 主动补充范围内检索或提出新检索计划的策略、以及 §2.4 八项验收场景的会话级覆盖都还没有实现或测试。**因此 A1 未通过阶段门，不能报告"智能体版本已完成"。**
 - 本节结果只证明"Agent 只能通过确定性服务、在项目范围内、经用户确认地访问文献与证据"，不证明检索质量、回答正确性、教学效果或 A1 整体验收通过。
@@ -653,13 +654,57 @@ M10 缓存路径规则：
 - 新增副作用工具 `literature_acquire_fulltext` 与 `literature_index`，使 Agent 能走完"检索 → 入库 → 获取开放全文 → 建立页级索引 → 证据问答"整条链；两者只调用既有服务接口，`access_unavailable` / `acquire_failed` 等失败码原样返回，工具描述要求失败时转告用户改用本地 PDF，不得声称已下载。
 - 确认不可绕过由注册契约保证：五个副作用工具的 `effects` 含 `network`，`ToolSpec.requires_approval` 为真，运行时在既有 `await_approval` 上暂停；即便会话开启自动批准，结果也会回显实际提交的检索式、`search_execution_id` + `paper_ids`、`question` + `source_ids`。
 - 证据不足必须改变下一步：`literature_answer` 在 `status=insufficient` 时额外返回 `next_actions=["widen_scope_within_project","propose_new_query_for_confirmation"]` 与 `must_not_answer_from_memory=true`，`answered` 时不返回这两个字段；工具描述写明"证据不足时不得凭记忆或常识作答"。
-- 会话级验收 `python/tests/integration/test_agent_literature_session_e2e.py` 6 例：真实 `ConversationRuntime` + 真实 `literature_*` 工具 + 真实应用（工具的 `SCHOLAR_API_BASE` 调用由 `httpx.ASGITransport` 直连同一应用，不启服务、不出网）。脚本模型只依据**真实工具结果**规划下一步，断言包括：七类副作用调用全部停在审批上且顺序与数量与导入结果一致；首个工具是 `literature_sources` 且初始 `source_count=0`；最终 `literature_answer` 为 `answered` 且每条证据都有真实页码与精确原文；拒绝审批时检索从未到达服务（结果中不出现 `search_exec_`）；越界 `source_id` 被服务以 `source_not_found` 拒绝；第二轮读到 `already_indexed` 后不再调用 `literature_index` 或 `literature_acquire_fulltext`；**证据不足时按 `next_actions` 在同一项目内扩大 `source_ids` 重问并得到 `answered`**；**同一会话的追问只调用 `literature_sources` + `literature_answer`，不重新检索或重建索引**。
+- 会话级验收 `python/tests/integration/test_agent_literature_session_e2e.py` 6 例：真实 `ConversationRuntime` + 真实 `literature_*` 工具 + 真实应用（工具的 `SCHOLAR_API_BASE` 调用由 `httpx.ASGITransport` 直连同一应用，不启服务、不出网）。脚本模型只依据**真实工具结果**规划下一步，断言包括：该链路全部 9 次副作用调用（检索、入库、3×获取全文、3×建索引、应答）逐一停在审批上且顺序与数量与导入结果一致；首个工具是 `literature_sources` 且初始 `source_count=0`；最终 `literature_answer` 为 `answered` 且每条证据都有真实页码与精确原文，并与直接调用 `/api/literature/answer` 的结论 ID 与证据（ID/页码/精确原文）逐项相等；结果经 `agent_event_to_sse` 转换后 `result_detail` 仍可 `json.loads` 且含证据（证明 SSE 边界不额外截断）；拒绝审批时**由计数传输层实测**只有 `/api/project/sources` 到达应用、检索从未发出；越界 `source_id` 被服务以 `source_not_found` 拒绝；第二轮读到本轮所建来源的 `already_indexed=true` 后不再调用 `literature_index` 或 `literature_acquire_fulltext`；**证据不足时按 `next_actions` 在同一项目内扩大 `source_ids` 重问并得到 `answered`**；**同一会话的追问只调用 `literature_sources` + `literature_answer`，不重新检索或重建索引**。
 - 会话级测试暴露一个真实缺陷并已修复：`literature_sources` 最初用工作区 UI 字段 `rag_status == "ready"` 判定 `already_indexed`，而该字段由前端在索引后自行更新——服务端索引成功时它仍是 `unavailable`，于是第二轮会重复索引。现在判定改为服务端写入的 literature 元数据（全文状态 `indexed` 或存在 `index` 记录），并有单元用例固化"UI 字段为 unavailable 但服务端已索引时 `already_indexed` 必须为真"。
 - 前端引用展示：新增 `AgentLiteratureEvidence.vue`（结论 → 可展开的页码级证据；`insufficient` 只显示原因；非合法 JSON 回退原文）；`AgentExecutionGroup.vue` 仅在工具名为 `literature_answer` 时改用该渲染器，SSE 事件名与 `tool_name` 契约未改动。
-- 测试与检查：`test_literature_agent_tools.py` 扩展到 39 例；会话级 6 例；前端 `AgentLiteratureEvidence.test.ts` 6 例与 `agentExecution.test.ts` 渲染分流 1 例（该文件改为保留真实 `createI18n`，使组件内 i18n 回退可被真实语言包校验）。全量后端为 `3024 passed, 14 skipped, 8 failed`，8 个失败仍是 §5.3–5.5 已记录且可在 `071c6b0` 复现的既存/环境问题；前端全量为 `869 passed`，Prettier、ESLint、`vue-tsc` 全部通过。
+- 测试与检查：`test_literature_agent_tools.py` 扩展到 41 例；会话级 6 例；前端 `AgentLiteratureEvidence.test.ts` 7 例与 `agentExecution.test.ts` 渲染分流 1 例（该文件改为保留真实 `createI18n`，使组件内 i18n 回退可被真实语言包校验），另有 i18n 重复键守卫 2 例。全量后端为 `3046 passed, 14 skipped, 8 failed`（§5.13 复核后），8 个失败仍是 §5.3–5.5 已记录且已独立复现于 `071c6b0` 的既存/环境问题；前端全量为 `874 passed`，Prettier、ESLint、`vue-tsc` 全部通过。
 - 工具失败与调用上限沿用 Agent V2 既有机制，未新增独立限制：连续工具错误上限由 `_DEFAULT_MAX_TOOL_ERRORS`（选择期 `_SELECTION_MAX_TOOL_ERRORS`）控制，回归用例为 `tests/agent_v2/test_conversation_runtime.py::test_tool_error_limit_counts_consecutive_failures`；停滞调用上限由 `max_stalled_tool_calls` 控制。
 - **仍未完成（A1 剩余部分）**：真实在线 arXiv 下的 Agent 会话未自动化（仍按 D-024 只做一次性人工冒烟）；`methods/literature_poc/METHODOLOGY.md` 仍未建立；多轮追问与"证据不足后补检索"由工具反馈驱动，会话级用例证明了**脚本模型按提示行动时链路成立**，但**没有**证明任意真实模型都会照做（这属于模型行为，不是确定性的系统保证，不得写成系统保证）。§2.4 的八项验收场景现已全部有对应覆盖：计划与确认、跳过重复处理、证据不足后补检索、用户取消、工具失败与调用上限（沿用既有回归）、跨项目与未选文献拒绝、最终证据与普通服务入口一致（同一 `/api/literature/answer` 响应）。
 - 本节结果只证明"Agent 能读到项目范围、确认不可绕过、证据不足有明确的下一步、引用在界面上可展开核对，且整条链在会话中真的跑通"，不证明检索质量、回答正确性、教学效果或 A1 整体验收通过。
+
+### 5.13 独立复核与订正（2026-09-29）
+
+本节记录一次针对 §5.9–§5.12 的独立复核：两路只读复核（后端证据链、前端与 A1 各一路）+ 一次自测式复核。复核**发现并修复了真实缺陷**，也**订正了本文档自身的错误数字**。
+
+**验证方法（可复现）**
+
+- 全量后端：`cd python && pytest tests/ -q` → `3046 passed, 14 skipped, 8 failed`。
+- "8 个失败是既存问题"：`git worktree add <tmp> 071c6b0` 后在干净基线单跑这 8 个用例 → `8 failed, 17 passed`，失败集合与当前逐项相同。**该说法现已独立复现，不再只继承自 §5.5 的记录。**
+- P3 历史快照：`git worktree add <tmp> b856dcf` 后 `pytest tests/unit/ -q` → `1788 passed, 5 skipped`，与 §5.9 一致。
+- 例数：`pytest --collect-only -q <file>` 逐文件实测（参数化用例按实际收集数计）。
+- 前端：`npx vitest run` → `874 passed`；Prettier、ESLint、`vue-tsc` 通过。
+
+**复核发现并已修复的缺陷**
+
+| # | 缺陷 | 影响 | 修复 | 回归测试 |
+|---|---|---|---|---|
+| V-1 | 工具结果默认上限 4000 字符，SSE 适配层又 `out[:4000]`；多文献答案（≥2 条页级证据）被截断成非法 JSON | 前端按 §5.12 规则回退成原始文本，"结论 + 可展开证据"在真实规模下静默失效；截断同时进入模型上下文 | 新增按工具的输出预算（`ToolSpec.max_output_chars`，默认仍 4000），`literature_answer` 用 24000；适配层只保留 32000 硬上限，不再二次截断 | `test_literature_agent_tools.py::TestAnswerPayloadBudget`（3×1330 字引文，断言未截断且可 `json.loads`）、`test_sse_adapter.py`（9000 字透传 / 40000 字按硬上限）、组件与 `agentExecution` 的真实 SSE 形状用例、会话 e2e 的 `agent_event_to_sse` 往返断言 |
+| V-2 | "证据不足不渲染结论"只依赖服务端不变量，前端两个渲染点无条件透传 claims | 一旦服务端或缓存返回带 claims 的 `insufficient`，界面会把它当正常结论渲染，且没有测试会失败 | `useLiteratureAnswer` 的 claims/evidence 计算属性与 `AgentLiteratureEvidence` 的解析结果都按 `status === 'answered'` 收敛 | 两处 fixture 改为**故意违约**（insufficient + 非空 claims/evidence）；已实测"去掉门禁即变红" |
+| V-3 | `index_store_unavailable` / `retrieval_unavailable` 在问答路径被折叠成 `unresolved` + 200 `insufficient` | 客户端无法区分"语料答不了"与"向量库坏了"，§5.9 规则 7 的错误码在该路径不可达 | 服务在证据解析循环中对这两个码直接上抛 | `test_literature_answer_service.py`（参数化两码） |
+| V-4 | 页码伪造检测只识别 4 种写法，`见 9 页`、`第 9 頁`、`pg. 9`、`(p 9)`、`page9` 均可绕过 | 模型可用未枚举写法带出伪造页码 | 扩展为 6 类模式（含裸 `N 页/頁`、`pg`、无空格形式），并把超长数字段留给范围模式，使"荒谬范围"仍判为不可核验 | 新增 6 个正例 + 原有反例 + 荒谬范围回归 |
+| V-5 | P4 运行记录缺 `answer_model_config_hash`；"不得含密钥"只查键名；同秒重复运行会覆盖同名记录 | 记录与密钥口径不一致，重复运行可能丢记录 | 记录新增该字段；密钥检查扩展为键名 + 值前缀；写文件遇同名自动加后缀 | `test_literature_demo.py` 三例 |
+| V-6 | P4 四类失败场景只有两类有测试；`index` 步把真实失败码盖成 `no_indexed_source` | §5.10 承诺的失败原因码未被验证，真实原因会被掩盖 | 脚本改为优先报真实失败码；补 provider 429、索引 409、无开放全文三条用例 | `test_literature_demo.py::TestDemoRunFailureScenarios` 三例 |
+| V-7 | 会话 e2e 两处断言不可证伪：拒绝用例只查运行时自造文本；复用用例的 `all(... if rag_status == "ready")` 恒真（服务端从不写该值） | "检索从未到达服务"与"跳过重复索引"实际未被验证 | 用计数传输层实测到达应用的路径集合；改用本轮真实建立的 `source_id` 集合断言 `already_indexed` | `test_agent_literature_session_e2e.py` |
+| V-8 | `/api/literature/evidence` 拒绝客户端引文/坐标这条承诺没有测试 | 承诺无覆盖 | 补 4 例参数化负例（引文、证据 ID、字符坐标、页码坐标均 422） | `test_literature_router.py` |
+| V-9 | Agent 侧证据投影缺 `chunk_id` 与 `artifact_sha256` | 会话内引用无法就地回链校验，与 §5.9 规则 9 的字段口径不一致 | 投影补齐两字段 | 既有工具测试覆盖字段集合 |
+
+**已订正的文档错误**
+
+- §5.9 单元例数：`test_literature_answer.py` 43 → **67**；`test_literature_answer_service.py` 30 → **34**。前者自首个提交起未变，属**当时写错**，不是时间漂移；其余例数（16/19/23/39）实测一致。
+- §5.11 `tests/agent_v2/` 全量 860 → **843**（860 是"该目录 + 新工具测试文件"的合计）。
+- §5.12 "七类副作用调用" → **9 次**（检索 + 入库 + 3×获取 + 3×建索引 + 应答），与实际断言一致。
+- D-029/§5.9 规则 5 的页码格式清单补全，并明确"有限枚举、非通用解析"。
+- §5.9 规则 8 补注：思考模式 provider 会丢弃 `temperature`，"temperature=0"只成立于请求层。
+
+**复核确认成立的部分**（不重复证据）：坐标派生引文且调用方不能提交引文/坐标、项目与文献双范围强制、无可用证据不调用模型、被拒结论不降级、D-032 存储键与内容身份分离、运行中应用注册 `fixture` provider 且 `result_mode` 不混用、五个副作用工具 `requires_approval` 为真且项目范围不可由入参覆盖、`already_indexed` 由服务端元数据判定、`next_actions` 仅在 `insufficient` 出现、前端 i18n 键对称与分组正确、SSE 事件名与 `tool_name` 契约未被改动。
+
+**仍未验证 / 已知限制**
+
+- 真实在线 arXiv 模式与真实模型的会话行为未自动化（D-024）。
+- 页码伪造检测是有限枚举，`página 9` 等未枚举写法仍可绕过。
+- 思考模式下采样温度不可控。
+- CLI 完整流程未在真实服务器上自动化。
+- `methods/literature_poc/METHODOLOGY.md` 仍未建立；运行记录只含过程事实。
 
 ## 6. 验证与毕设方法边界
 
