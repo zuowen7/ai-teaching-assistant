@@ -13,6 +13,14 @@
       >
         <Search :size="14" /> {{ t('sources.discoverLiterature') }}
       </UiButton>
+      <UiButton
+        variant="secondary"
+        size="sm"
+        data-testid="open-evidence-answer"
+        @click="openEvidenceAnswer"
+      >
+        <ShieldCheck :size="14" /> {{ t('sources.answerSection') }}
+      </UiButton>
       <UiButton variant="secondary" size="sm" @click="openZotero">
         <BookOpen :size="14" /> {{ t('sources.fromZotero') }}
       </UiButton>
@@ -141,6 +149,16 @@
               @click="pickReference(selectedSource)"
             >
               <Plus :size="14" /> {{ t('sources.attachFullText') }}
+            </UiButton>
+            <UiButton
+              v-if="isLiteratureSource(selectedSource) && !selectedSource.original_path"
+              variant="secondary"
+              size="sm"
+              data-testid="acquire-open-fulltext"
+              :loading="answer.acquiringSourceId.value === selectedSource.id"
+              @click="acquireOpenFullText(selectedSource)"
+            >
+              <FileDown :size="14" /> {{ t('sources.acquireFullText') }}
             </UiButton>
             <UiButton
               variant="secondary"
@@ -420,6 +438,163 @@
       </section>
     </div>
 
+    <div
+      v-if="answerOpen"
+      class="zotero-overlay"
+      data-testid="evidence-answer-dialog"
+      @click.self="answerOpen = false"
+    >
+      <section
+        class="zotero-dialog literature-dialog"
+        role="dialog"
+        :aria-label="t('sources.answerSection')"
+      >
+        <div class="dialog-heading">
+          <div>
+            <span>{{ t('sources.answerSectionHint') }}</span>
+            <h2>{{ t('sources.answerSection') }}</h2>
+          </div>
+          <button type="button" :aria-label="t('general.close')" @click="answerOpen = false">
+            <X :size="18" />
+          </button>
+        </div>
+
+        <section class="answer-scope" data-testid="answer-scope">
+          <div class="section-title">
+            <strong>{{ t('sources.answerScope') }}</strong>
+            <span>{{
+              t('sources.answerSelectedCount', { count: answer.selectedCount.value })
+            }}</span>
+          </div>
+          <p class="answer-hint">{{ t('sources.answerScopeHint') }}</p>
+          <div class="scope-actions">
+            <button type="button" data-testid="answer-select-all" @click="selectAllAnswerSources">
+              {{ t('sources.answerSelectAll') }}
+            </button>
+            <button
+              type="button"
+              data-testid="answer-clear-selection"
+              @click="answer.clearSelection()"
+            >
+              {{ t('sources.answerClearSelection') }}
+            </button>
+          </div>
+          <ul class="scope-list">
+            <li v-for="source in answerableSources" :key="source.id">
+              <label>
+                <input
+                  type="checkbox"
+                  :checked="answer.isSourceSelected(source.id)"
+                  :data-testid="`answer-source-${source.id}`"
+                  @change="
+                    answer.toggleSource(source.id, ($event.target as HTMLInputElement).checked)
+                  "
+                />
+                <span>{{ source.title }}</span>
+                <i>{{ t(`sources.rag.${source.rag_status}`) }}</i>
+              </label>
+            </li>
+          </ul>
+        </section>
+
+        <form class="answer-form" data-testid="answer-form" @submit.prevent="submitAnswer">
+          <label class="literature-field question-field">
+            <span>{{ t('sources.answerQuestion') }}</span>
+            <textarea
+              v-model="answer.question.value"
+              rows="2"
+              data-testid="answer-question"
+              :placeholder="t('sources.answerQuestionPlaceholder')"
+            />
+          </label>
+          <UiButton
+            type="submit"
+            variant="primary"
+            size="sm"
+            data-testid="answer-submit"
+            :loading="answer.answering.value"
+            :disabled="!answer.selectedCount.value"
+          >
+            {{ answer.answering.value ? t('sources.answering') : t('sources.askSelected') }}
+          </UiButton>
+        </form>
+
+        <section v-if="answer.answer.value" class="answer-result" data-testid="answer-result">
+          <div class="answer-status" :data-status="answer.status.value">
+            <strong>
+              {{
+                answer.status.value === 'answered'
+                  ? t('sources.answerStatusAnswered')
+                  : t('sources.answerStatusInsufficient')
+              }}
+            </strong>
+            <span v-if="answer.insufficientReason.value">
+              {{ reasonLabel('insufficientReason', answer.insufficientReason.value) }}
+            </span>
+            <span>
+              {{
+                t('sources.answerModelRecord', {
+                  provider: answer.answer.value.model_provider,
+                  model: answer.answer.value.model_name,
+                })
+              }}
+            </span>
+          </div>
+
+          <ul v-if="answer.claims.value.length" class="answer-claims" data-testid="answer-claims">
+            <li v-for="claim in answer.claims.value" :key="claim.claim_id">
+              <p class="claim-text">{{ claim.text }}</p>
+              <ul class="claim-evidence">
+                <li v-for="item in answer.evidenceForClaim(claim)" :key="item.span.evidence_id">
+                  <button
+                    type="button"
+                    :data-testid="`evidence-toggle-${item.span.evidence_id}`"
+                    @click="answer.toggleEvidence(item.span.evidence_id)"
+                  >
+                    {{ item.title }} ·
+                    {{ t('sources.answerEvidencePage', { page: item.span.page_start }) }}
+                  </button>
+                  <blockquote
+                    v-if="answer.isEvidenceExpanded(item.span.evidence_id)"
+                    :data-testid="`evidence-quote-${item.span.evidence_id}`"
+                  >
+                    <p v-if="item.span.context_before" class="evidence-context">
+                      {{ item.span.context_before }}
+                    </p>
+                    <p class="evidence-quote">{{ item.span.exact_quote }}</p>
+                    <p v-if="item.span.context_after" class="evidence-context">
+                      {{ item.span.context_after }}
+                    </p>
+                  </blockquote>
+                </li>
+              </ul>
+            </li>
+          </ul>
+
+          <p
+            v-if="answer.rejectedClaims.value.length"
+            class="answer-note"
+            data-testid="answer-rejected"
+          >
+            {{ t('sources.answerRejectedSummary', { count: answer.rejectedClaims.value.length }) }}
+            <span v-for="item in answer.rejectedClaims.value" :key="item.text">
+              · {{ reasonLabel('rejectedReason', item.reason) }}
+            </span>
+          </p>
+          <p
+            v-if="answer.unresolved.value.length"
+            class="answer-note"
+            data-testid="answer-unresolved"
+          >
+            {{ t('sources.answerUnresolvedSummary', { count: answer.unresolved.value.length }) }}
+            <span v-for="item in answer.unresolved.value" :key="`${item.chunk_id}-${item.reason}`">
+              · {{ reasonLabel('unresolvedReason', item.reason) }}
+            </span>
+          </p>
+        </section>
+      </section>
+    </div>
+
     <div v-if="zoteroOpen" class="zotero-overlay" @click.self="zoteroOpen = false">
       <section class="zotero-dialog" role="dialog" :aria-label="t('sources.fromZotero')">
         <div class="dialog-heading">
@@ -466,6 +641,7 @@ import {
   BookOpen,
   CheckCircle2,
   Database,
+  FileDown,
   FileText,
   Languages,
   Library,
@@ -473,6 +649,7 @@ import {
   Plus,
   Quote,
   Search,
+  ShieldCheck,
   Trash2,
   X,
 } from 'lucide-vue-next'
@@ -481,6 +658,7 @@ import { useI18n } from 'vue-i18n'
 import AppHeader from './shell/AppHeader.vue'
 import EmptyState from './shell/EmptyState.vue'
 import UiButton from './ui/UiButton.vue'
+import { i18n } from '../i18n'
 import {
   useSourceLibrary,
   type ProjectSource,
@@ -497,6 +675,7 @@ import {
   useLiteratureDiscovery,
   type LiteraturePaperRecord,
 } from '../composables/useLiteratureDiscovery'
+import { useLiteratureAnswer } from '../composables/useLiteratureAnswer'
 
 defineProps<{
   healthOk: boolean
@@ -537,6 +716,58 @@ const researchQuestion = ref('')
 const suggestedLiteratureQuery = ref('')
 const confirmedLiteratureQuery = ref('')
 const selectedLiteratureProvider = ref('arxiv')
+const answerOpen = ref(false)
+const answer = useLiteratureAnswer()
+
+/** Only sources that entered through the structured literature flow can answer. */
+const answerableSources = computed(() =>
+  library.sources.value.filter((source) => isLiteratureSource(source)),
+)
+
+function isLiteratureSource(source: ProjectSource | null): boolean {
+  return Boolean(source?.metadata?.literature)
+}
+
+function reasonLabel(
+  group: 'insufficientReason' | 'rejectedReason' | 'unresolvedReason',
+  reason: string,
+): string {
+  const key = `sources.${group}.${reason}`
+  return i18n.global.te(key) ? t(key) : reason
+}
+
+function openEvidenceAnswer() {
+  const available = answerableSources.value.map((source) => source.id)
+  answer.setSelection(answer.selectedSourceIds.value.filter((id) => available.includes(id)))
+  answerOpen.value = true
+}
+
+function selectAllAnswerSources() {
+  answer.selectAll(answerableSources.value.map((source) => source.id))
+}
+
+async function submitAnswer() {
+  try {
+    await answer.askQuestion()
+  } catch (cause) {
+    pushError(cause instanceof Error ? cause.message : t('sources.answerFailed'))
+  }
+}
+
+/**
+ * Ask the service for the declared open PDF, then re-read the library: the
+ * server owns ``metadata.literature`` and rewriting it locally would be refused.
+ */
+async function acquireOpenFullText(source: ProjectSource) {
+  try {
+    const result = await answer.acquireFullText(source.id)
+    await library.loadSources().catch(() => undefined)
+    if (result.status === 'fulltext_ready') success(t('sources.fullTextAcquired'))
+    else pushError(result.failure_reason || t('sources.fullTextAcquireFailed'))
+  } catch (cause) {
+    pushError(cause instanceof Error ? cause.message : t('sources.fullTextAcquireFailed'))
+  }
+}
 
 const selectedSource = computed(
   () => library.sources.value.find((source) => source.id === selectedSourceId.value) ?? null,
@@ -615,6 +846,9 @@ watch(
     researchQuestion.value = ''
     suggestedLiteratureQuery.value = ''
     confirmedLiteratureQuery.value = ''
+    // An answer is scoped to a project and its sources; keep it out of the next one.
+    answer.reset()
+    answerOpen.value = false
   },
 )
 
@@ -1688,5 +1922,129 @@ async function addZoteroItem(item: ZoteroItem) {
     margin-top: 12px;
     padding-top: 12px;
   }
+}
+.answer-scope,
+.answer-form,
+.answer-result {
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid var(--c-border);
+}
+.answer-hint {
+  margin: 4px 0 0;
+  color: var(--c-text-3);
+  font-size: 11px;
+  line-height: 1.6;
+}
+.scope-actions {
+  display: flex;
+  gap: 10px;
+  margin: 8px 0;
+}
+.scope-actions button {
+  padding: 0;
+  border: none;
+  background: none;
+  color: var(--c-accent);
+  font-size: 11px;
+  cursor: pointer;
+}
+.scope-list {
+  display: grid;
+  gap: 6px;
+  max-height: 22vh;
+  margin: 0;
+  padding: 0;
+  overflow: auto;
+  list-style: none;
+}
+.scope-list label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--c-text-2);
+}
+.scope-list i {
+  margin-left: auto;
+  color: var(--c-text-3);
+  font-size: 10px;
+  font-style: normal;
+}
+.answer-form {
+  display: grid;
+  gap: 10px;
+  justify-items: start;
+}
+.answer-status {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 10px;
+  font-size: 11px;
+  color: var(--c-text-3);
+}
+.answer-status strong {
+  color: var(--c-text-1);
+  font-size: 12px;
+}
+.answer-status[data-status='insufficient'] strong {
+  color: var(--c-warn);
+}
+.answer-claims {
+  display: grid;
+  gap: 10px;
+  margin: 10px 0 0;
+  padding: 0;
+  list-style: none;
+}
+.claim-text {
+  margin: 0;
+  color: var(--c-text-1);
+  font-size: 12px;
+  line-height: 1.7;
+}
+.claim-evidence {
+  display: grid;
+  gap: 6px;
+  margin: 6px 0 0;
+  padding: 0;
+  list-style: none;
+}
+.claim-evidence button {
+  padding: 0;
+  border: none;
+  background: none;
+  color: var(--c-accent);
+  font-size: 11px;
+  text-align: left;
+  cursor: pointer;
+}
+.claim-evidence blockquote {
+  margin: 4px 0 0;
+  padding: 8px 10px;
+  border: 1px solid var(--c-border);
+  border-radius: 8px;
+  background: var(--c-panel);
+}
+.evidence-quote {
+  margin: 0;
+  color: var(--c-text-1);
+  font-size: 11px;
+  line-height: 1.7;
+  white-space: pre-wrap;
+}
+.evidence-context {
+  margin: 0;
+  color: var(--c-text-3);
+  font-size: 11px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+}
+.answer-note {
+  margin: 8px 0 0;
+  color: var(--c-warn);
+  font-size: 11px;
+  line-height: 1.7;
 }
 </style>
