@@ -7,6 +7,13 @@ from typing import Any
 VALID_THINKING_MODES = frozenset({"auto", "enabled", "disabled"})
 VALID_REASONING_EFFORTS = frozenset({"low", "high", "max"})
 
+#: Model-name prefixes of the official DeepSeek V4 family, which defaults to
+#: thinking mode and accepts ``reasoning_effort``.  DeepSeek renamed the V4.1
+#: line — ``deepseek-v4-flash`` is deprecated in favour of ``deepseek-flash``
+#: (the old alias still resolves to the same model) — so both spellings are
+#: matched; otherwise the policy silently stops applying after the rename.
+_DEEPSEEK_V4_MODEL_PREFIXES = ("deepseek-v4-", "deepseek-flash")
+
 
 def normalize_thinking_mode(value: Any) -> str:
     """Return a supported thinking mode, falling back to automatic policy."""
@@ -32,7 +39,7 @@ def normalize_reasoning_effort(value: Any) -> str | None:
 def resolve_thinking_mode(base_url: str, model: str, configured: Any = "auto") -> str | None:
     """Resolve request-level thinking control.
 
-    DeepSeek V4 defaults to thinking mode. Scholar Assistant's translation,
+    DeepSeek V4 defaults to thinking mode.  Scholar Assistant's translation,
     structured extraction, and tool loop need bounded latency, so automatic
     policy explicitly selects non-thinking mode on the official endpoint.
     Other providers receive no vendor-specific parameter.
@@ -49,7 +56,7 @@ def resolve_thinking_mode(base_url: str, model: str, configured: Any = "auto") -
     if mode != "auto":
         return mode
 
-    if normalized_model.startswith("deepseek-v4-"):
+    if normalized_model.startswith(_DEEPSEEK_V4_MODEL_PREFIXES):
         return "disabled"
     return None
 
@@ -82,7 +89,7 @@ def apply_reasoning_effort_policy(
     if (
         effort is not None
         and "api.deepseek.com" in normalized_url
-        and normalized_model.startswith("deepseek-v4-")
+        and normalized_model.startswith(_DEEPSEEK_V4_MODEL_PREFIXES)
     ):
         payload["reasoning_effort"] = effort
         return effort

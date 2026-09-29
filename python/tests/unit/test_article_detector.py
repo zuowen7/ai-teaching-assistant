@@ -87,6 +87,65 @@ class TestDetectByTruncation:
         assert len(boundaries) == 1
 
 
+class TestDetectBySplitInitial:
+    """Strategy C: the extractor strands the opening word's first letter.
+
+    Shape taken from a real Science Perspectives extraction, where the text has no
+    blank line before the new article and strategy B therefore never fires.
+    """
+
+    SECOND_ARTICLE = (
+        "Laurie S. Huning and Manuela I. Brunner\n"
+        "I\n"
+        "n 2023, extreme heat propelled the spread of severe wildfires.\n"
+    )
+    THIRD_ARTICLE = (
+        "Guillaume Blot and Przemyslaw Sapieha\n"
+        "I\n"
+        "nflammation is transient, but its consequences can be lifelong.\n"
+    )
+
+    def test_stranded_initial_marks_a_boundary(self):
+        text = "First article about fossils.\nSome body text.\n" + self.SECOND_ARTICLE
+
+        boundaries = detect_articles(text)
+
+        assert len(boundaries) == 2
+        assert boundaries[1][2] == "In"
+
+    def test_two_stranded_initials_split_three_articles(self):
+        text = (
+            "First article about Masripithecus.\n"
+            "More about fossils.\n"
+            "Multifaceted effects of extreme\n" + self.SECOND_ARTICLE + "Designed to remember\n"
+            "S pecific DNA sequence features.\n" + self.THIRD_ARTICLE
+        )
+
+        articles = extract_articles(text)
+
+        assert len(articles) == 3
+        assert "Masripithecus" in articles[0]
+        assert articles[1].startswith("In 2023, extreme heat")
+        assert articles[2].startswith("Inflammation is transient")
+        assert not articles[1].startswith("n 2023")
+
+    def test_pronoun_i_line_is_not_a_boundary(self):
+        text = (
+            "A normal article.\n"
+            "I\n"
+            "think this sentence continues normally without truncation.\n"
+            "More text follows here."
+        )
+
+        assert len(detect_articles(text)) == 1
+
+    def test_stranded_letter_must_match_the_known_word(self):
+        # "n" is a known truncation of "In", but "T" + "n 2023" is not that word.
+        text = "Body text.\nT\nn 2023, something happened.\nMore text."
+
+        assert len(detect_articles(text)) == 1
+
+
 class TestExtractArticles:
     """extract_articles returns correct article texts."""
 

@@ -7,7 +7,10 @@ download, parse, index, or answer from full text; those are later PoC phases.
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import inspect
+import mimetypes
 import re
 import unicodedata
 import uuid
@@ -17,14 +20,49 @@ from collections.abc import Callable, Mapping, Sequence
 from copy import deepcopy
 from datetime import UTC, datetime
 from enum import StrEnum
+from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
+from urllib.parse import urlparse
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from src.literature.answer import (
+    AnswerEvidenceCandidate,
+    AnswerResponseError,
+    AnswerStatus,
+    InsufficientReason,
+    RejectedClaim,
+    RejectedClaimReason,
+    UnresolvedEvidence,
+    build_answer_prompt,
+    build_answer_system_prompt,
+    parse_answer_response,
+    validate_answer_claims,
+)
+from src.literature.answer_model import EvidenceAnswerModel
+from src.literature.evidence import (
+    CHUNKER_VERSION,
+    INDEX_VERSION,
+    PARSER_VERSION,
+    EvidenceResolutionError,
+    assert_current_versions,
+    evidence_metadata,
+    normalized_pages,
+    resolve_evidence_span,
+    sha256_file,
+)
+from src.literature.fulltext import (
+    FullTextDownloader,
+    FullTextDownloadError,
+    maybe_aclose,
+    select_open_pdf_location,
+)
 from src.literature.models import (
     AccessKind,
     AccessLocation,
     AccessStatus,
+    AnswerClaim,
+    EvidenceSpan,
     ExternalIdentifiers,
     FullTextArtifact,
     FullTextStatus,
@@ -46,8 +84,22 @@ _SOURCE_SCHEMA_VERSION = 1
 _MAX_SNAPSHOT_IDS_PER_SOURCE = 50
 _MAX_SOURCE_ID_ATTEMPTS = 20
 _MAX_SEARCH_EXECUTION_ID_ATTEMPTS = 20
+_MAX_CACHED_PAGE_TEXTS = 8
+_EVIDENCE_ARTIFACT_SUFFIXES = {".pdf"}
+_FILE_PRESENT_STATUSES = {
+    FullTextStatus.FULLTEXT_READY,
+    FullTextStatus.PARSING,
+    FullTextStatus.PARSED,
+    FullTextStatus.PARSE_FAILED,
+    FullTextStatus.INDEXING,
+    FullTextStatus.INDEXED,
+    FullTextStatus.INDEX_FAILED,
+}
 _SAFE_SOURCE_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,64}$")
 _SAFE_SEARCH_EXECUTION_ID_RE = re.compile(r"^search_exec_[0-9a-f]{32}$")
+DEFAULT_ANSWER_TOP_K = 8
+MAX_ANSWER_TOP_K = 20
+MAX_ANSWER_SOURCES = 50
 
 
 @runtime_checkable
@@ -62,6 +114,93 @@ class ProjectSourceStore(Protocol):
         """Run ``update`` inside one project-manifest read-modify-write lock."""
         ...
 
+    def read_sources(self, project_path: str) -> list[dict[str, Any]]:
+        """Return the project's sources without modifying them."""
+        ...
+
+    def resolve_source_artifact(self, project_path: str, source: Mapping[str, Any]) -> str:
+        """Return the project-internal absolute path of a source's full text."""
+        ...
+
+
+@runtime_checkable
+class PageIndexStore(Protocol):
+    """Narrow page-aware index boundary required by the service."""
+
+    async def embedding_identity(self) -> tuple[str, str]:
+        """Return the embedding model/version the index actually uses."""
+        ...
+
+    async def index_pages(
+        self,
+        *,
+        doc_id: str,
+        title: str,
+        pages: Sequence[tuple[int, str]],
+        artifact_sha256: str,
+        project_root: str | None = None,
+        source_id: str | None = None,
+        filename: str | None = None,
+        force: bool = False,
+    ) -> Mapping[str, Any]:
+        """Write page-scoped chunks and return the stored document entry."""
+        ...
+
+    async def get_chunk(
+        self, chunk_id: str, *, source_id: str | None = None
+    ) -> Mapping[str, Any] | None:
+        """Return one stored chunk, optionally restricted to one source."""
+        ...
+
+    async def get_document(self, doc_id: str) -> Mapping[str, Any] | None:
+        """Return one stored document entry or ``None``."""
+        ...
+
+
+@runtime_checkable
+class ArtifactStore(Protocol):
+    """Project-side storage of an acquired full-text file."""
+
+    def store_source_artifact(
+        self,
+        project_path: str,
+        source_id: str,
+        filename: str,
+        content: bytes,
+    ) -> str:
+        """Write one artifact inside the project and return its absolute path."""
+        ...
+
+
+class RetrievedChunk(BaseModel):
+    """One scoped retrieval hit: a chunk identity plus the source it belongs to.
+
+    ``source_id`` may be blank for a legacy flat-text chunk that carries no source
+    identity; the service reports those as unresolved instead of dropping them.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    chunk_id: str = Field(min_length=1, max_length=128)
+    source_id: str = Field(default="", max_length=64)
+    text: str = Field(default="", max_length=100_000)
+
+
+@runtime_checkable
+class EvidenceRetriever(Protocol):
+    """Scoped page retrieval: the only route by which an answer finds evidence."""
+
+    async def retrieve(
+        self,
+        *,
+        project_root: str,
+        source_ids: Sequence[str],
+        query: str,
+        top_k: int,
+    ) -> Sequence[RetrievedChunk]:
+        """Return page-level hits inside one project and its selected sources."""
+        ...
+
 
 class LiteratureServiceErrorCode(StrEnum):
     UNKNOWN_PROVIDER = "unknown_provider"
@@ -71,6 +210,36 @@ class LiteratureServiceErrorCode(StrEnum):
     PROJECT_DATA_INVALID = "project_data_invalid"
     SOURCE_ID_EXHAUSTED = "source_id_exhausted"
     SEARCH_EXECUTION_ID_EXHAUSTED = "search_execution_id_exhausted"
+    SOURCE_NOT_FOUND = "source_not_found"
+    SOURCE_NOT_LITERATURE = "source_not_literature"
+    SOURCE_ARTIFACT_MISSING = "source_artifact_missing"
+    UNSUPPORTED_EVIDENCE_FORMAT = "unsupported_evidence_format"
+    ACCESS_UNAVAILABLE = "access_unavailable"
+    ACQUIRE_FAILED = "acquire_failed"
+    FULLTEXT_ALREADY_PRESENT = "fulltext_already_present"
+    ARTIFACT_STORE_UNAVAILABLE = "artifact_store_unavailable"
+    DOWNLOADER_UNAVAILABLE = "downloader_unavailable"
+    PARSE_FAILED = "parse_failed"
+    INDEX_FAILED = "index_failed"
+    INDEX_STORE_UNAVAILABLE = "index_store_unavailable"
+    CHUNK_NOT_FOUND = "chunk_not_found"
+    EVIDENCE_UNRESOLVED = "evidence_unresolved"
+    SCOPE_REQUIRED = "scope_required"
+    ANSWER_REQUEST_INVALID = "answer_request_invalid"
+    ANSWER_MODEL_UNAVAILABLE = "answer_model_unavailable"
+    ANSWER_GENERATION_FAILED = "answer_generation_failed"
+    ANSWER_INVALID_RESPONSE = "answer_invalid_response"
+    RETRIEVAL_UNAVAILABLE = "retrieval_unavailable"
+
+
+#: Failures that mean "the answer service cannot run right now", not "the corpus
+#: is silent"; they must not be folded into an honest insufficiency.
+_UNAVAILABLE_EVIDENCE_CODES = frozenset(
+    {
+        LiteratureServiceErrorCode.INDEX_STORE_UNAVAILABLE,
+        LiteratureServiceErrorCode.RETRIEVAL_UNAVAILABLE,
+    }
+)
 
 
 class LiteratureServiceError(RuntimeError):
@@ -139,6 +308,94 @@ class LiteratureSearchExecution(BaseModel):
             or self.plan.result_snapshot_id != self.page.result_snapshot_id
         ):
             raise ValueError("search plan does not match the executed search page")
+        return self
+
+
+class LiteratureIndexResult(BaseModel):
+    """Page-aware indexing outcome for one project literature source."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    source_id: str = Field(min_length=1, max_length=64)
+    doc_id: str = Field(min_length=1, max_length=200)
+    status: FullTextStatus
+    reused: bool
+    chunk_count: int = Field(ge=0)
+    page_count: int = Field(ge=0)
+    artifact_sha256: str
+    index_fingerprint: str
+    parser_version: str
+    chunker_version: str
+    embedding_model: str
+    embedding_version: str
+    index_version: str
+    indexed_at: datetime
+
+
+class LiteratureEvidenceResult(BaseModel):
+    """A retrieved chunk resolved back to a verifiable page quote."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    source_id: str = Field(min_length=1, max_length=64)
+    doc_id: str = Field(min_length=1, max_length=200)
+    title: str
+    chunk_id: str = Field(min_length=1, max_length=128)
+    paper_id: str | None = None
+    span: EvidenceSpan
+
+
+class LiteratureFullTextResult(BaseModel):
+    """Outcome of one open-access full-text acquisition attempt."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    source_id: str = Field(min_length=1, max_length=64)
+    status: FullTextStatus
+    reused: bool
+    local_path: str | None = None
+    source_url: str | None = None
+    sha256: str | None = None
+    file_size_bytes: int | None = None
+    mime_type: str | None = None
+    acquired_at: datetime | None = None
+    failure_reason: str | None = None
+
+
+class LiteratureAnswerResult(BaseModel):
+    """One evidence-grounded answer inside a project and source scope (P3)."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    question: str
+    project_root: str
+    source_ids: list[str]
+    status: AnswerStatus
+    insufficient_reason: InsufficientReason | None = None
+    claims: list[AnswerClaim]
+    evidence: list[LiteratureEvidenceResult]
+    rejected_claims: list[RejectedClaim]
+    unresolved: list[UnresolvedEvidence]
+    retrieved_chunk_count: int = Field(ge=0)
+    model_provider: str
+    model_name: str
+    model_config_hash: str
+    generated_at: datetime
+
+    @model_validator(mode="after")
+    def validate_result_scope(self) -> LiteratureAnswerResult:
+        evidence_ids = {item.span.evidence_id for item in self.evidence}
+        for claim in self.claims:
+            if not set(claim.evidence_ids) <= evidence_ids:
+                raise ValueError("a claim cites evidence that is missing from the result")
+        requested = set(self.source_ids)
+        for item in self.evidence:
+            if item.source_id not in requested:
+                raise ValueError("evidence falls outside the requested source scope")
+        if self.status is AnswerStatus.ANSWERED and not self.claims:
+            raise ValueError("an answered result must carry at least one claim")
+        if self.status is AnswerStatus.INSUFFICIENT and self.claims:
+            raise ValueError("an insufficient result cannot carry claims")
         return self
 
 
@@ -447,6 +704,11 @@ class LiteratureService:
         *,
         providers: Sequence[LiteratureProvider],
         project_store: ProjectSourceStore,
+        index_store: PageIndexStore | None = None,
+        downloader: FullTextDownloader | None = None,
+        artifact_store: ArtifactStore | None = None,
+        retriever: EvidenceRetriever | None = None,
+        answer_model: EvidenceAnswerModel | None = None,
         snapshot_capacity: int = 64,
         now_factory: Callable[[], datetime] | None = None,
         source_id_factory: Callable[[], str] | None = None,
@@ -469,11 +731,27 @@ class LiteratureService:
             raise ValueError("at least one literature provider is required")
         if not isinstance(project_store, ProjectSourceStore):
             raise TypeError("project_store does not satisfy ProjectSourceStore")
+        if index_store is not None and not isinstance(index_store, PageIndexStore):
+            raise TypeError("index_store does not satisfy PageIndexStore")
+        if retriever is not None and not isinstance(retriever, EvidenceRetriever):
+            raise TypeError("retriever does not satisfy EvidenceRetriever")
+        if answer_model is not None and not isinstance(answer_model, EvidenceAnswerModel):
+            raise TypeError("answer_model does not satisfy EvidenceAnswerModel")
 
         self._providers = registry
         self._project_store = project_store
+        self._index_store = index_store
+        self._downloader = downloader
+        self._retriever = retriever
+        self._answer_model = answer_model
+        self._artifact_store = (
+            artifact_store
+            if artifact_store is not None
+            else (project_store if isinstance(project_store, ArtifactStore) else None)
+        )
         self._execution_capacity = snapshot_capacity
         self._search_executions: OrderedDict[str, LiteratureSearchExecution] = OrderedDict()
+        self._page_text_cache: OrderedDict[str, dict[int, str]] = OrderedDict()
         self._now_factory = now_factory or (lambda: datetime.now(UTC))
         self._source_id_factory = source_id_factory or (lambda: f"src_lit_{uuid.uuid4().hex[:16]}")
         self._search_execution_id_factory = search_execution_id_factory or (
@@ -619,9 +897,775 @@ class LiteratureService:
             ),
         )
 
+    async def acquire_fulltext(
+        self,
+        *,
+        project_path: str,
+        source_id: str,
+        force: bool = False,
+    ) -> LiteratureFullTextResult:
+        """Acquire the provider-declared open PDF for one project literature source.
+
+        Only locations the provider itself marked ``open`` are used.  The plan's
+        state machine is driven explicitly (``metadata_only → acquiring →
+        fulltext_ready`` or a failure state), and an existing artifact is never
+        silently replaced: ``force`` is required to fetch again.
+        """
+
+        source = self._require_literature_source(project_path, source_id)
+        record = self._primary_record(source)
+        if record is None:
+            raise LiteratureServiceError(
+                LiteratureServiceErrorCode.PROJECT_DATA_INVALID,
+                "项目文献缺少规范化记录，无法确定开放全文位置",
+                details={"source_id": source_id},
+            )
+        downloader = self._require_downloader()
+        artifact_store = self._require_artifact_store()
+
+        existing = self._existing_fulltext(project_path, source_id)
+        existing_status = FullTextStatus(existing["status"]) if existing else None
+        if (
+            not force
+            and existing_status in _FILE_PRESENT_STATUSES
+            and existing is not None
+            and existing.get("local_path")
+        ):
+            raise LiteratureServiceError(
+                LiteratureServiceErrorCode.FULLTEXT_ALREADY_PRESENT,
+                "该文献已有全文附件；如需重新获取请显式使用 force",
+                details={"source_id": source_id, "status": existing_status.value},
+            )
+
+        location = select_open_pdf_location(record)
+        if location is None:
+            artifact = FullTextArtifact.model_validate(
+                {
+                    **(dict(existing) if existing else {}),
+                    "source_id": source_id,
+                    "status": FullTextStatus.ACCESS_UNAVAILABLE,
+                    "failure_reason": "该记录没有声明可用的开放 PDF 位置",
+                    "local_path": None,
+                    "sha256": None,
+                    "file_size_bytes": None,
+                    "mime_type": None,
+                    "acquired_at": None,
+                    "artifact_id": None,
+                }
+            )
+            self._write_fulltext(project_path, source_id, artifact)
+            raise LiteratureServiceError(
+                LiteratureServiceErrorCode.ACCESS_UNAVAILABLE,
+                "该记录没有声明可用的开放 PDF 位置",
+                details={"source_id": source_id},
+            )
+
+        self._write_fulltext(
+            project_path,
+            source_id,
+            FullTextArtifact.model_validate(
+                {
+                    "source_id": source_id,
+                    "status": FullTextStatus.ACQUIRING,
+                    "source_url": location.url,
+                    "access_status": location.access_status,
+                }
+            ),
+        )
+
+        acquired_at = self._now_datetime()
+        try:
+            downloaded = await downloader.download(location.url)
+        except FullTextDownloadError as exc:
+            artifact = self._acquire_failure_artifact(
+                project_path=project_path,
+                source_id=source_id,
+                failure_reason=f"获取开放全文失败：{exc.code.value}",
+                source_url=location.url,
+                access_status=location.access_status,
+            )
+            self._write_fulltext(project_path, source_id, artifact)
+            raise LiteratureServiceError(
+                LiteratureServiceErrorCode.ACQUIRE_FAILED,
+                "获取开放全文失败",
+                details={"source_id": source_id, "code": exc.code.value, **exc.details},
+            ) from exc
+        except Exception as exc:  # pragma: no cover - defensive, downloader is pluggable
+            artifact = self._acquire_failure_artifact(
+                project_path=project_path,
+                source_id=source_id,
+                failure_reason=f"获取开放全文失败：{type(exc).__name__}",
+                source_url=location.url,
+                access_status=location.access_status,
+            )
+            self._write_fulltext(project_path, source_id, artifact)
+            raise LiteratureServiceError(
+                LiteratureServiceErrorCode.ACQUIRE_FAILED,
+                "获取开放全文失败",
+                details={"source_id": source_id, "exception_type": type(exc).__name__},
+            ) from exc
+
+        filename = self._artifact_filename_for(record, downloaded.source_url)
+        # D-023 rule 4: the recorded hash is the hash of the bytes that are about
+        # to be written, never the downloader's self-report alone.
+        actual_sha256 = hashlib.sha256(downloaded.content).hexdigest()
+        if downloaded.sha256 != actual_sha256:
+            mismatch_artifact = self._acquire_failure_artifact(
+                project_path=project_path,
+                source_id=source_id,
+                failure_reason="获取开放全文失败：downloader_hash_mismatch",
+                source_url=location.url,
+                access_status=location.access_status,
+            )
+            self._write_fulltext(project_path, source_id, mismatch_artifact)
+            raise LiteratureServiceError(
+                LiteratureServiceErrorCode.ACQUIRE_FAILED,
+                "下载器报告的哈希与实际字节不一致",
+                details={"source_id": source_id, "code": "downloader_hash_mismatch"},
+            )
+        try:
+            local_path = artifact_store.store_source_artifact(
+                project_path,
+                source_id,
+                filename,
+                downloaded.content,
+            )
+        except LiteratureServiceError:
+            raise
+        except Exception as exc:
+            artifact = self._acquire_failure_artifact(
+                project_path=project_path,
+                source_id=source_id,
+                failure_reason=f"写入全文附件失败：{type(exc).__name__}",
+                source_url=location.url,
+                access_status=location.access_status,
+            )
+            self._write_fulltext(project_path, source_id, artifact)
+            raise LiteratureServiceError(
+                LiteratureServiceErrorCode.ACQUIRE_FAILED,
+                "写入全文附件失败",
+                details={"source_id": source_id, "exception_type": type(exc).__name__},
+            ) from exc
+
+        artifact = FullTextArtifact.model_validate(
+            {
+                "source_id": source_id,
+                "status": FullTextStatus.FULLTEXT_READY,
+                "local_path": local_path,
+                "source_url": downloaded.source_url,
+                "access_status": location.access_status,
+                "acquired_at": acquired_at,
+                "file_size_bytes": downloaded.size_bytes,
+                "mime_type": downloaded.mime_type,
+                "sha256": actual_sha256,
+            }
+        )
+        self._write_source_path(project_path, source_id, local_path)
+        self._write_fulltext(project_path, source_id, artifact)
+
+        return LiteratureFullTextResult(
+            source_id=source_id,
+            status=artifact.status,
+            reused=False,
+            local_path=artifact.local_path,
+            source_url=artifact.source_url,
+            sha256=artifact.sha256,
+            file_size_bytes=artifact.file_size_bytes,
+            mime_type=artifact.mime_type,
+            acquired_at=artifact.acquired_at,
+        )
+
+    def _acquire_failure_artifact(
+        self,
+        *,
+        project_path: str,
+        source_id: str,
+        failure_reason: str,
+        source_url: str,
+        access_status: AccessStatus,
+    ) -> FullTextArtifact:
+        existing = self._existing_fulltext(project_path, source_id)
+        payload: dict[str, Any] = {
+            "source_id": source_id,
+            "status": FullTextStatus.ACQUIRE_FAILED,
+            "failure_reason": failure_reason,
+            "source_url": source_url,
+            "access_status": access_status,
+        }
+        if existing is not None and existing.get("artifact_version"):
+            payload["artifact_version"] = int(existing["artifact_version"])
+        return FullTextArtifact.model_validate(payload)
+
+    def _write_source_path(self, project_path: str, source_id: str, local_path: str) -> None:
+        """Point the project source at its newly acquired artifact."""
+
+        def update(sources: list[dict[str, Any]]) -> list[dict[str, Any]]:
+            updated = deepcopy(sources)
+            for item in updated:
+                if str(item.get("id")) != source_id:
+                    continue
+                item["original_path"] = local_path
+                return updated
+            raise LiteratureServiceError(
+                LiteratureServiceErrorCode.SOURCE_NOT_FOUND,
+                "项目文献不存在",
+                details={"source_id": source_id},
+            )
+
+        self._project_store.update_sources(project_path, update)
+
+    def _require_downloader(self) -> FullTextDownloader:
+        if self._downloader is None:
+            raise LiteratureServiceError(
+                LiteratureServiceErrorCode.DOWNLOADER_UNAVAILABLE,
+                "未配置开放全文下载器",
+            )
+        return self._downloader
+
+    def _require_artifact_store(self) -> ArtifactStore:
+        if self._artifact_store is None:
+            raise LiteratureServiceError(
+                LiteratureServiceErrorCode.ARTIFACT_STORE_UNAVAILABLE,
+                "项目存储不支持写入全文附件",
+            )
+        return self._artifact_store
+
+    def _primary_record(self, source: Mapping[str, Any]) -> PaperRecord | None:
+        metadata = source.get("metadata")
+        literature = metadata.get("literature") if isinstance(metadata, Mapping) else None
+        if not isinstance(literature, Mapping):
+            return None
+        paper_id = literature.get("primary_paper_id")
+        records = literature.get("records")
+        if not isinstance(paper_id, str) or not isinstance(records, Mapping):
+            return None
+        payload = records.get(paper_id)
+        if not isinstance(payload, Mapping):
+            return None
+        try:
+            return PaperRecord.model_validate(payload)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _artifact_filename_for(record: PaperRecord, source_url: str) -> str:
+        if record.external_ids.arxiv:
+            stem = record.external_ids.arxiv.replace("/", "-")
+            if record.external_ids.arxiv_version is not None:
+                stem = f"{stem}v{record.external_ids.arxiv_version}"
+            return f"{stem}.pdf"
+        url_name = Path(urlparse(source_url).path).name
+        if url_name.lower().endswith(".pdf"):
+            return url_name
+        return f"{record.paper_id}.pdf"
+
+    async def index_source(
+        self,
+        *,
+        project_path: str,
+        source_id: str,
+        force: bool = False,
+    ) -> LiteratureIndexResult:
+        """Parse one project literature source by page and build its evidence index.
+
+        Only PDF attachments are evidence-indexable in the first version: the
+        other extractors synthesize a single ``page_num=1`` and cannot support an
+        honest page coordinate.  Every state transition of the plan's full-text
+        state machine is persisted so a failure stays visible.
+        """
+
+        index_store = self._require_index_store()
+        source = self._require_literature_source(project_path, source_id)
+        artifact_path = Path(self._project_store.resolve_source_artifact(project_path, source))
+        if artifact_path.suffix.lower() not in _EVIDENCE_ARTIFACT_SUFFIXES:
+            raise LiteratureServiceError(
+                LiteratureServiceErrorCode.UNSUPPORTED_EVIDENCE_FORMAT,
+                "首版只对 PDF 附件建立页码级证据索引：该附件没有可核验的真实页码",
+                details={"source_id": source_id, "suffix": artifact_path.suffix.lower()},
+            )
+        try:
+            file_size = artifact_path.stat().st_size
+        except OSError as exc:
+            raise LiteratureServiceError(
+                LiteratureServiceErrorCode.SOURCE_ARTIFACT_MISSING,
+                "文献附件不存在或不可读取",
+                details={"source_id": source_id},
+            ) from exc
+        if file_size <= 0:
+            raise LiteratureServiceError(
+                LiteratureServiceErrorCode.SOURCE_ARTIFACT_MISSING,
+                "文献附件为空",
+                details={"source_id": source_id},
+            )
+
+        artifact_sha256 = await asyncio.to_thread(sha256_file, artifact_path)
+        mime_type = mimetypes.guess_type(artifact_path.name)[0] or "application/pdf"
+        acquired_at = self._now_datetime()
+        doc_id = f"project:{source_id}"
+
+        def artifact(
+            status: FullTextStatus, *, failure_reason: str | None = None
+        ) -> FullTextArtifact:
+            return self._build_file_artifact(
+                project_path=project_path,
+                source_id=source_id,
+                status=status,
+                local_path=str(artifact_path),
+                artifact_sha256=artifact_sha256,
+                file_size_bytes=file_size,
+                mime_type=mime_type,
+                acquired_at=acquired_at,
+                failure_reason=failure_reason,
+            )
+
+        self._write_fulltext(project_path, source_id, artifact(FullTextStatus.PARSING))
+        try:
+            pages = await asyncio.to_thread(self._parse_pages, artifact_path)
+        except Exception as exc:
+            reason = f"解析失败：{type(exc).__name__}"
+            self._write_fulltext(
+                project_path,
+                source_id,
+                artifact(FullTextStatus.PARSE_FAILED, failure_reason=reason),
+            )
+            raise LiteratureServiceError(
+                LiteratureServiceErrorCode.PARSE_FAILED,
+                "无法解析该 PDF 的页面文本",
+                details={"source_id": source_id, "exception_type": type(exc).__name__},
+            ) from exc
+        if not any(text.strip() for _, text in pages):
+            reason = "PDF 没有可提取文本（疑似扫描版）"
+            self._write_fulltext(
+                project_path,
+                source_id,
+                artifact(FullTextStatus.PARSE_FAILED, failure_reason=reason),
+            )
+            raise LiteratureServiceError(
+                LiteratureServiceErrorCode.PARSE_FAILED,
+                reason,
+                details={"source_id": source_id},
+            )
+        self._write_fulltext(project_path, source_id, artifact(FullTextStatus.PARSED))
+
+        embedding_model, embedding_version = await index_store.embedding_identity()
+        self._write_fulltext(project_path, source_id, artifact(FullTextStatus.INDEXING))
+        try:
+            entry = await index_store.index_pages(
+                doc_id=doc_id,
+                title=str(source.get("title") or source_id),
+                pages=pages,
+                artifact_sha256=artifact_sha256,
+                project_root=project_path,
+                source_id=source_id,
+                filename=self._artifact_filename(source),
+                force=force,
+            )
+        except LiteratureServiceError:
+            self._write_fulltext(
+                project_path,
+                source_id,
+                artifact(FullTextStatus.INDEX_FAILED, failure_reason="索引写入失败"),
+            )
+            raise
+        except Exception as exc:
+            self._write_fulltext(
+                project_path,
+                source_id,
+                artifact(FullTextStatus.INDEX_FAILED, failure_reason="索引写入失败"),
+            )
+            raise LiteratureServiceError(
+                LiteratureServiceErrorCode.INDEX_FAILED,
+                "建立页级索引失败",
+                details={"source_id": source_id, "exception_type": type(exc).__name__},
+            ) from exc
+
+        indexed_at = self._now_datetime()
+        index_payload = {
+            "doc_id": doc_id,
+            "chunk_count": int(entry.get("chunk_count") or 0),
+            "page_count": int(entry.get("page_count") or 0),
+            "artifact_sha256": artifact_sha256,
+            "index_fingerprint": str(entry.get("index_fingerprint") or ""),
+            "parser_version": str(entry.get("parser_version") or PARSER_VERSION),
+            "chunker_version": str(entry.get("chunker_version") or CHUNKER_VERSION),
+            "embedding_model": str(entry.get("embedding_model") or embedding_model),
+            "embedding_version": str(entry.get("embedding_version") or embedding_version),
+            "index_version": str(entry.get("index_version") or INDEX_VERSION),
+            "indexed_at": str(entry.get("indexed_at") or indexed_at.isoformat()),
+        }
+        self._write_fulltext(
+            project_path,
+            source_id,
+            artifact(FullTextStatus.INDEXED),
+            index=index_payload,
+        )
+        return LiteratureIndexResult(
+            source_id=source_id,
+            doc_id=doc_id,
+            status=FullTextStatus.INDEXED,
+            reused=bool(entry.get("reused")),
+            chunk_count=index_payload["chunk_count"],
+            page_count=index_payload["page_count"],
+            artifact_sha256=artifact_sha256,
+            index_fingerprint=index_payload["index_fingerprint"],
+            parser_version=index_payload["parser_version"],
+            chunker_version=index_payload["chunker_version"],
+            embedding_model=index_payload["embedding_model"],
+            embedding_version=index_payload["embedding_version"],
+            index_version=index_payload["index_version"],
+            indexed_at=indexed_at,
+        )
+
+    async def resolve_evidence(
+        self,
+        *,
+        project_path: str,
+        source_id: str,
+        chunk_id: str,
+    ) -> LiteratureEvidenceResult:
+        """Resolve one indexed chunk back to a verifiable page quote.
+
+        The chunk is looked up in the server-owned index (never supplied by the
+        caller), then the artifact is re-read, re-hashed and re-parsed, so a
+        replaced PDF, a stale index or a version change fails explicitly instead
+        of producing a plausible-looking citation.
+        """
+
+        index_store = self._require_index_store()
+        source = self._require_literature_source(project_path, source_id)
+        chunk = await index_store.get_chunk(chunk_id, source_id=source_id)
+        if chunk is None:
+            raise LiteratureServiceError(
+                LiteratureServiceErrorCode.CHUNK_NOT_FOUND,
+                "检索块不存在或索引已重建，请重新检索",
+                details={"source_id": source_id, "chunk_id": chunk_id},
+            )
+        metadata = dict(chunk.get("metadata") or {})
+
+        # Sufficiency first: a legacy flat-text or translation chunk carries no
+        # page metadata at all, and that is the most precise diagnosis for it.
+        embedding_model, embedding_version = await index_store.embedding_identity()
+        try:
+            fields = evidence_metadata(metadata)
+            assert_current_versions(
+                metadata,
+                embedding_model=embedding_model,
+                embedding_version=embedding_version,
+            )
+        except EvidenceResolutionError as exc:
+            raise self._evidence_error(exc, source_id=source_id, chunk_id=chunk_id) from exc
+
+        if str(metadata.get("source_id") or "") != source_id:
+            raise LiteratureServiceError(
+                LiteratureServiceErrorCode.EVIDENCE_UNRESOLVED,
+                "检索块不属于该项目文献",
+                details={"source_id": source_id, "chunk_id": chunk_id},
+            )
+
+        artifact_path = Path(self._project_store.resolve_source_artifact(project_path, source))
+        artifact_sha256 = await asyncio.to_thread(sha256_file, artifact_path)
+        if artifact_sha256 != fields["artifact_sha256"]:
+            raise LiteratureServiceError(
+                LiteratureServiceErrorCode.EVIDENCE_UNRESOLVED,
+                "当前附件与索引记录的文件哈希不一致，需要重新建立索引",
+                details={
+                    "source_id": source_id,
+                    "chunk_id": chunk_id,
+                    "code": "artifact_hash_mismatch",
+                },
+            )
+
+        page_texts = await self._page_texts(artifact_path, artifact_sha256)
+        try:
+            span = resolve_evidence_span(
+                source_id=source_id,
+                artifact_sha256=artifact_sha256,
+                page_texts=page_texts,
+                page_number=fields["page_start"],
+                char_start=fields["char_start"],
+                char_end=fields["char_end"],
+                chunk_id=str(chunk.get("chunk_id") or chunk_id),
+                parser_version=fields["parser_version"],
+                chunker_version=fields["chunker_version"],
+                embedding_model=fields["embedding_model"],
+                embedding_version=fields["embedding_version"],
+                index_version=fields["index_version"],
+            )
+        except EvidenceResolutionError as exc:
+            raise self._evidence_error(exc, source_id=source_id, chunk_id=chunk_id) from exc
+        if span.exact_quote != str(chunk.get("text") or ""):
+            raise LiteratureServiceError(
+                LiteratureServiceErrorCode.EVIDENCE_UNRESOLVED,
+                "索引中的块文本与哈希文档的对应页不一致，需要重新建立索引",
+                details={"source_id": source_id, "chunk_id": chunk_id, "code": "quote_mismatch"},
+            )
+
+        return LiteratureEvidenceResult(
+            source_id=source_id,
+            doc_id=str(metadata.get("doc_id") or f"project:{source_id}"),
+            title=str(source.get("title") or source_id),
+            chunk_id=span.chunk_id,
+            paper_id=self._primary_paper_id(source),
+            span=span,
+        )
+
+    async def answer_question(
+        self,
+        *,
+        project_path: str,
+        question: str,
+        source_ids: Sequence[str],
+        top_k: int = DEFAULT_ANSWER_TOP_K,
+    ) -> LiteratureAnswerResult:
+        """Answer a question from evidence scoped to one project and its sources.
+
+        The order of operations is part of the contract: scope is validated first,
+        every retrieval hit is resolved back to a real page quote, and the model is
+        only called when at least one verifiable piece of evidence exists.  When
+        there is no evidence the result says so without consulting a model.
+        """
+
+        normalized_question = question.strip() if isinstance(question, str) else ""
+        if not normalized_question:
+            raise LiteratureServiceError(
+                LiteratureServiceErrorCode.ANSWER_REQUEST_INVALID,
+                "研究问题不能为空",
+            )
+        if (
+            isinstance(top_k, bool)
+            or not isinstance(top_k, int)
+            or not 1 <= top_k <= MAX_ANSWER_TOP_K
+        ):
+            raise LiteratureServiceError(
+                LiteratureServiceErrorCode.ANSWER_REQUEST_INVALID,
+                f"top_k 必须是 1 到 {MAX_ANSWER_TOP_K} 之间的整数",
+                details={"top_k": top_k},
+            )
+
+        scoped_source_ids: list[str] = []
+        for raw_source_id in source_ids or []:
+            normalized_source_id = str(raw_source_id).strip()
+            if normalized_source_id and normalized_source_id not in scoped_source_ids:
+                scoped_source_ids.append(normalized_source_id)
+        if not scoped_source_ids:
+            raise LiteratureServiceError(
+                LiteratureServiceErrorCode.SCOPE_REQUIRED,
+                "多文献证据问答必须显式选择至少一篇项目文献",
+            )
+        if len(scoped_source_ids) > MAX_ANSWER_SOURCES:
+            raise LiteratureServiceError(
+                LiteratureServiceErrorCode.ANSWER_REQUEST_INVALID,
+                f"单次问答最多选择 {MAX_ANSWER_SOURCES} 篇文献",
+                details={"source_count": len(scoped_source_ids)},
+            )
+        for source_id in scoped_source_ids:
+            self._require_literature_source(project_path, source_id)
+
+        retriever = self._require_retriever()
+        answer_model = self._require_answer_model()
+        generated_at = self._now_datetime()
+
+        hits = await retriever.retrieve(
+            project_root=project_path,
+            source_ids=list(scoped_source_ids),
+            query=normalized_question,
+            top_k=top_k,
+        )
+        unique_hits: list[RetrievedChunk] = []
+        seen_chunk_ids: set[str] = set()
+        for hit in hits:
+            if hit.chunk_id in seen_chunk_ids:
+                continue
+            seen_chunk_ids.add(hit.chunk_id)
+            unique_hits.append(hit)
+        if len(unique_hits) > MAX_ANSWER_TOP_K:
+            # Silently trimming the evidence set could drop the only verifiable
+            # quote, so a retriever that ignores top_k fails loudly instead.
+            raise LiteratureServiceError(
+                LiteratureServiceErrorCode.ANSWER_REQUEST_INVALID,
+                f"检索返回的去重命中数超过上限 {MAX_ANSWER_TOP_K}",
+                details={
+                    "reason": "too_many_retrieval_hits",
+                    "hit_count": len(unique_hits),
+                },
+            )
+
+        candidates: dict[str, AnswerEvidenceCandidate] = {}
+        resolved: dict[str, LiteratureEvidenceResult] = {}
+        unresolved: list[UnresolvedEvidence] = []
+        for hit in unique_hits:
+            if not hit.source_id:
+                unresolved.append(
+                    UnresolvedEvidence(
+                        source_id="",
+                        chunk_id=hit.chunk_id,
+                        reason="missing_source_scope",
+                        detail="检索块没有来源标识，无法限定在所选文献范围内",
+                    )
+                )
+                continue
+            if hit.source_id not in scoped_source_ids:
+                unresolved.append(
+                    UnresolvedEvidence(
+                        source_id=hit.source_id,
+                        chunk_id=hit.chunk_id,
+                        reason="out_of_scope_chunk",
+                        detail="检索块不属于本次选定的文献范围",
+                    )
+                )
+                continue
+            try:
+                evidence = await self.resolve_evidence(
+                    project_path=project_path,
+                    source_id=hit.source_id,
+                    chunk_id=hit.chunk_id,
+                )
+            except LiteratureServiceError as exc:
+                # A broken store is not "the corpus cannot answer": it must stay
+                # distinguishable from an honest insufficiency (plan 5.9 rule 7).
+                if exc.code in _UNAVAILABLE_EVIDENCE_CODES:
+                    raise
+                unresolved.append(
+                    UnresolvedEvidence(
+                        source_id=hit.source_id,
+                        chunk_id=hit.chunk_id,
+                        reason=str(exc.details.get("code") or exc.code.value),
+                        detail=str(exc),
+                    )
+                )
+                continue
+            span = evidence.span
+            candidates[span.evidence_id] = AnswerEvidenceCandidate(
+                evidence_id=span.evidence_id,
+                source_id=evidence.source_id,
+                title=evidence.title,
+                page_start=span.page_start,
+                page_end=span.page_end,
+                chunk_id=span.chunk_id,
+                exact_quote=span.exact_quote,
+                context_before=span.context_before,
+                context_after=span.context_after,
+            )
+            resolved[span.evidence_id] = evidence
+
+        envelope: dict[str, Any] = {
+            "question": normalized_question,
+            "project_root": project_path,
+            "source_ids": list(scoped_source_ids),
+            "model_provider": answer_model.identity.provider,
+            "model_name": answer_model.identity.model,
+            "model_config_hash": answer_model.identity.config_hash,
+            "generated_at": generated_at,
+            "retrieved_chunk_count": len(unique_hits),
+            "unresolved": unresolved,
+        }
+
+        if not unique_hits:
+            return LiteratureAnswerResult(
+                **envelope,
+                status=AnswerStatus.INSUFFICIENT,
+                insufficient_reason=InsufficientReason.NO_RETRIEVAL_HITS,
+                claims=[],
+                evidence=[],
+                rejected_claims=[],
+            )
+        if not candidates:
+            return LiteratureAnswerResult(
+                **envelope,
+                status=AnswerStatus.INSUFFICIENT,
+                insufficient_reason=InsufficientReason.NO_RESOLVABLE_EVIDENCE,
+                claims=[],
+                evidence=[],
+                rejected_claims=[],
+            )
+
+        try:
+            prompt = build_answer_prompt(
+                question=normalized_question,
+                candidates=list(candidates.values()),
+            )
+        except ValueError as exc:
+            raise LiteratureServiceError(
+                LiteratureServiceErrorCode.ANSWER_REQUEST_INVALID,
+                "证据集合超出提示预算",
+                details={
+                    "reason": str(exc),
+                    "candidate_count": len(candidates),
+                    "question_chars": len(normalized_question),
+                },
+            ) from exc
+        try:
+            raw_response = await answer_model.complete(
+                system_prompt=build_answer_system_prompt(),
+                prompt=prompt,
+            )
+        except Exception as exc:  # noqa: BLE001 - every provider failure is explicit
+            raise LiteratureServiceError(
+                LiteratureServiceErrorCode.ANSWER_GENERATION_FAILED,
+                "证据问答模型调用失败",
+                details={
+                    "exception_type": type(exc).__name__,
+                    "source_ids": list(scoped_source_ids),
+                },
+            ) from exc
+
+        try:
+            parsed = parse_answer_response(raw_response)
+        except AnswerResponseError as exc:
+            raise LiteratureServiceError(
+                LiteratureServiceErrorCode.ANSWER_INVALID_RESPONSE,
+                "证据问答模型未返回约定的结构化结果",
+                details={"reason": str(exc)},
+            ) from exc
+
+        claims, rejected_claims = validate_answer_claims(
+            parsed=parsed,
+            candidates=candidates,
+            identity=answer_model.identity,
+            generated_at=generated_at,
+        )
+
+        cited_ids: list[str] = []
+        for claim in claims:
+            for evidence_id in claim.evidence_ids:
+                if evidence_id not in cited_ids:
+                    cited_ids.append(evidence_id)
+
+        if claims:
+            return LiteratureAnswerResult(
+                **envelope,
+                status=AnswerStatus.ANSWERED,
+                insufficient_reason=None,
+                claims=claims,
+                evidence=[resolved[evidence_id] for evidence_id in cited_ids],
+                rejected_claims=rejected_claims,
+            )
+
+        declined = bool(rejected_claims) and all(
+            item.reason is RejectedClaimReason.MODEL_REPORTED_INSUFFICIENT
+            for item in rejected_claims
+        )
+        return LiteratureAnswerResult(
+            **envelope,
+            status=AnswerStatus.INSUFFICIENT,
+            insufficient_reason=(
+                InsufficientReason.MODEL_REPORTED_INSUFFICIENT
+                if not parsed or declined
+                else InsufficientReason.ALL_CLAIMS_REJECTED
+            ),
+            claims=[],
+            evidence=[],
+            rejected_claims=rejected_claims,
+        )
+
     async def aclose(self) -> None:
         failures: list[Exception] = []
         seen: set[int] = set()
+        if self._downloader is not None:
+            try:
+                await maybe_aclose(self._downloader)
+            except Exception as exc:  # pragma: no cover - lifecycle caller logs failures
+                failures.append(exc)
         for provider in self._providers.values():
             if id(provider) in seen:
                 continue
@@ -1191,6 +2235,192 @@ class LiteratureService:
         updated["updated_at"] = self._now()
         return updated
 
+    def _require_index_store(self) -> PageIndexStore:
+        if self._index_store is None:
+            raise LiteratureServiceError(
+                LiteratureServiceErrorCode.INDEX_STORE_UNAVAILABLE,
+                "页级索引未启用",
+            )
+        return self._index_store
+
+    def _require_retriever(self) -> EvidenceRetriever:
+        if self._retriever is None:
+            raise LiteratureServiceError(
+                LiteratureServiceErrorCode.RETRIEVAL_UNAVAILABLE,
+                "范围内检索未启用",
+            )
+        return self._retriever
+
+    def _require_answer_model(self) -> EvidenceAnswerModel:
+        if self._answer_model is None:
+            raise LiteratureServiceError(
+                LiteratureServiceErrorCode.ANSWER_MODEL_UNAVAILABLE,
+                "证据问答模型未配置",
+            )
+        return self._answer_model
+
+    def _require_literature_source(self, project_path: str, source_id: str) -> Mapping[str, Any]:
+        sources = self._project_store.read_sources(project_path)
+        source = next((item for item in sources if str(item.get("id")) == source_id), None)
+        if source is None:
+            raise LiteratureServiceError(
+                LiteratureServiceErrorCode.SOURCE_NOT_FOUND,
+                "项目文献不存在",
+                details={"source_id": source_id},
+            )
+        self._validate_sources([source])
+        metadata = source.get("metadata")
+        literature = metadata.get("literature") if isinstance(metadata, Mapping) else None
+        if not isinstance(literature, Mapping):
+            raise LiteratureServiceError(
+                LiteratureServiceErrorCode.SOURCE_NOT_LITERATURE,
+                "该文献不是通过公开检索入库的文献条目，暂无页级证据状态",
+                details={"source_id": source_id},
+            )
+        return source
+
+    def _build_file_artifact(
+        self,
+        *,
+        project_path: str,
+        source_id: str,
+        status: FullTextStatus,
+        local_path: str,
+        artifact_sha256: str,
+        file_size_bytes: int,
+        mime_type: str,
+        acquired_at: datetime,
+        failure_reason: str | None = None,
+    ) -> FullTextArtifact:
+        existing = self._existing_fulltext(project_path, source_id)
+        payload: dict[str, Any] = {
+            "source_id": source_id,
+            "status": status,
+            "local_path": local_path,
+            "sha256": artifact_sha256,
+            "file_size_bytes": file_size_bytes,
+            "mime_type": mime_type,
+            "acquired_at": acquired_at,
+            "failure_reason": failure_reason,
+        }
+        if existing is not None:
+            if existing.get("source_url"):
+                payload["source_url"] = existing["source_url"]
+            if existing.get("access_status"):
+                payload["access_status"] = existing["access_status"]
+            payload["artifact_version"] = int(existing.get("artifact_version") or 1)
+        return FullTextArtifact.model_validate(payload)
+
+    def _existing_fulltext(self, project_path: str, source_id: str) -> Mapping[str, Any] | None:
+        for source in self._project_store.read_sources(project_path):
+            if str(source.get("id")) != source_id:
+                continue
+            metadata = source.get("metadata")
+            literature = metadata.get("literature") if isinstance(metadata, Mapping) else None
+            if isinstance(literature, Mapping):
+                fulltext = literature.get("fulltext")
+                return fulltext if isinstance(fulltext, Mapping) else None
+            return None
+        return None
+
+    def _write_fulltext(
+        self,
+        project_path: str,
+        source_id: str,
+        artifact: FullTextArtifact,
+        *,
+        index: Mapping[str, Any] | None = None,
+    ) -> None:
+        """Persist one full-text state transition for a project literature source."""
+
+        def update(sources: list[dict[str, Any]]) -> list[dict[str, Any]]:
+            updated = deepcopy(sources)
+            for item in updated:
+                if str(item.get("id")) != source_id:
+                    continue
+                metadata = item.get("metadata")
+                if not isinstance(metadata, dict):
+                    raise LiteratureServiceError(
+                        LiteratureServiceErrorCode.PROJECT_DATA_INVALID,
+                        "项目文献缺少 metadata 对象",
+                        details={"source_id": source_id},
+                    )
+                literature = metadata.get("literature")
+                if not isinstance(literature, dict):
+                    raise LiteratureServiceError(
+                        LiteratureServiceErrorCode.SOURCE_NOT_LITERATURE,
+                        "该文献不是通过公开检索入库的文献条目，暂无页级证据状态",
+                        details={"source_id": source_id},
+                    )
+                literature["fulltext"] = artifact.model_dump(mode="json")
+                if index is not None:
+                    literature["index"] = dict(index)
+                return updated
+            raise LiteratureServiceError(
+                LiteratureServiceErrorCode.SOURCE_NOT_FOUND,
+                "项目文献不存在",
+                details={"source_id": source_id},
+            )
+
+        self._project_store.update_sources(project_path, update)
+
+    @staticmethod
+    def _parse_pages(path: Path) -> list[tuple[int, str]]:
+        from src.parser import extract_document
+
+        document = extract_document(path)
+        return [(page.page_num, page.text) for page in document.pages]
+
+    async def _page_texts(self, path: Path, artifact_sha256: str) -> dict[int, str]:
+        """Normalized page text of one artifact, cached by hash and parser version."""
+
+        key = f"{artifact_sha256}:{PARSER_VERSION}"
+        cached = self._page_text_cache.get(key)
+        if cached is not None:
+            self._page_text_cache.move_to_end(key)
+            return cached
+        pages = await asyncio.to_thread(self._parse_pages, path)
+        normalized = dict(normalized_pages(pages))
+        self._page_text_cache[key] = normalized
+        self._page_text_cache.move_to_end(key)
+        while len(self._page_text_cache) > _MAX_CACHED_PAGE_TEXTS:
+            self._page_text_cache.popitem(last=False)
+        return normalized
+
+    @staticmethod
+    def _artifact_filename(source: Mapping[str, Any]) -> str | None:
+        raw_path = source.get("original_path")
+        if not isinstance(raw_path, str) or not raw_path.strip():
+            return None
+        return Path(raw_path).name
+
+    @staticmethod
+    def _primary_paper_id(source: Mapping[str, Any]) -> str | None:
+        metadata = source.get("metadata")
+        literature = metadata.get("literature") if isinstance(metadata, Mapping) else None
+        if not isinstance(literature, Mapping):
+            return None
+        paper_id = literature.get("primary_paper_id")
+        return str(paper_id) if isinstance(paper_id, str) and paper_id else None
+
+    @staticmethod
+    def _evidence_error(
+        error: EvidenceResolutionError,
+        *,
+        source_id: str,
+        chunk_id: str,
+    ) -> LiteratureServiceError:
+        return LiteratureServiceError(
+            LiteratureServiceErrorCode.EVIDENCE_UNRESOLVED,
+            "该检索块无法核验回原文页码与精确原文",
+            details={
+                "source_id": source_id,
+                "chunk_id": chunk_id,
+                "code": error.code.value,
+                **deepcopy(error.details),
+            },
+        )
+
     def _now_datetime(self) -> datetime:
         value = self._now_factory()
         if value.tzinfo is None or value.utcoffset() is None:
@@ -1202,10 +2432,14 @@ class LiteratureService:
 
 
 __all__ = [
+    "ArtifactStore",
     "IdentityKind",
     "ImportDisposition",
+    "LiteratureEvidenceResult",
+    "LiteratureFullTextResult",
     "LiteratureImportBatch",
     "LiteratureImportItem",
+    "LiteratureIndexResult",
     "LiteratureSearchExecution",
     "LiteratureService",
     "LiteratureServiceError",

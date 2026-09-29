@@ -192,20 +192,30 @@ async def test_pinned_fetch_rejects_oversized_response_before_reading(
 
 
 @pytest.mark.asyncio
-async def test_arxiv_search_uses_https_redirects_and_clamps_result_count(
+async def test_literature_search_replaces_the_raw_arxiv_tool(
     monkeypatch: pytest.MonkeyPatch, tmp_path
 ):
-    client_options = {}
+    """D-031: literature access goes through the structured service only."""
+
     calls = []
 
-    class ArxivResponse:
+    class ServiceResponse:
         status_code = 200
-        text = "<feed><title>YOLO paper</title></feed>"
-        url = "https://export.arxiv.org/api/query?search_query=all%3AYOLO"
 
-    class ArxivClient:
-        def __init__(self, **kwargs):
-            client_options.update(kwargs)
+        def json(self):
+            return {
+                "search_execution_id": "search_exec_" + "c" * 32,
+                "page": {
+                    "provider": "fixture",
+                    "result_mode": "fixture",
+                    "records": [],
+                    "total_results": 0,
+                },
+            }
+
+    class ServiceClient:
+        def __init__(self, **_kwargs):
+            pass
 
         async def __aenter__(self):
             return self
@@ -213,26 +223,23 @@ async def test_arxiv_search_uses_https_redirects_and_clamps_result_count(
         async def __aexit__(self, *_args):
             return None
 
-        async def get(self, url, *, params):
-            calls.append((url, params))
-            return ArxivResponse()
+        async def post(self, url, *, json):
+            calls.append((url, json))
+            return ServiceResponse()
 
-    monkeypatch.setattr(httpx, "AsyncClient", ArxivClient)
+    monkeypatch.setattr(httpx, "AsyncClient", ServiceClient)
     registry = ToolRegistry(tmp_path)
     register_academic_tools(registry)
 
-    result = await registry.execute("arxiv_search", {"query": "YOLO", "max_results": 200})
+    assert registry.get("arxiv_search") is None
+    result = await registry.execute(
+        "literature_search", {"provider": "fixture", "query": 'all:"demo"'}
+    )
 
     assert result.is_error is False
-    assert client_options["follow_redirects"] is True
-    assert calls == [
-        (
-            "https://export.arxiv.org/api/query",
-            {"search_query": "all:YOLO", "max_results": "20"},
-        )
-    ]
-    assert result.metadata["source_kind"] == "arxiv"
-    assert result.metadata["max_results"] == 20
+    assert calls[0][0].endswith("/api/literature/search")
+    assert calls[0][1]["query"]["query"] == 'all:"demo"'
+    assert result.metadata["result_mode"] == "fixture"
 
 
 class _Response:

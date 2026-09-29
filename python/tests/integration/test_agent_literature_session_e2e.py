@@ -1,0 +1,681 @@
+"""A1 session-level acceptance (plan §2.4, §5.11–5.12).
+
+This is the whole A1 loop over the **real** runtime: a scripted model plans the
+work, the real ``literature_*`` tools reach the real application, every
+side-effecting call stops at the approval contract, and the turn ends with claims
+whose evidence can be resolved back to a page quote.
+
+Everything is offline.  The tools talk HTTP to ``SCHOLAR_API_BASE``; here that
+address is served by the ASGI application itself through ``httpx.ASGITransport``,
+so no server is started and no request leaves the process.
+"""
+
+from __future__ import annotations
+
+import importlib
+import json
+import shutil
+import sys
+import tempfile
+from pathlib import Path
+from unittest.mock import patch
+
+import httpx
+import pytest
+from fastapi.testclient import TestClient
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from src.agent_v2.runtime.conversation import ConversationRuntime  # noqa: E402
+from src.agent_v2.types import (  # noqa: E402
+    AgentEventType,
+    ProviderResponse,
+    TextBlock,
+    ToolResultBlock,
+    ToolUseBlock,
+)
+
+pytestmark = pytest.mark.integration
+
+CONFIG = """\
+translator:
+  engine: ollama
+  model: qwen3:8b
+  ollama_base_url: http://localhost:11434
+  temperature: 0.3
+  timeout: 300.0
+chunker:
+  max_tokens: 2048
+  overlap_tokens: 128
+formatter:
+  output_format: bilingual
+agent:
+  model: qwen3:8b
+  max_stalled_tool_calls: 12
+  max_tool_errors: 5
+"""
+
+
+@pytest.fixture(scope="module")
+def demo_helpers():
+    module = importlib.import_module("tests.integration.test_literature_demo_e2e")
+    return module
+
+
+class LibraryAgentProvider:
+    """Scripted model that plans the A1 chain from the *real* tool results."""
+
+    provider_name = "scripted"
+    model = "scripted-library-agent-v1"
+    base_url = ""
+
+    def __init__(self, corpus, helpers, *, mode: str = "full_chain") -> None:
+        self._corpus = corpus
+        self._helpers = helpers
+        self.mode = mode
+        self.turns = 0
+        self._baseline: int | None = None
+
+    def begin_turn(self) -> None:
+        """Forget earlier turns so a follow-up is planned from this turn alone."""
+
+        self._baseline = None
+
+    # -- helpers ---------------------------------------------------------
+    @staticmethod
+    def _results(messages, baseline: int = 0) -> dict[str, list[ToolResultBlock]]:
+        by_name: dict[str, list[ToolResultBlock]] = {}
+        for message in list(messages)[baseline:]:
+            for block in getattr(message, "blocks", []):
+                if isinstance(block, ToolResultBlock):
+                    by_name.setdefault(block.tool_name, []).append(block)
+        return by_name
+
+    @staticmethod
+    def _call(name: str, arguments: dict) -> ProviderResponse:
+        return ProviderResponse(
+            blocks=[
+                ToolUseBlock(
+                    id=f"call_{name}_{abs(hash(json.dumps(arguments, sort_keys=True))) % 100000}",
+                    name=name,
+                    input=json.dumps(arguments),
+                )
+            ]
+        )
+
+    @staticmethod
+    def _say(text: str) -> ProviderResponse:
+        return ProviderResponse(blocks=[TextBlock(text=text)])
+
+    # -- the plan --------------------------------------------------------
+    async def chat(
+        self,
+        messages,
+        tools=None,
+        system_prompt=None,
+        max_tokens=4096,
+        temperature=0.3,
+        tool_choice="auto",
+    ):
+        self.turns += 1
+        if self._baseline is None:
+            self._baseline = len(messages)
+        by_name = self._results(messages, self._baseline)
+
+        if "literature_sources" not in by_name:
+            return self._call("literature_sources", {})
+
+        sources = json.loads(by_name["literature_sources"][-1].output)
+
+        if self.mode == "reuse_existing" and sources["indexed_count"]:
+            # Already indexed work must not be processed twice.
+            return self._answer(by_name, sources, reuse=True)
+
+        if "literature_search" not in by_name:
+            return self._call(
+                "literature_search",
+                {
+                    "provider": "arxiv",
+                    "query": self._corpus.confirmed_query,
+                    "research_question": self._corpus.question,
+                },
+            )
+
+        search = json.loads(by_name["literature_search"][-1].output)
+        if "literature_import" not in by_name:
+            return self._call(
+                "literature_import",
+                {
+                    "search_execution_id": search["search_execution_id"],
+                    "paper_ids": [record["paper_id"] for record in search["records"]],
+                },
+            )
+
+        imported = json.loads(by_name["literature_import"][-1].output)
+        source_ids = [item["source_id"] for item in imported["sources"]]
+
+        acquired = by_name.get("literature_acquire_fulltext", [])
+        if len(acquired) < len(source_ids):
+            return self._call(
+                "literature_acquire_fulltext", {"source_id": source_ids[len(acquired)]}
+            )
+
+        indexed = by_name.get("literature_index", [])
+        if len(indexed) < len(source_ids):
+            return self._call("literature_index", {"source_id": source_ids[len(indexed)]})
+
+        return self._answer(by_name, sources, source_ids=source_ids)
+
+    def _answer(self, by_name, sources, *, source_ids=None, reuse=False):
+        answers = by_name.get("literature_answer", [])
+        if answers:
+            answer = json.loads(answers[-1].output)
+            if answer.get("status") == "insufficient":
+                if self.mode == "widen_after_insufficient":
+                    # Follow the tool's own next_actions: widen inside the project.
+                    already = answer.get("source_ids") or []
+                    remaining = [sid for sid in (source_ids or []) if sid not in already]
+                    if remaining:
+                        return self._call(
+                            "literature_answer",
+                            {"question": self._corpus.question, "source_ids": remaining},
+                        )
+                return self._say(
+                    "证据不足：" + str(answer.get("insufficient_reason")) + "，我不会凭记忆回答。"
+                )
+            evidence_ids = [item["evidence_id"] for item in answer["evidence"]]
+            return self._say(
+                f"根据 {len(answer['claims'])} 条结论作答，引用证据 {'、'.join(evidence_ids)}。"
+            )
+
+        scope = source_ids or [
+            item["source_id"] for item in sources["sources"] if item["already_indexed"]
+        ]
+        if self.mode == "widen_after_insufficient" and scope:
+            # Start with the narrowest scope so the retry has room to widen.
+            scope = scope[:1]
+        if not scope:
+            return self._say("当前项目没有可用于回答的已索引文献。")
+        return self._call(
+            "literature_answer",
+            {"question": self._corpus.question, "source_ids": scope},
+        )
+
+
+ANSWER_PROMPT_MARKER = "Answer the research question using only the evidence listed below"
+EVIDENCE_ID_RE = __import__("re").compile(r"\[(evidence_[0-9a-f]{24})\]")
+
+
+class RoleRouter:
+    """One injected provider serving both the planner and the answer model.
+
+    The application builds its answer model through the same Agent provider
+    factory, so the two roles share one object here and are told apart by the
+    shape of the request: the answer model is called with no tools and the frozen
+    evidence prompt.
+    """
+
+    provider_name = "scripted"
+    model = "scripted-a1-v1"
+    base_url = ""
+
+    def __init__(self) -> None:
+        self.planner: LibraryAgentProvider | None = None
+        # Per-call script for the answering role, consumed in order.
+        self.answer_script: list[str] = []
+        self.answer_calls = 0
+
+    @staticmethod
+    def _is_answer_call(prompt: str, tools) -> bool:
+        return not tools and ANSWER_PROMPT_MARKER in prompt
+
+    async def chat(
+        self,
+        messages,
+        tools=None,
+        system_prompt=None,
+        max_tokens=4096,
+        temperature=0.3,
+        tool_choice="auto",
+    ):
+        prompt = messages[0].text_content() if messages else ""
+        if self._is_answer_call(prompt, tools):
+            evidence_ids = EVIDENCE_ID_RE.findall(prompt)
+            mode = (
+                self.answer_script[self.answer_calls]
+                if self.answer_calls < len(self.answer_script)
+                else "supported"
+            )
+            self.answer_calls += 1
+            if mode == "insufficient":
+                claims = [
+                    {
+                        "text": "The cited scope does not support an answer.",
+                        "evidence_ids": [],
+                        "evidence_status": "insufficient",
+                    }
+                ]
+            else:
+                claims = [
+                    {
+                        "text": "The selected demo papers report this protocol.",
+                        "evidence_ids": evidence_ids,
+                        "evidence_status": "supported",
+                    }
+                ]
+            return ProviderResponse(blocks=[TextBlock(text=json.dumps({"claims": claims}))])
+        if self.planner is None:
+            raise AssertionError("no planner script was installed for this turn")
+        return await self.planner.chat(
+            messages, tools, system_prompt, max_tokens, temperature, tool_choice
+        )
+
+
+class ForeignSourceProvider(LibraryAgentProvider):
+    """Plans the chain but asks the answer tool for a source outside the project."""
+
+    async def chat(
+        self,
+        messages,
+        tools=None,
+        system_prompt=None,
+        max_tokens=4096,
+        temperature=0.3,
+        tool_choice="auto",
+    ):
+        by_name = self._results(messages)
+        if "literature_answer" not in by_name:
+            return self._call(
+                "literature_answer",
+                {"question": "Q?", "source_ids": ["src_other_project0001"]},
+            )
+        answer = by_name["literature_answer"][-1]
+        if answer.is_error:
+            return self._say(f"工具被拒绝：{answer.output}")
+        return self._say("不应该走到这里")
+
+
+async def run_turn(
+    runtime: ConversationRuntime, message: str, *, decisions: dict[str, str] | None = None
+) -> list:
+    """Run one turn and answer every approval with the scripted decision."""
+
+    events = []
+    async for event in runtime.turn(message):
+        events.append(event)
+        if event.type is AgentEventType.AWAIT_APPROVAL:
+            tool_name = str(event.data.get("tool_name", ""))
+            decision = (decisions or {}).get(tool_name, "allow_once")
+            runtime.approve(str(event.data.get("id", "")), decision)
+    return events
+
+
+def tool_result_for(events: list, tool_name: str):
+    for event in events:
+        if event.type is not AgentEventType.TOOL_RESULT:
+            continue
+        if (
+            event.data.get("tool_name") == tool_name
+            or event.data.get("metadata", {}).get("tool_name") == tool_name
+        ):
+            return event
+    return None
+
+
+@pytest.fixture(scope="module")
+def client_and_patches():
+    pytest.importorskip("chromadb")
+    from api_factory import create_app
+
+    helpers = importlib.import_module("tests.integration.test_literature_demo_e2e")
+    corpus = helpers.load_demo_corpus()
+    test_dir = Path(tempfile.mkdtemp(prefix="a1-session-"))
+    config_dir = test_dir / "config"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    (config_dir / "default.yaml").write_text(CONFIG, encoding="utf-8")
+
+    stub = helpers.OfflineArxivStub(corpus, open_fulltext=True)
+    downloader = helpers.CorpusDownloader(corpus, test_dir / "downloads")
+    roles = RoleRouter()
+
+    with (
+        patch("api_factory.CONFIG_PATH", config_dir / "default.yaml"),
+        patch("api_factory.RUNTIME_DIR", test_dir),
+        patch("api_factory.BASE_DIR", test_dir),
+        patch("src.literature.providers.arxiv.ArxivProvider", lambda *a, **k: stub),
+        patch("src.literature.fulltext.HttpFullTextDownloader", lambda *a, **k: downloader),
+        # Same seam as D-024: the model is substituted before the app is created.
+        patch("src.agent_v2.router._create_provider", lambda *a, **k: roles),
+    ):
+        app = create_app()
+        with TestClient(app) as test_client:
+            yield test_client, app, corpus, helpers, test_dir, roles
+
+    shutil.rmtree(test_dir, ignore_errors=True)
+
+
+class CountingTransport(httpx.ASGITransport):
+    """ASGI transport that records which application paths were actually hit."""
+
+    def __init__(self, app) -> None:
+        super().__init__(app=app)
+        self.paths: list[str] = []
+
+    async def handle_async_request(self, request):
+        self.paths.append(request.url.path)
+        return await super().handle_async_request(request)
+
+
+def patch_tool_http(monkeypatch: pytest.MonkeyPatch, app) -> CountingTransport:
+    """Serve the tools' ``SCHOLAR_API_BASE`` calls from the app itself."""
+
+    real_client = httpx.AsyncClient
+    transport = CountingTransport(app)
+
+    def factory(**kwargs):
+        forwarded = {
+            key: value for key, value in kwargs.items() if key in {"timeout", "follow_redirects"}
+        }
+        return real_client(
+            transport=transport,
+            base_url="http://localhost:18088",
+            **forwarded,
+        )
+
+    monkeypatch.setattr(httpx, "AsyncClient", factory)
+    return transport
+
+
+def tool_names(events: list, event_type: AgentEventType) -> list[str]:
+    return [str(event.data.get("tool_name")) for event in events if event.type is event_type]
+
+
+def output_for(events: list, tool_name: str) -> str:
+    return next(
+        event.data["output"]
+        for event in events
+        if event.type is AgentEventType.TOOL_RESULT and event.data.get("tool_name") == tool_name
+    )
+
+
+def run_turn_sync(
+    runtime: ConversationRuntime, message: str, *, decisions: dict[str, str] | None = None
+) -> list:
+    import asyncio
+
+    return asyncio.run(run_turn(runtime, message, decisions=decisions))
+
+
+def run_session_sync(runtime: ConversationRuntime, messages: list[str]) -> list[list]:
+    """Run several turns of one session inside a single event loop."""
+
+    import asyncio
+
+    async def drive() -> list[list]:
+        turns = []
+        for message in messages:
+            turns.append(await run_turn(runtime, message))
+        return turns
+
+    return asyncio.run(drive())
+
+
+def build_runtime(
+    project: str, planner: LibraryAgentProvider, roles: RoleRouter
+) -> ConversationRuntime:
+    import src.agent_v2.router as router
+
+    roles.planner = planner
+    runtime = router._create_runtime(project)
+    assert runtime is not None
+    return runtime
+
+
+def create_project(client: TestClient, workdir: Path, name: str) -> str:
+    location = workdir / "projects"
+    location.mkdir(parents=True, exist_ok=True)
+    created = client.post(
+        "/api/project/create",
+        json={
+            "name": name,
+            "location": str(location),
+            "template_id": "research_paper",
+            "init_git": False,
+        },
+    )
+    assert created.status_code == 200, created.text
+    return str(created.json()["project_path"])
+
+
+def test_agent_runs_the_whole_literature_chain_with_confirmations(
+    client_and_patches, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client, app, corpus, helpers, test_dir, roles = client_and_patches
+    project = create_project(client, test_dir / "chain", "A1 Chain")
+    provider = LibraryAgentProvider(corpus, helpers)
+    runtime = build_runtime(project, provider, roles)
+    patch_tool_http(monkeypatch, app)
+
+    events = run_turn_sync(runtime, "请用我项目里的文献回答我的研究问题")
+
+    approvals = [e for e in events if e.type is AgentEventType.AWAIT_APPROVAL]
+    approved_tools = [str(e.data.get("tool_name")) for e in approvals]
+    imported = json.loads(output_for(events, "literature_import"))
+    source_count = len(imported["sources"])
+    assert source_count >= 2
+    # Every side-effecting literature step stopped for confirmation, in order.
+    assert approved_tools == [
+        "literature_search",
+        "literature_import",
+        *["literature_acquire_fulltext"] * source_count,
+        *["literature_index"] * source_count,
+        "literature_answer",
+    ]
+
+    calls = tool_names(events, AgentEventType.TOOL_CALL)
+    assert calls[0] == "literature_sources"
+
+    sources = json.loads(output_for(events, "literature_sources"))
+    assert sources["source_count"] == 0
+
+    answer = json.loads(output_for(events, "literature_answer"))
+    assert answer["status"] == "answered"
+    assert answer["claims"] and answer["evidence"]
+    assert answer["source_ids"]
+    for item in answer["evidence"]:
+        assert item["page"] >= 1
+        assert item["exact_quote"]
+
+    final = [e for e in events if e.type is AgentEventType.RESPONSE]
+    assert final and "引用证据" in final[-1].data.get("text", "")
+
+    # §2.4: "the final evidence equals the plain service entry".  Replay the same
+    # question through the HTTP route and require an identical answer.
+    direct = client.post(
+        "/api/literature/answer",
+        json={
+            "project_path": project,
+            "question": corpus.question,
+            "source_ids": answer["source_ids"],
+            "top_k": 5,
+        },
+    )
+    assert direct.status_code == 200, direct.text
+    direct_body = direct.json()
+    assert direct_body["status"] == answer["status"]
+    assert [claim["claim_id"] for claim in direct_body["claims"]] == [
+        claim["claim_id"] for claim in answer["claims"]
+    ]
+    assert [
+        (item["span"]["evidence_id"], item["span"]["page_start"], item["span"]["exact_quote"])
+        for item in direct_body["evidence"]
+    ] == [(item["evidence_id"], item["page"], item["exact_quote"]) for item in answer["evidence"]]
+
+    # The frontend only ever sees the SSE payload, so the adapter must hand it the
+    # complete result: a second truncation here would turn the answer into
+    # unparseable JSON and silently drop the evidence cards.
+    from src.agent_v2.sse_adapter import agent_event_to_sse
+
+    answer_event = next(
+        event
+        for event in events
+        if event.type is AgentEventType.TOOL_RESULT
+        and event.data.get("tool_name") == "literature_answer"
+    )
+    sse = agent_event_to_sse(answer_event)
+    detail = sse["metadata"]["result_detail"]
+    assert sse["metadata"]["truncated"] is False
+    assert detail == answer_event.data["output"]
+    assert json.loads(detail)["evidence"]
+
+
+def test_denied_confirmation_stops_the_chain_without_calling_the_service(
+    client_and_patches, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client, app, corpus, helpers, test_dir, roles = client_and_patches
+    project = create_project(client, test_dir / "deny", "A1 Deny")
+    provider = LibraryAgentProvider(corpus, helpers)
+    runtime = build_runtime(project, provider, roles)
+    transport = patch_tool_http(monkeypatch, app)
+
+    events = run_turn_sync(runtime, "检索新文献", decisions={"literature_search": "deny"})
+
+    types = [e.type for e in events]
+    assert AgentEventType.APPROVAL_RECEIVED in types
+    denial = output_for(events, "literature_search")
+    assert "denied" in json.dumps(denial, ensure_ascii=False).lower()
+    assert "search_exec_" not in denial
+    # Measured, not inferred: the only request that reached the application is the
+    # read-only source listing; the denied search never hit the service.
+    assert transport.paths == ["/api/project/sources"]
+
+
+def test_out_of_scope_source_is_refused_by_the_answer_tool(
+    client_and_patches, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client, app, corpus, helpers, test_dir, roles = client_and_patches
+    project = create_project(client, test_dir / "foreign", "A1 Foreign")
+    provider = ForeignSourceProvider(corpus, helpers)
+    runtime = build_runtime(project, provider, roles)
+    patch_tool_http(monkeypatch, app)
+
+    events = run_turn_sync(runtime, "回答我")
+
+    answer_event = next(
+        e
+        for e in events
+        if e.type is AgentEventType.TOOL_RESULT and e.data.get("tool_name") == "literature_answer"
+    )
+    assert answer_event.data.get("is_error") is True
+    assert "source_not_found" in answer_event.data["output"]
+
+
+def test_insufficient_answer_leads_to_a_wider_scoped_retry(
+    client_and_patches, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """§2.4: when the evidence is insufficient, the Agent widens inside the project."""
+
+    client, app, corpus, helpers, test_dir, roles = client_and_patches
+    project = create_project(client, test_dir / "widen", "A1 Widen")
+    provider = LibraryAgentProvider(corpus, helpers, mode="widen_after_insufficient")
+    runtime = build_runtime(project, provider, roles)
+    roles.answer_script = ["insufficient"]
+    roles.answer_calls = 0
+    patch_tool_http(monkeypatch, app)
+
+    events = run_turn_sync(runtime, "先用最窄的范围回答")
+
+    answers = [
+        json.loads(event.data["output"])
+        for event in events
+        if event.type is AgentEventType.TOOL_RESULT
+        and event.data.get("tool_name") == "literature_answer"
+    ]
+    assert len(answers) == 2
+    assert answers[0]["status"] == "insufficient"
+    assert answers[0]["next_actions"] == [
+        "widen_scope_within_project",
+        "propose_new_query_for_confirmation",
+    ]
+    assert answers[0]["must_not_answer_from_memory"] is True
+
+    assert answers[1]["status"] == "answered"
+    assert len(answers[1]["source_ids"]) > len(answers[0]["source_ids"])
+    assert answers[1]["evidence"]
+
+    final = [e for e in events if e.type is AgentEventType.RESPONSE]
+    assert final and "引用证据" in final[-1].data.get("text", "")
+    assert "证据不足" not in final[-1].data.get("text", "")
+
+
+def test_follow_up_question_reuses_the_session_scope(
+    client_and_patches, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """§2.4: a follow-up in the same session answers without rebuilding anything."""
+
+    client, app, corpus, helpers, test_dir, roles = client_and_patches
+    project = create_project(client, test_dir / "followup", "A1 Follow-up")
+    provider = LibraryAgentProvider(corpus, helpers)
+    runtime = build_runtime(project, provider, roles)
+    roles.answer_script = []
+    roles.answer_calls = 0
+    patch_tool_http(monkeypatch, app)
+
+    import asyncio
+
+    provider.begin_turn()
+    first = asyncio.run(run_turn(runtime, "建库并回答"))
+    assert json.loads(output_for(first, "literature_answer"))["status"] == "answered"
+
+    # The follow-up sees the same session history.
+    provider.mode = "reuse_existing"
+    provider.begin_turn()
+
+    async def second_turn() -> list:
+        return await run_turn(runtime, "那这些论文的评测协议是什么？")
+
+    second = asyncio.run(second_turn())
+
+    second_calls = tool_names(second, AgentEventType.TOOL_CALL)
+    assert "literature_search" not in second_calls
+    assert "literature_import" not in second_calls
+    assert "literature_index" not in second_calls
+    assert "literature_acquire_fulltext" not in second_calls
+    assert second_calls == ["literature_sources", "literature_answer"]
+
+    answer = json.loads(output_for(second, "literature_answer"))
+    assert answer["status"] == "answered"
+    assert answer["claims"] and answer["evidence"]
+    assert answer["evidence"][0]["exact_quote"]
+
+
+def test_second_turn_reuses_existing_index_instead_of_reindexing(
+    client_and_patches, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client, app, corpus, helpers, test_dir, roles = client_and_patches
+    project = create_project(client, test_dir / "reuse", "A1 Reuse")
+    patch_tool_http(monkeypatch, app)
+
+    first = LibraryAgentProvider(corpus, helpers)
+    first_events = run_turn_sync(build_runtime(project, first, roles), "建库并回答")
+    assert "literature_index" in tool_names(first_events, AgentEventType.TOOL_RESULT)
+    built_sources = {
+        item["source_id"]
+        for item in json.loads(output_for(first_events, "literature_import"))["sources"]
+    }
+    assert len(built_sources) >= 2
+
+    second = LibraryAgentProvider(corpus, helpers, mode="reuse_existing")
+    second_events = run_turn_sync(build_runtime(project, second, roles), "再回答一次")
+
+    second_calls = tool_names(second_events, AgentEventType.TOOL_CALL)
+    assert "literature_index" not in second_calls
+    assert "literature_acquire_fulltext" not in second_calls
+    assert second_calls[-1] == "literature_answer"
+
+    # Non-vacuous: the sources this run built must report as already indexed.
+    sources = json.loads(output_for(second_events, "literature_sources"))
+    by_id = {item["source_id"]: item for item in sources["sources"]}
+    assert built_sources <= set(by_id)
+    assert all(by_id[source_id]["already_indexed"] for source_id in built_sources)
+    assert sources["indexed_count"] >= len(built_sources)

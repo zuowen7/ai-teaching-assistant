@@ -403,7 +403,15 @@ def _resolve_source_attachment(
     return resolved
 
 
-def _extract_source_content(path: Path) -> dict[str, Any]:
+def _extract_source_content(path: Path, *, include_pages: bool = False) -> dict[str, Any]:
+    """Extract one source file's flat text plus its P2B provenance.
+
+    ``include_pages`` is opt-in because the import route persists the result in
+    the project manifest and must not store per-page text there.  Page text is
+    raw extraction output: it is never normalized or rewritten here.
+    """
+
+    from src.literature.evidence import sha256_file
     from src.parser import extract_document
 
     try:
@@ -416,11 +424,17 @@ def _extract_source_content(path: Path) -> dict[str, Any]:
         from src.parser.ocr import ocr_install_hint
 
         raise HTTPException(422, f"文献没有可提取文本（疑似扫描版 PDF）。{ocr_install_hint()}")
-    return {
+    payload: dict[str, Any] = {
         "text": text,
         "pages": len(document.pages),
         "chars": len(text),
+        "document_sha256": sha256_file(path),
     }
+    if include_pages:
+        payload["page_texts"] = [
+            {"page_num": page.page_num, "text": page.text} for page in document.pages
+        ]
+    return payload
 
 
 def _export_manifest(project_path: Path) -> Path:
@@ -1032,6 +1046,8 @@ def register_project(
             "size": len(content),
         }
         try:
+            # Manifest metadata keeps only flat text stats and the artifact hash;
+            # per-page text stays out of sources.json (read it via the content route).
             metadata.update(_extract_source_content(target))
             metadata.pop("text", None)
         except HTTPException as exc:
@@ -1109,12 +1125,14 @@ def register_project(
         source_id: str,
         project_path: str,
         version: Literal["original", "translated"] = "original",
+        include_pages: bool = False,
     ):
         project = _require_project(project_path)
         source = _find_source(project, source_id)
         path_key = "translated_path" if version == "translated" else "original_path"
         payload = _extract_source_content(
-            _resolve_source_attachment(project, source, path_key=path_key)
+            _resolve_source_attachment(project, source, path_key=path_key),
+            include_pages=include_pages,
         )
         return {
             "source_id": source_id,

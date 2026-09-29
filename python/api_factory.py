@@ -383,10 +383,39 @@ def _apply_local_overrides(cfg: dict) -> None:
             cfg.update(_deep_merge(cfg, local_cfg))
 
 
+def _literature_answer_mode(config: dict) -> str:
+    """Return the configured answer mode: ``model`` (default) or ``fixture``."""
+
+    literature = config.get("literature") if isinstance(config, dict) else None
+    answer = literature.get("answer") if isinstance(literature, dict) else None
+    raw = answer.get("mode") if isinstance(answer, dict) else None
+    return "fixture" if str(raw or "").strip().casefold() == "fixture" else "model"
+
+
+def _literature_answer_max_tokens(config: dict) -> int:
+    """Output budget for the answer call (``literature.answer.max_tokens``)."""
+
+    from src.literature.answer_model import DEFAULT_MAX_TOKENS
+
+    literature = config.get("literature") if isinstance(config, dict) else None
+    answer = literature.get("answer") if isinstance(literature, dict) else None
+    raw = answer.get("max_tokens") if isinstance(answer, dict) else None
+    try:
+        configured = int(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_MAX_TOKENS
+    return configured if configured > 0 else DEFAULT_MAX_TOKENS
+
+
 def _apply_env_overrides(cfg: dict) -> None:
     env_key = os.environ.get("SCHOLAR_CLOUD_API_KEY", "").strip()
     if env_key:
         cfg.setdefault("translator", {}).setdefault("cloud", {})["api_key"] = env_key
+    # Offline runs (defense laptop, CI) may force the deterministic extractive
+    # answer model without touching the user's config file.
+    answer_mode = os.environ.get("SCHOLAR_LITERATURE_ANSWER_MODE", "").strip()
+    if answer_mode:
+        cfg.setdefault("literature", {}).setdefault("answer", {})["mode"] = answer_mode
 
 
 _save_config_lock = threading.Lock()
@@ -639,6 +668,11 @@ def create_app(*, cloud_only: bool = False) -> FastAPI:
 
     from prompts.loader import validate_required_prompt_bundle
     from src._version import __version__
+    from src.net_env import normalize_proxy_env
+
+    # Every httpx client in this process (providers, health probes) is built from
+    # the environment; an unparsable NO_PROXY entry would break them at construction.
+    normalize_proxy_env()
 
     # Academic safety prompts are production resources, not optional cosmetic
     # text. Refuse to start a weakened backend when packaging omitted them.
@@ -969,15 +1003,104 @@ def create_app(*, cloud_only: bool = False) -> FastAPI:
         data_root=data_root,
     )
 
-    from routers.literature import ProjectSourceManifestStore, register_literature_routes
+    from routers.literature import (
+        ProjectSourceManifestStore,
+        RagPageIndexStore,
+        RagPageRetriever,
+        register_literature_routes,
+    )
+    from src.agent_v2.router import _create_provider
+    from src.literature.answer_model import (
+        AgentProviderAnswerModel,
+        effective_thinking_mode,
+    )
+    from src.literature.demo_corpus import (
+        DemoCorpusError,
+        build_fixture_provider,
+        load_demo_corpus,
+    )
+    from src.literature.fixture_answer_model import FIXTURE_MODEL_NAME, FixtureAnswerModel
+    from src.literature.fulltext import HttpFullTextDownloader
     from src.literature.providers.arxiv import ArxivProvider
     from src.literature.service import LiteratureService
+
+    _literature_providers: list = [ArxivProvider()]
+    # M10/D-033: the fixed demo corpus only adds an explicitly labelled offline
+    # provider.  A missing or corrupt corpus degrades to "no cached provider"; it
+    # never blocks startup and never masquerades as the live provider.
+    try:
+        _demo_corpus = load_demo_corpus()
+    except DemoCorpusError as exc:
+        logger.warning("Demo corpus unavailable (%s); fixture provider not registered", exc.code)
+    else:
+        _demo_fixture = build_fixture_provider(_demo_corpus)
+        if any(provider.name == _demo_fixture.name for provider in _literature_providers):
+            logger.warning(
+                "A provider named %s is already registered; demo corpus not added",
+                _demo_fixture.name,
+            )
+        else:
+            _literature_providers.append(_demo_fixture)
+            logger.info("Demo corpus %s registered as the fixture provider", _demo_corpus.corpus_id)
+
+    # P3 answer model: reuse the existing Agent provider factory instead of
+    # introducing a second provider-selection path (decision D-028).
+    # ``literature.answer.mode: fixture`` (or SCHOLAR_LITERATURE_ANSWER_MODE) swaps
+    # in the deterministic extractive model so the chain stays demonstrable
+    # offline; its identity keeps fixture answers distinguishable (decision D-040).
+    _answer_config = _load_config()
+    _answer_model = None
+    if _literature_answer_mode(_answer_config) == "fixture":
+        _answer_model = FixtureAnswerModel()
+        logger.info(
+            "Literature answer model is the deterministic fixture model (%s)",
+            FIXTURE_MODEL_NAME,
+        )
+    else:
+        try:
+            _answer_provider = _create_provider(_answer_config)
+        except Exception as exc:  # pragma: no cover - misconfigured local environment
+            logger.warning("Literature answer model is unavailable: %s", type(exc).__name__)
+            _answer_provider = None
+
+        if _answer_provider is not None:
+            # Report what the provider is configured to do; the answer path never
+            # overrides the user's model settings (plan 5.9 rule 8).
+            logger.info(
+                "Literature answer thinking mode: %s",
+                effective_thinking_mode(_answer_provider) or "n/a",
+            )
+            _agent_config = (
+                (_answer_config.get("agent") or {}) if isinstance(_answer_config, dict) else {}
+            )
+            _answer_model = AgentProviderAnswerModel(
+                provider=_answer_provider,
+                provider_name=str(
+                    getattr(_answer_provider, "provider_name", None)
+                    or _agent_config.get("provider")
+                    or type(_answer_provider).__name__
+                ),
+                model=str(
+                    getattr(_answer_provider, "model", None)
+                    or _agent_config.get("model")
+                    or "unknown"
+                ),
+                base_url=str(
+                    getattr(_answer_provider, "base_url", "") or _agent_config.get("base_url") or ""
+                ),
+                # Thinking models need headroom for reasoning plus the JSON answer.
+                max_tokens=_literature_answer_max_tokens(_answer_config),
+            )
 
     state_literature = register_literature_routes(
         app,
         service=LiteratureService(
-            providers=[ArxivProvider()],
+            providers=_literature_providers,
             project_store=ProjectSourceManifestStore(),
+            index_store=RagPageIndexStore(state_rag),
+            downloader=HttpFullTextDownloader(),
+            retriever=RagPageRetriever(state_rag),
+            answer_model=_answer_model,
         ),
     )
 

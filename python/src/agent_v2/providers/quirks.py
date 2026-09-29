@@ -58,7 +58,9 @@ _register(
 )
 
 # Qwen（DashScope/本地 qwen3 思考模型）：同样输出 reasoning_content 并要求回传
-_register("qwen", prefer_temperature_zero=True, choices_can_be_empty=True, echo_reasoning_content=True)
+_register(
+    "qwen", prefer_temperature_zero=True, choices_can_be_empty=True, echo_reasoning_content=True
+)
 
 # 智谱 GLM 思考模型：reasoning_content 同规则
 _register("glm", echo_reasoning_content=True)

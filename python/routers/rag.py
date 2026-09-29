@@ -6,6 +6,11 @@ Endpoints:
   POST   /api/rag/upload                 — upload file and ingest
   DELETE /api/rag/documents/{doc_id}     — delete a doc
   POST   /api/rag/query                  — semantic search
+
+Two indexing modes share the collection: the legacy flat-text mode (translation
+auto-ingest, uploads, manual text) and the page-aware evidence mode used by
+project literature sources, which stores page/character/artifact metadata so a
+hit can be resolved back to a real page quote.
 """
 
 from __future__ import annotations
@@ -17,16 +22,30 @@ import logging
 import os
 import tempfile
 import uuid
+from collections.abc import Sequence
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, UploadFile
 from pydantic import BaseModel, Field
 
+from src.literature.evidence import (
+    CHUNKER_VERSION,
+    DEFAULT_EMBEDDING_MODEL,
+    DEFAULT_EMBEDDING_VERSION,
+    INDEX_VERSION,
+    PARSER_VERSION,
+    build_page_chunks,
+    chunk_metadata,
+    index_fingerprint,
+)
+
 logger = logging.getLogger(__name__)
 _MAX_UPLOAD_BYTES = 20 * 1024 * 1024
 _CHUNK_TARGET_CHARS = 1400
 _CHUNK_OVERLAP_CHARS = 180
+_PAGE_DOC_KIND = "literature_pages"
 
 
 class IngestRequest(BaseModel):
@@ -42,6 +61,7 @@ class QueryRequest(BaseModel):
     top_k: int = Field(default=5, ge=1, le=50)
     project_root: str | None = Field(default=None, max_length=2000)
     source_ids: list[str] | None = Field(default=None, max_length=100)
+    project_scoped: bool = False
 
 
 def build_translation_doc_id(source_text: str) -> str:
@@ -83,7 +103,9 @@ def _dedupe_hits(
         hits.append(
             {
                 "doc_id": doc_id,
-                "chunk_id": chunk_id,
+                # Page chunks are stored under "<doc_id>::<chunk_id>" (D-032);
+                # callers always see the content-level id.
+                "chunk_id": str(metadata.get("chunk_id") or chunk_id),
                 "source": metadata.get("title", chunk_id),
                 "text": documents[index] if index < len(documents) else "",
                 "distance": distances[index] if index < len(distances) else None,
@@ -253,6 +275,168 @@ def register_rag_routes(
             raise HTTPException(500, "RAG document ingest failed")
         return entry
 
+    async def _embedding_identity() -> tuple[str, str]:
+        """Best-effort identity of the collection's embedding function.
+
+        ChromaDB is used without an explicit ``embedding_function``, so the
+        honest record is the function the library actually installed (its class
+        name) plus an explicitly unpinned version marker.  The store is opened
+        first on purpose: reading the identity before the collection exists
+        returns the fallback on the very first call and the real class name
+        afterwards, which would make the index fingerprint depend on call order
+        and mark a freshly built index as stale.
+        """
+
+        function = getattr(await _ensure_store(), "_embedding_function", None)
+        name = type(function).__name__ if function is not None else ""
+        if not name or name == "NoneType":
+            return DEFAULT_EMBEDDING_MODEL, DEFAULT_EMBEDDING_VERSION
+        return name, DEFAULT_EMBEDDING_VERSION
+
+    async def _index_pages(
+        *,
+        doc_id: str,
+        title: str,
+        pages: list[tuple[int, str]],
+        artifact_sha256: str,
+        project_root: str | None = None,
+        source_id: str | None = None,
+        filename: str | None = None,
+        force: bool = False,
+    ) -> dict[str, Any]:
+        """Index page-scoped chunks that carry full evidence metadata.
+
+        Re-indexing is idempotent: an existing entry with the same artifact hash
+        and index fingerprint is reused unless ``force`` is set.
+        """
+
+        embedding_model, embedding_version = await _embedding_identity()
+        fingerprint = index_fingerprint(
+            artifact_sha256=artifact_sha256,
+            parser_version=PARSER_VERSION,
+            chunker_version=CHUNKER_VERSION,
+            embedding_model=embedding_model,
+            embedding_version=embedding_version,
+            index_version=INDEX_VERSION,
+        )
+        existing = _docs.get(doc_id)
+        if (
+            not force
+            and isinstance(existing, dict)
+            and existing.get("index_fingerprint") == fingerprint
+            and existing.get("artifact_sha256") == artifact_sha256
+        ):
+            return {**existing, "reused": True}
+
+        chunks = build_page_chunks(pages, artifact_sha256=artifact_sha256)
+        if not chunks:
+            raise HTTPException(422, "Document has no indexable page text")
+        col = await _ensure_store()
+        if col is None:
+            raise HTTPException(503, "RAG store not available")
+
+        # Storage key = document scope + content identity (D-032).  Two documents
+        # with identical bytes produce identical content ids, so the bare id would
+        # let one document silently overwrite another's page metadata.
+        ids = [f"{doc_id}::{chunk.chunk_id}" for chunk in chunks]
+        documents = [chunk.text for chunk in chunks]
+        metadatas = [
+            chunk_metadata(
+                chunk,
+                doc_id=doc_id,
+                title=title,
+                chunk_index=index,
+                artifact_sha256=artifact_sha256,
+                index_fingerprint_value=fingerprint,
+                project_root=project_root,
+                source_id=source_id,
+                parser_version=PARSER_VERSION,
+                chunker_version=CHUNKER_VERSION,
+                embedding_model=embedding_model,
+                embedding_version=embedding_version,
+                index_version=INDEX_VERSION,
+            )
+            for index, chunk in enumerate(chunks)
+        ]
+        entry: dict[str, Any] = {
+            "doc_id": doc_id,
+            "title": title,
+            "kind": _PAGE_DOC_KIND,
+            "chunk_count": len(chunks),
+            "page_count": len({chunk.page_number for chunk in chunks}),
+            "char_count": sum(len(chunk.text) for chunk in chunks),
+            "artifact_sha256": artifact_sha256,
+            "index_fingerprint": fingerprint,
+            "parser_version": PARSER_VERSION,
+            "chunker_version": CHUNKER_VERSION,
+            "embedding_model": embedding_model,
+            "embedding_version": embedding_version,
+            "index_version": INDEX_VERSION,
+            "indexed_at": datetime.now(UTC).isoformat(),
+            "filename": filename,
+            "project_root": project_root,
+            "source_id": source_id,
+        }
+        try:
+            async with _operation_lock:
+                await asyncio.to_thread(col.delete, where={"doc_id": doc_id})
+                await asyncio.to_thread(
+                    col.upsert,
+                    ids=ids,
+                    documents=documents,
+                    metadatas=metadatas,
+                )
+                _docs[doc_id] = entry
+                await asyncio.to_thread(_save_docs)
+        except HTTPException:
+            raise
+        except Exception as exc:
+            logger.warning("RAG page indexing failed: %s", exc)
+            raise HTTPException(500, "RAG page indexing failed")
+        return {**entry, "reused": False}
+
+    async def _get_chunk(chunk_id: str, source_id: str | None = None) -> dict[str, Any] | None:
+        """Fetch one stored chunk together with its evidence metadata.
+
+        Page chunks are stored under ``<doc_id>::<chunk_id>`` (D-032), so the
+        content-level ``chunk_id`` is resolved through chunk metadata instead of
+        through the storage key.  A bare id lookup stays as the fallback for rows
+        written before D-032 and for flat-text chunks.
+        """
+
+        col = await _ensure_store()
+        if col is None:
+            raise HTTPException(503, "RAG store not available")
+        try:
+            where: dict[str, Any] = {"chunk_id": chunk_id}
+            if source_id:
+                where = {"$and": [{"chunk_id": chunk_id}, {"source_id": source_id}]}
+            result = await asyncio.to_thread(
+                col.get,
+                where=where,
+                include=["documents", "metadatas"],
+            )
+            if not (result.get("ids") or []):
+                result = await asyncio.to_thread(
+                    col.get,
+                    ids=[chunk_id],
+                    include=["documents", "metadatas"],
+                )
+        except Exception as exc:
+            logger.warning("RAG chunk lookup failed: %s", exc)
+            raise HTTPException(500, "RAG chunk lookup failed")
+        ids = result.get("ids") or []
+        if not ids:
+            return None
+        documents = result.get("documents") or []
+        metadatas = result.get("metadatas") or []
+        metadata = dict(metadatas[0] or {}) if metadatas else {}
+        return {
+            "chunk_id": str(metadata.get("chunk_id") or ids[0]),
+            "text": str(documents[0]) if documents else "",
+            "metadata": metadata,
+        }
+
     @app.post("/api/rag/ingest")
     async def rag_ingest(req: IngestRequest):
         doc_id = req.doc_id or f"doc_{uuid.uuid4().hex[:8]}"
@@ -319,6 +503,10 @@ def register_rag_routes(
     async def rag_delete_document(doc_id: str):
         if doc_id not in _docs:
             raise HTTPException(404, f"Document {doc_id} not found")
+        await _delete_document(doc_id)
+        return {"status": "ok", "deleted": doc_id}
+
+    async def _delete_document(doc_id: str) -> None:
         col = await _ensure_store()
         if col is None:
             raise HTTPException(503, "RAG store not available")
@@ -327,34 +515,49 @@ def register_rag_routes(
                 await asyncio.to_thread(col.delete, where={"doc_id": doc_id})
                 # Compatibility with documents indexed before chunking was introduced.
                 await asyncio.to_thread(col.delete, ids=[doc_id])
-                del _docs[doc_id]
+                _docs.pop(doc_id, None)
                 await asyncio.to_thread(_save_docs)
         except Exception as e:
             logger.warning("RAG delete failed: %s", e)
             raise HTTPException(500, "RAG document delete failed")
 
-        return {"status": "ok", "deleted": doc_id}
+    async def _query_pages(
+        *,
+        query: str,
+        top_k: int,
+        project_root: str | None = None,
+        source_ids: Sequence[str] | None = None,
+        project_scoped: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Run one scoped vector query and return de-duplicated hits.
 
-    @app.post("/api/rag/query")
-    async def rag_query(req: QueryRequest):
+        The HTTP route and the P3 evidence answer service share this function so
+        that "project and source scoped" has exactly one implementation.
+        """
+
+        if project_scoped and (not project_root or not source_ids):
+            raise HTTPException(
+                400,
+                "project_scoped queries require project_root and explicit source_ids",
+            )
         col = await _ensure_store()
         if col is None:
             raise HTTPException(503, "RAG store not available")
         try:
             where: dict[str, Any] | None = None
             filters: list[dict[str, Any]] = []
-            if req.project_root is not None:
-                filters.append({"project_root": req.project_root})
-            if req.source_ids:
-                filters.append({"source_id": {"$in": req.source_ids}})
+            if project_root is not None:
+                filters.append({"project_root": project_root})
+            if source_ids:
+                filters.append({"source_id": {"$in": list(source_ids)}})
             if len(filters) == 1:
                 where = filters[0]
             elif filters:
                 where = {"$and": filters}
             query_kwargs: dict[str, Any] = {
-                "query_texts": [req.query],
+                "query_texts": [query],
                 # 多取候选，便于按文档去重后仍能凑满 top_k
-                "n_results": min(max(req.top_k * 3, 10), 50),
+                "n_results": min(max(top_k * 3, 10), 50),
             }
             if where is not None:
                 query_kwargs["where"] = where
@@ -366,9 +569,33 @@ def register_rag_routes(
             documents = (results.get("documents") or [[]])[0]
             metadatas = (results.get("metadatas") or [[]])[0]
             distances = (results.get("distances") or [[]])[0]
-            return {"hits": _dedupe_hits(ids, documents, metadatas, distances, req.top_k)}
+            return _dedupe_hits(ids, documents, metadatas, distances, top_k)
+        except HTTPException:
+            raise
         except Exception as exc:
             logger.warning("RAG query failed: %s", exc)
-            raise HTTPException(500, "RAG query failed")
+            raise HTTPException(500, "RAG query failed") from exc
 
+    @app.post("/api/rag/query")
+    async def rag_query(req: QueryRequest):
+        return {
+            "hits": await _query_pages(
+                query=req.query,
+                top_k=req.top_k,
+                project_root=req.project_root,
+                source_ids=req.source_ids,
+                project_scoped=req.project_scoped,
+            )
+        }
+
+    state.update(
+        {
+            "index_pages": _index_pages,
+            "get_chunk": _get_chunk,
+            "get_document": lambda doc_id: _docs.get(doc_id),
+            "delete_document": _delete_document,
+            "embedding_identity": _embedding_identity,
+            "query_pages": _query_pages,
+        }
+    )
     return state

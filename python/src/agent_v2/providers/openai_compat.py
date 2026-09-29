@@ -92,6 +92,8 @@ class OpenAiCompatProvider(BaseProvider):
     Connection strategy: system-proxy-aware → direct fallback.
     """
 
+    provider_name = "openai_compatible"
+
     def __init__(
         self,
         base_url: str = "https://api.openai.com/v1",
@@ -212,8 +214,14 @@ class OpenAiCompatProvider(BaseProvider):
         max_tokens: int = 4096,
         temperature: float = 0.3,
         tool_choice: str = "auto",
+        response_format: dict[str, Any] | None = None,
     ) -> ProviderResponse:
-        """非流式调用。tool_choice: 'auto' | 'required' | 'none'"""
+        """非流式调用。tool_choice: 'auto' | 'required' | 'none'
+
+        ``response_format`` is opt-in: the caller passes
+        ``{"type": "json_object"}`` when it needs guaranteed JSON output (DeepSeek
+        documents this as JSON Output).  The Agent loop leaves it unset.
+        """
         body: dict[str, Any] = {
             "model": self.model,
             "messages": self._build_messages(messages, system_prompt),
@@ -221,6 +229,8 @@ class OpenAiCompatProvider(BaseProvider):
             "temperature": temperature,
             "stream": False,
         }
+        if response_format is not None:
+            body["response_format"] = response_format
         built_tools = self._build_tools(tools)
         thinking_resolved = apply_thinking_policy(
             body,

@@ -1,6 +1,11 @@
-"""学术工具 — 翻译、导出、arXiv、RAG 检索。
+"""学术工具 — 翻译、导出、结构化文献检索与范围内 RAG 检索。
 
 参考 claw-code: retrieve_context_tool (RAG), dispatch_tool (file ops).
+
+A1 (plan 5.11 / D-036): literature access goes through the deterministic
+services only, always inside the workspace project, and the confirmed calls use
+``approval_scope="exact-input"``.  The old raw-ArXiv tool and the unscoped
+``rag_search`` are deliberately gone.
 """
 
 from __future__ import annotations
@@ -531,39 +536,519 @@ def register_academic_tools(registry: ToolRegistry) -> None:
         except Exception as e:
             return ToolResult(f"error connecting to export API: {e}", is_error=True)
 
-    # ---- arxiv_search ----
-    async def arxiv_search(args: dict) -> ToolResult:
-        """搜索 arXiv 论文。"""
-        query = str(args.get("query", ""))
-        max_results = max(1, min(int(args.get("max_results", 5)), 20))
+    # ---- literature tools (A1, plan 5.11 / decision D-036) ----------------
+    #
+    # The Agent may only reach the deterministic literature services and always
+    # inside the workspace project.  ``project_root`` is taken from the registry
+    # workspace and can never be supplied by the caller; the three confirmed
+    # calls are registered with ``approval_scope="exact-input"`` so a change of
+    # query, selection or scope stops at the existing approval contract.
 
+    def _workspace_project() -> str | ToolResult:
+        root = registry._workspace_root
+        if root is None:
+            return ToolResult(
+                "error: project_scope_unavailable — no workspace project is selected",
+                is_error=True,
+            )
+        return str(root)
+
+    def _service_error(response, *, action: str) -> ToolResult:
+        code = f"http_{response.status_code}"
+        message = ""
+        try:
+            detail = response.json().get("detail")
+        except Exception:  # noqa: BLE001 - a non-JSON error body is still an error
+            detail = None
+        if isinstance(detail, dict):
+            code = str(detail.get("code") or code)
+            message = str(detail.get("message") or "")
+        elif isinstance(detail, str):
+            message = detail
+        return ToolResult(
+            json.dumps(
+                {"error": code, "action": action, "message": message},
+                ensure_ascii=False,
+            ),
+            is_error=True,
+        )
+
+    def _error_code_of(response) -> str:
+        """Structured error code from a service response, or an HTTP fallback."""
+
+        try:
+            detail = response.json().get("detail")
+        except Exception:  # noqa: BLE001 - a non-JSON error body is still an error
+            return f"http_{response.status_code}"
+        if isinstance(detail, dict) and detail.get("code"):
+            return str(detail["code"])
+        return f"http_{response.status_code}"
+
+    async def _available_providers(client) -> list[str]:
+        """Registered literature providers, for an actionable error message."""
+
+        try:
+            response = await client.get(f"{_api_base()}/api/literature/providers")
+            if response.status_code != 200:
+                return []
+            providers = response.json().get("providers") or []
+        except Exception:  # noqa: BLE001 - the hint is optional
+            return []
+        return [str(item.get("provider")) for item in providers if item.get("provider")]
+
+    def _api_base() -> str:
+        return os.environ.get("SCHOLAR_API_BASE", "http://localhost:18088")
+
+    async def _post_service(client, path: str, payload: dict):
+        api_base = os.environ.get("SCHOLAR_API_BASE", "http://localhost:18088")
+        return await client.post(f"{api_base}{path}", json=payload)
+
+    def _access_state(record: dict) -> str:
+        locations = record.get("access_locations") or []
+        if any(location.get("access_status") == "open" for location in locations):
+            return "open"
+        if locations:
+            return "restricted"
+        return "unknown"
+
+    async def literature_providers(args: dict) -> ToolResult:
+        """List registered literature providers so a model need not guess names."""
+
+        try:
+            import httpx
+
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.get(
+                    f"{os.environ.get('SCHOLAR_API_BASE', 'http://localhost:18088')}"
+                    "/api/literature/providers"
+                )
+                if response.status_code != 200:
+                    return _service_error(response, action="literature_providers")
+                payload = response.json()
+        except Exception as exc:  # noqa: BLE001 - report, never silently degrade
+            return ToolResult(f"literature providers lookup failed: {exc}", is_error=True)
+
+        providers = [
+            {
+                "provider": item.get("provider"),
+                "result_mode": item.get("result_mode"),
+                "supports_search": item.get("supports_search"),
+            }
+            for item in (payload.get("providers") or [])
+        ]
+        return ToolResult(
+            json.dumps(
+                {
+                    "provider_count": len(providers),
+                    "providers": providers,
+                    "note": (
+                        "'fixture' serves the offline demo corpus; 'arxiv' is the live "
+                        "public API. Search results must never be relabelled across modes."
+                    ),
+                },
+                ensure_ascii=False,
+            )
+        )
+
+    async def literature_search(args: dict) -> ToolResult:
+        """Run a confirmed query against the structured literature service."""
+        provider = str(args.get("provider", "")).strip()
+        query = str(args.get("query", "")).strip()
+        research_question = str(args.get("research_question", "")).strip() or query
+        max_results = max(1, min(int(args.get("max_results", 5)), 20))
+        if not provider:
+            return ToolResult("error: provider is required", is_error=True)
         if not query:
             return ToolResult("error: query is required", is_error=True)
 
         try:
             import httpx
 
-            url = "https://export.arxiv.org/api/query"
-            params = {
-                "search_query": f"all:{query}",
-                "max_results": str(max_results),
-            }
-            async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
-                resp = await client.get(url, params=params)
-                if resp.status_code != 200:
-                    return ToolResult(f"arXiv API returned {resp.status_code}", is_error=True)
-                text = resp.text[:4000]
-                return ToolResult(
-                    text,
-                    metadata={
-                        "source_url": str(resp.url),
-                        "source_kind": "arxiv",
-                        "query": query,
-                        "max_results": max_results,
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                response = await _post_service(
+                    client,
+                    "/api/literature/search",
+                    {
+                        "provider": provider,
+                        # The query is the confirmed expression, so the plan
+                        # records it as user-supplied rather than generated.
+                        "plan": {
+                            "research_question": research_question,
+                            "suggested_query": query,
+                            "generation_method": "user",
+                            "generation_model": None,
+                            "generation_config": {"source": "agent_tool"},
+                        },
+                        "query": {
+                            "query": query,
+                            "page": 1,
+                            "page_size": max_results,
+                            "sort_by": "relevance",
+                            "sort_order": "descending",
+                            "filters": {"year_from": None, "year_to": None, "categories": []},
+                        },
                     },
                 )
-        except Exception as e:
-            return ToolResult(f"arXiv search failed: {e}", is_error=True)
+                if response.status_code != 200:
+                    error = _service_error(response, action="literature_search")
+                    # A model that invents a provider name must be told which ones
+                    # exist, otherwise it burns the turn guessing (observed with a
+                    # real model asking for "semantic_scholar").
+                    if _error_code_of(response) == "provider_not_found":
+                        available = await _available_providers(client)
+                        if available:
+                            error = ToolResult(
+                                f"{error.output}\navailable providers: {', '.join(available)}",
+                                is_error=True,
+                            )
+                    return error
+                execution = response.json()
+        except Exception as exc:  # noqa: BLE001 - report, never silently degrade
+            return ToolResult(f"literature search failed: {exc}", is_error=True)
+
+        page = execution.get("page") or {}
+        records = page.get("records") or []
+        payload = {
+            "provider": page.get("provider"),
+            "result_mode": page.get("result_mode"),
+            "confirmed_query": query,
+            "search_execution_id": execution.get("search_execution_id"),
+            "total_results": page.get("total_results"),
+            "records": [
+                {
+                    "paper_id": record.get("paper_id"),
+                    "title": record.get("title"),
+                    "authors": list(record.get("authors") or [])[:5],
+                    "year": record.get("year"),
+                    "access": _access_state(record),
+                    "record_url": record.get("record_url"),
+                }
+                for record in records[:max_results]
+            ],
+        }
+        return ToolResult(
+            json.dumps(payload, ensure_ascii=False),
+            metadata={
+                "source_kind": "literature_search",
+                "provider": payload["provider"],
+                "result_mode": payload["result_mode"],
+                "query": query,
+                "search_execution_id": payload["search_execution_id"],
+                "record_count": len(payload["records"]),
+            },
+        )
+
+    async def literature_import(args: dict) -> ToolResult:
+        """Add confirmed search results to the workspace project library."""
+
+        execution_id = str(args.get("search_execution_id", "")).strip()
+        raw_paper_ids = args.get("paper_ids") or []
+        paper_ids = [str(item).strip() for item in raw_paper_ids if str(item).strip()]
+        if not execution_id:
+            return ToolResult("error: search_execution_id is required", is_error=True)
+        if not paper_ids:
+            return ToolResult("error: paper_ids must not be empty", is_error=True)
+
+        project = _workspace_project()
+        if isinstance(project, ToolResult):
+            return project
+        try:
+            import httpx
+
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                response = await _post_service(
+                    client,
+                    "/api/literature/import",
+                    {
+                        "project_path": project,
+                        "search_execution_id": execution_id,
+                        "paper_ids": paper_ids,
+                    },
+                )
+                if response.status_code != 200:
+                    return _service_error(response, action="literature_import")
+                batch = response.json()
+        except Exception as exc:  # noqa: BLE001
+            return ToolResult(f"literature import failed: {exc}", is_error=True)
+
+        payload = {
+            "created_count": batch.get("created_count", 0),
+            "reused_count": batch.get("reused_count", 0),
+            "metadata_updated_count": batch.get("metadata_updated_count", 0),
+            "search_execution_id": execution_id,
+            "paper_ids": paper_ids,
+            "sources": [
+                {
+                    "paper_id": item.get("paper_id"),
+                    "source_id": item.get("source_id"),
+                    "disposition": item.get("disposition"),
+                }
+                for item in batch.get("results") or []
+            ],
+        }
+        return ToolResult(
+            json.dumps(payload, ensure_ascii=False),
+            metadata={
+                "source_kind": "literature_import",
+                "created_count": payload["created_count"],
+                "reused_count": payload["reused_count"],
+            },
+        )
+
+    async def literature_acquire_fulltext(args: dict) -> ToolResult:
+        """Ask the service for the declared open full text of one source."""
+
+        source_id = str(args.get("source_id", "")).strip()
+        force = bool(args.get("force", False))
+        if not source_id:
+            return ToolResult("error: source_id is required", is_error=True)
+        project = _workspace_project()
+        if isinstance(project, ToolResult):
+            return project
+        try:
+            import httpx
+
+            async with httpx.AsyncClient(timeout=120.0) as client:
+                response = await _post_service(
+                    client,
+                    "/api/literature/fulltext",
+                    {"project_path": project, "source_id": source_id, "force": force},
+                )
+                if response.status_code != 200:
+                    return _service_error(response, action="literature_acquire_fulltext")
+                result = response.json()
+        except Exception as exc:  # noqa: BLE001
+            return ToolResult(f"full text acquisition failed: {exc}", is_error=True)
+
+        payload = {
+            "source_id": result.get("source_id"),
+            "status": result.get("status"),
+            "reused": result.get("reused"),
+            "has_local_path": bool(result.get("local_path")),
+            "failure_reason": result.get("failure_reason"),
+        }
+        return ToolResult(
+            json.dumps(payload, ensure_ascii=False),
+            metadata={
+                "source_kind": "literature_acquire_fulltext",
+                "status": payload["status"],
+            },
+        )
+
+    async def literature_index(args: dict) -> ToolResult:
+        """Build the page-level evidence index for one source that has full text."""
+
+        source_id = str(args.get("source_id", "")).strip()
+        force = bool(args.get("force", False))
+        if not source_id:
+            return ToolResult("error: source_id is required", is_error=True)
+        project = _workspace_project()
+        if isinstance(project, ToolResult):
+            return project
+        try:
+            import httpx
+
+            async with httpx.AsyncClient(timeout=300.0) as client:
+                response = await _post_service(
+                    client,
+                    "/api/literature/index",
+                    {"project_path": project, "source_id": source_id, "force": force},
+                )
+                if response.status_code != 200:
+                    return _service_error(response, action="literature_index")
+                result = response.json()
+        except Exception as exc:  # noqa: BLE001
+            return ToolResult(f"literature indexing failed: {exc}", is_error=True)
+
+        payload = {
+            "source_id": result.get("source_id"),
+            "status": result.get("status"),
+            "reused": result.get("reused"),
+            "chunk_count": result.get("chunk_count"),
+            "page_count": result.get("page_count"),
+            "artifact_sha256": result.get("artifact_sha256"),
+        }
+        return ToolResult(
+            json.dumps(payload, ensure_ascii=False),
+            metadata={
+                "source_kind": "literature_index",
+                "status": payload["status"],
+                "reused": payload["reused"],
+                "chunk_count": payload["chunk_count"],
+            },
+        )
+
+    async def literature_sources(args: dict) -> ToolResult:
+        """List the current project's literature scope and its index state.
+
+        The Agent needs this to plan inside one project and to skip work that is
+        already done (``already_indexed``), instead of re-indexing or guessing
+        which sources exist.
+        """
+
+        project = _workspace_project()
+        if isinstance(project, ToolResult):
+            return project
+        limit = max(1, min(int(args.get("limit", 50)), 200))
+        try:
+            import httpx
+
+            api_base = os.environ.get("SCHOLAR_API_BASE", "http://localhost:18088")
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.get(
+                    f"{api_base}/api/project/sources",
+                    params={"project_path": project},
+                )
+                if response.status_code != 200:
+                    return _service_error(response, action="literature_sources")
+                payload = response.json()
+        except Exception as exc:  # noqa: BLE001
+            return ToolResult(f"literature sources lookup failed: {exc}", is_error=True)
+
+        sources = []
+        for source in (payload.get("sources") or [])[:limit]:
+            metadata = source.get("metadata") if isinstance(source.get("metadata"), dict) else {}
+            literature = metadata.get("literature") if isinstance(metadata, dict) else None
+            fulltext = literature.get("fulltext") if isinstance(literature, dict) else None
+            original_path = source.get("original_path")
+            fulltext_status = (fulltext or {}).get("status")
+            index_state = literature.get("index") if isinstance(literature, dict) else None
+            sources.append(
+                {
+                    "source_id": source.get("id"),
+                    "title": source.get("title"),
+                    "year": metadata.get("year"),
+                    # ``rag_status`` is the workspace UI field; the authoritative
+                    # index state belongs to the literature metadata the service
+                    # writes, so "already indexed" is derived from that.
+                    "rag_status": source.get("rag_status"),
+                    "fulltext_status": fulltext_status,
+                    "already_indexed": bool(
+                        fulltext_status == "indexed" or isinstance(index_state, dict)
+                    ),
+                    "has_fulltext": bool(original_path),
+                    "is_literature": isinstance(literature, dict),
+                    "paper_id": metadata.get("paper_id"),
+                }
+            )
+        result = {
+            "project_root": project,
+            "source_count": len(sources),
+            "indexed_count": sum(1 for item in sources if item["already_indexed"]),
+            "sources": sources,
+        }
+        return ToolResult(
+            json.dumps(result, ensure_ascii=False),
+            metadata={
+                "source_kind": "literature_sources",
+                "source_count": result["source_count"],
+                "indexed_count": result["indexed_count"],
+            },
+        )
+
+    async def literature_answer(args: dict) -> ToolResult:
+        """Answer a question from evidence scoped to the selected project sources."""
+
+        question = str(args.get("question", "")).strip()
+        raw_source_ids = args.get("source_ids") or []
+        source_ids = [str(item).strip() for item in raw_source_ids if str(item).strip()]
+        top_k = max(1, min(int(args.get("top_k", 5)), 20))
+        if not question:
+            return ToolResult("error: question is required", is_error=True)
+        if not source_ids:
+            return ToolResult(
+                "error: source_ids is required — an unscoped answer is not allowed; "
+                "select the project sources first",
+                is_error=True,
+            )
+
+        project = _workspace_project()
+        if isinstance(project, ToolResult):
+            return project
+        try:
+            import httpx
+
+            async with httpx.AsyncClient(timeout=180.0) as client:
+                response = await _post_service(
+                    client,
+                    "/api/literature/answer",
+                    {
+                        "project_path": project,
+                        "question": question,
+                        "source_ids": source_ids,
+                        "top_k": top_k,
+                    },
+                )
+                if response.status_code != 200:
+                    return _service_error(response, action="literature_answer")
+                answer = response.json()
+        except Exception as exc:  # noqa: BLE001
+            return ToolResult(f"literature answer failed: {exc}", is_error=True)
+
+        evidence: list[dict] = []
+        for item in (answer.get("evidence") or [])[:20]:
+            span = item.get("span") or {}
+            evidence.append(
+                {
+                    "evidence_id": span.get("evidence_id"),
+                    "source_id": item.get("source_id"),
+                    "title": item.get("title"),
+                    "page": span.get("page_start"),
+                    "chunk_id": item.get("chunk_id") or span.get("chunk_id"),
+                    "artifact_sha256": span.get("artifact_sha256"),
+                    "exact_quote": span.get("exact_quote"),
+                    "context_before": span.get("context_before") or "",
+                    "context_after": span.get("context_after") or "",
+                }
+            )
+        payload = {
+            "status": answer.get("status"),
+            "insufficient_reason": answer.get("insufficient_reason"),
+            # Echo the submitted scope so the session record stays reviewable even
+            # when the session runs with auto-approval enabled.
+            "question": question,
+            "source_ids": source_ids,
+            "claims": [
+                {
+                    # The claim id is the same value the plain service entry
+                    # returns, so a session record can be compared with it.
+                    "claim_id": claim.get("claim_id"),
+                    "text": claim.get("text"),
+                    "evidence_ids": list(claim.get("evidence_ids") or []),
+                    "evidence_status": claim.get("evidence_status"),
+                }
+                for claim in answer.get("claims") or []
+            ],
+            "evidence": evidence,
+            "rejected_claims": [
+                {"text": item.get("text"), "reason": item.get("reason")}
+                for item in answer.get("rejected_claims") or []
+            ],
+            "unresolved_count": len(answer.get("unresolved") or []),
+            "model": {
+                "provider": answer.get("model_provider"),
+                "name": answer.get("model_name"),
+                "config_hash": answer.get("model_config_hash"),
+            },
+        }
+        if payload["status"] == "insufficient":
+            # Plan 5.12 rule 3: an insufficiency must change the next step rather
+            # than invite an answer from memory.
+            payload["next_actions"] = [
+                "widen_scope_within_project",
+                "propose_new_query_for_confirmation",
+            ]
+            payload["must_not_answer_from_memory"] = True
+        return ToolResult(
+            json.dumps(payload, ensure_ascii=False),
+            metadata={
+                "source_kind": "literature_answer",
+                "status": payload["status"],
+                "insufficient_reason": payload["insufficient_reason"],
+                "claim_count": len(payload["claims"]),
+                "evidence_count": len(evidence),
+            },
+        )
 
     # Register tools
     registry.register(
@@ -615,12 +1100,30 @@ def register_academic_tools(registry: ToolRegistry) -> None:
     )
 
     registry.register(
-        "arxiv_search",
-        "Search arXiv for papers",
+        "literature_search",
+        "Search structured literature. Requires the exact search query the user "
+        "confirmed; returns normalized records with their access state. Call "
+        "literature_sources first to reuse an existing project scope.",
         {
             "type": "object",
             "properties": {
-                "query": {"type": "string", "description": "Search query"},
+                "provider": {
+                    "type": "string",
+                    "description": (
+                        "Registered literature provider name: 'arxiv' for the live "
+                        "public API, 'fixture' for the offline demo corpus. Use "
+                        "literature_providers to list what is registered instead of "
+                        "guessing a name."
+                    ),
+                },
+                "query": {
+                    "type": "string",
+                    "description": "The confirmed provider-native search expression",
+                },
+                "research_question": {
+                    "type": "string",
+                    "description": "The research question this query was confirmed for",
+                },
                 "max_results": {
                     "type": "integer",
                     "minimum": 1,
@@ -628,23 +1131,156 @@ def register_academic_tools(registry: ToolRegistry) -> None:
                     "default": 5,
                 },
             },
-            "required": ["query"],
+            "required": ["provider", "query"],
         },
-        arxiv_search,
+        literature_search,
         permission="read-only",
         effects={"network"},
-        approval_scope="domain",
-        network_scope={"export.arxiv.org"},
+        approval_scope="exact-input",
+        network_scope={"local-literature-api"},
+    )
+
+    registry.register(
+        "literature_providers",
+        "List the literature providers this installation has registered, with their "
+        "result mode. Call this before literature_search instead of guessing a "
+        "provider name.",
+        {"type": "object", "properties": {}},
+        literature_providers,
+        permission="read-only",
+    )
+
+    registry.register(
+        "literature_sources",
+        "List the current project's literature sources with their index and full-text "
+        "state. Call this before searching or indexing so already indexed sources are "
+        "not processed twice.",
+        {
+            "type": "object",
+            "properties": {
+                "limit": {"type": "integer", "minimum": 1, "maximum": 200, "default": 50},
+            },
+        },
+        literature_sources,
+        permission="read-only",
+    )
+
+    registry.register(
+        "literature_acquire_fulltext",
+        "Fetch the open full text the provider declared for one project source. "
+        "When it reports access_unavailable or acquire_failed, tell the user to "
+        "attach a local PDF instead of pretending the paper was downloaded.",
+        {
+            "type": "object",
+            "properties": {
+                "source_id": {"type": "string"},
+                "force": {"type": "boolean", "default": False},
+            },
+            "required": ["source_id"],
+        },
+        literature_acquire_fulltext,
+        permission="workspace-write",
+        effects={"network"},
+        approval_scope="exact-input",
+        network_scope={"local-literature-api"},
+    )
+
+    registry.register(
+        "literature_index",
+        "Build or rebuild the page-level evidence index for one source that already "
+        "has full text. Check literature_sources first: a source with "
+        "already_indexed=true must not be indexed again unless the user asks.",
+        {
+            "type": "object",
+            "properties": {
+                "source_id": {"type": "string"},
+                "force": {"type": "boolean", "default": False},
+            },
+            "required": ["source_id"],
+        },
+        literature_index,
+        permission="workspace-write",
+        effects={"network"},
+        approval_scope="exact-input",
+        network_scope={"local-literature-api"},
+    )
+
+    registry.register(
+        "literature_import",
+        "Add confirmed search results to the current project library. Requires "
+        "the search_execution_id of the confirmed search.",
+        {
+            "type": "object",
+            "properties": {
+                "search_execution_id": {"type": "string"},
+                "paper_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "minItems": 1,
+                    "maxItems": 50,
+                },
+            },
+            "required": ["search_execution_id", "paper_ids"],
+        },
+        literature_import,
+        permission="workspace-write",
+        effects={"network"},
+        approval_scope="exact-input",
+        network_scope={"local-literature-api"},
+    )
+
+    registry.register(
+        "literature_answer",
+        "Answer a research question from evidence in the selected project sources. "
+        "Requires an explicit source_ids scope; every claim comes back with its "
+        "page and exact quote. When the result says insufficient, do NOT answer "
+        "from memory or general knowledge: either widen the scope inside the "
+        "project or propose a new search query for the user to confirm.",
+        {
+            "type": "object",
+            "properties": {
+                "question": {"type": "string"},
+                "source_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "minItems": 1,
+                    "maxItems": 50,
+                },
+                "top_k": {"type": "integer", "minimum": 1, "maximum": 20, "default": 5},
+            },
+            "required": ["question", "source_ids"],
+        },
+        literature_answer,
+        permission="read-only",
+        effects={"network"},
+        approval_scope="exact-input",
+        network_scope={"local-literature-api"},
+        # A multi-paper answer carries claims plus their page-level evidence;
+        # the default 4000-character budget would cut it into invalid JSON.
+        max_output_chars=24_000,
     )
 
     # ---- rag_search — 参考 claw-code retrieve_context_tool ----
     async def rag_search(args: dict) -> ToolResult:
-        """检索文档库，返回相关文档片段。参考 claw-code retrieve_context。"""
+        """范围内检索扁平文本库；无 source_ids 时显式拒绝。"""
+
         query = str(args.get("query", ""))
         top_k = int(args.get("top_k", 5))
+        raw_source_ids = args.get("source_ids") or []
+        source_ids = [str(item).strip() for item in raw_source_ids if str(item).strip()]
 
         if not query:
             return ToolResult("error: query is required", is_error=True)
+        if not source_ids:
+            return ToolResult(
+                "error: source_ids is required — an unscoped library search is not "
+                "allowed; use literature_search and literature_answer for project "
+                "scoped work",
+                is_error=True,
+            )
+        project = _workspace_project()
+        if isinstance(project, ToolResult):
+            return project
 
         try:
             import httpx
@@ -656,6 +1292,9 @@ def register_academic_tools(registry: ToolRegistry) -> None:
                     json={
                         "query": query,
                         "top_k": min(top_k, 10),
+                        "project_root": project,
+                        "source_ids": source_ids,
+                        "project_scoped": True,
                     },
                 )
                 if resp.status_code == 404:
@@ -680,19 +1319,30 @@ def register_academic_tools(registry: ToolRegistry) -> None:
     registry.register(
         "rag_search",
         (
-            "Search the document library (RAG) for relevant papers, notes, and references. "
-            "Use this when the user asks about topics that may be in their document collection."
+            "Search the flat-text document library (RAG) inside one project and an "
+            "explicit set of source ids. Scoped search only: pass the project sources "
+            "you mean to search."
         ),
         {
             "type": "object",
             "properties": {
                 "query": {"type": "string", "description": "Search query"},
+                "source_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "minItems": 1,
+                    "maxItems": 50,
+                    "description": "Project source ids this search is limited to",
+                },
                 "top_k": {"type": "integer", "default": 5, "description": "Number of results"},
             },
-            "required": ["query"],
+            "required": ["query", "source_ids"],
         },
         rag_search,
         permission="read-only",
+        effects={"network"},
+        approval_scope="exact-input",
+        network_scope={"local-rag-api"},
     )
 
     # ---- Argument Companion / Reviewer read tools -----------------------

@@ -42,6 +42,8 @@ class AnthropicProvider(BaseProvider):
     在 Anthropic 格式下，DeepSeek 的工具调用比 OpenAI 格式更可靠。
     """
 
+    provider_name = "anthropic"
+
     def __init__(
         self,
         base_url: str = "https://api.anthropic.com",

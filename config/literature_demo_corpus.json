@@ -1,0 +1,59 @@
+{
+  "version": 1,
+  "corpus_id": "literature-poc-demo-v1",
+  "kind": "synthetic-demo-corpus",
+  "provenance": "本文件是本课题自撰的固定演示语料：题名、作者、年份、摘要与逐页正文均为演示用合成内容，不代表任何真实论文，也不得作为检索质量或领域覆盖证据。记录标识统一使用 demo- 前缀，避免与真实 arXiv 编号或 DOI 混淆。所有记录都不声明开放全文位置，因此演示会真实走到“获取开放全文失败 → 附加本地全文”这条既有回退路径。",
+  "demo": {
+    "confirmed_query": "all:\"evidence traceable question answering\"",
+    "question": "What evaluation protocol do the demo papers use for evidence checking?",
+    "index_records": ["demo-0001", "demo-0002"],
+    "expected_failures": {
+      "acquire_fulltext": "access_unavailable"
+    },
+    "expected_failures_note": "本语料不声明任何开放全文位置，因此「获取开放全文」这一步必然记为 failed/access_unavailable（规范 5.10 第 1 条）。该声明只用于区分「预期失败」与「回归」，不影响运行记录：记录里这一步仍然是 failed。"
+  },
+  "records": [
+    {
+      "provider_record_id": "demo-0001",
+      "title": "Demo Paper A: Page-Aware Evidence for Retrieval-Augmented Answers",
+      "authors": ["Demo Author A", "Demo Author B"],
+      "year": 2024,
+      "venue": "Demo Venue",
+      "abstract": "演示用合成摘要：讨论按页切块与坐标派生引文对回答可核验性的影响。",
+      "categories": ["cs.CL"],
+      "pages": [
+        "Demo paper A page one. The study splits every document by page so that no retrieval chunk crosses a page boundary, and it derives each quote from stored character coordinates instead of accepting text from the caller.",
+        "Demo paper A page two. The evaluation protocol compares every rendered claim against the stored page text and reports an explicit failure when a coordinate no longer matches the hashed document."
+      ]
+    },
+    {
+      "provider_record_id": "demo-0002",
+      "title": "Demo Paper B: Scoped Retrieval Inside a Single Research Project",
+      "authors": ["Demo Author C"],
+      "year": 2025,
+      "venue": "Demo Venue",
+      "abstract": "演示用合成摘要：讨论项目与文献双范围检索如何避免无范围回答。",
+      "categories": ["cs.IR"],
+      "pages": [
+        "Demo paper B page one. Retrieval is restricted to one project root and to the identifiers the user selected, so a global index can never contribute evidence to a project answer.",
+        "Demo paper B page two. The evaluation protocol repeats each question with an empty scope and expects an explicit refusal rather than a best-effort answer."
+      ]
+    },
+    {
+      "provider_record_id": "demo-0003",
+      "title": "Demo Paper C: A Record Without Any Open Full Text",
+      "authors": ["Demo Author D"],
+      "year": 2023,
+      "venue": "Demo Venue",
+      "abstract": "演示用合成摘要：该记录保留元数据但没有全文，用于演示 access_unavailable 与后续的显式跳过。",
+      "categories": ["cs.DL"],
+      "pages": [
+        "Demo paper C page one. This synthetic record deliberately has no full text attached, so the demo records a skipped index step instead of pretending that a missing document was parsed.",
+        "Demo paper C page two. Nothing here may be presented as an online retrieval result."
+      ]
+    }
+  ],
+  "search_results": {
+    "all:\"evidence traceable question answering\"": ["demo-0001", "demo-0002", "demo-0003"]
+  }
+}

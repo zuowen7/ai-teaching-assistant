@@ -42,7 +42,11 @@
           </div>
           <div v-if="step.result" class="detail-section">
             <span>{{ t('agent.execution.result') }}</span>
-            <pre :class="{ error: step.status === 'error' }">{{
+            <AgentLiteratureEvidence
+              v-if="step.toolName === 'literature_answer'"
+              :result="step.resultDetail || step.result"
+            />
+            <pre v-else :class="{ error: step.status === 'error' }">{{
               truncate(step.resultDetail || step.result)
             }}</pre>
           </div>
@@ -56,6 +60,7 @@
 import { computed, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 
+import AgentLiteratureEvidence from './AgentLiteratureEvidence.vue'
 import type { AgentEvent } from '../types'
 import {
   buildExecutionSteps,
@@ -110,9 +115,10 @@ function actionLabel(step: AgentExecutionStep): string {
     return t('agent.execution.editFile', { target })
   if (step.toolName === 'grep_files' || step.toolName === 'glob_files')
     return t('agent.execution.searchFiles')
-  if (step.toolName === 'rag_search') return t('agent.execution.searchLibrary')
-  if (step.toolName === 'web_search' || step.toolName === 'arxiv_search')
-    return t('agent.execution.searchWeb')
+  if (step.toolName === 'rag_search' || step.toolName === 'literature_search')
+    return t('agent.execution.searchLibrary')
+  if (step.toolName === 'literature_answer') return t('agent.execution.answerFromEvidence')
+  if (step.toolName === 'web_search') return t('agent.execution.searchWeb')
   if (step.toolName === 'run_command') return t('agent.execution.runCommand')
   return t('agent.execution.useTool', { tool: step.toolName })
 }

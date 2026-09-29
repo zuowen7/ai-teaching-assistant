@@ -325,7 +325,11 @@ def test_tool_introspection_covers_academic_and_skill_activated_command_tools(tm
 
     academic = client.post(
         "/api/agent/v2/tool",
-        json={"tool_name": "arxiv_search", "workspace_root": str(tmp_path)},
+        json={
+            "tool_name": "literature_search",
+            "workspace_root": str(tmp_path),
+            "arguments": {"provider": "fixture", "query": 'all:"demo"'},
+        },
     )
     command = client.post(
         "/api/agent/v2/tool",
@@ -337,7 +341,7 @@ def test_tool_introspection_covers_academic_and_skill_activated_command_tools(tm
     )
 
     assert academic.status_code == 200
-    assert academic.json()["tool"] == "arxiv_search"
+    assert academic.json()["tool"] == "literature_search"
     assert command.status_code == 200
     assert command.json()["tool"] == "run_command"
 
@@ -545,7 +549,10 @@ _RUNTIME_SKILL_TOOL_CONTRACTS = [
         {"read_argument_graph", "read_argument_ledger", "read_reviewer_state"},
     ),
     ("nature_response", {"read_file", "write_file", "read_reviewer_state"}),
-    ("nature_citation", {"arxiv_search", "rag_search", "web_search", "web_fetch"}),
+    (
+        "nature_citation",
+        {"literature_search", "literature_answer", "rag_search", "web_search", "web_fetch"},
+    ),
     ("nature_data", {"read_file", "write_file"}),
     (
         "nature_reader",
