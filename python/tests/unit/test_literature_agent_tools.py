@@ -150,6 +150,8 @@ class TestToolRegistrationContract:
             "literature_search",
             "literature_import",
             "literature_answer",
+            "literature_acquire_fulltext",
+            "literature_index",
         ],
     )
     def test_confirmed_calls_use_the_exact_input_approval_scope(self, tool_name: str) -> None:
@@ -162,7 +164,13 @@ class TestToolRegistrationContract:
 
     @pytest.mark.parametrize(
         "tool_name",
-        ["literature_search", "literature_import", "literature_answer"],
+        [
+            "literature_search",
+            "literature_import",
+            "literature_answer",
+            "literature_acquire_fulltext",
+            "literature_index",
+        ],
     )
     def test_confirmed_calls_still_require_approval(self, tool_name: str) -> None:
         """The effects must keep ``requires_approval`` true (plan 5.12 rule 2)."""
@@ -180,6 +188,8 @@ class TestToolRegistrationContract:
             "literature_import",
             "literature_answer",
             "literature_sources",
+            "literature_acquire_fulltext",
+            "literature_index",
         ):
             schema = registry.get(tool_name).definition.input_schema
             assert "project_path" not in schema.get("properties", {})
@@ -461,6 +471,19 @@ SOURCES_PAYLOAD = {
             "metadata": {"literature": {"fulltext": {"status": "indexed"}}, "paper_id": "paper_a"},
         },
         {
+            "id": "src_demo_0002",
+            # Indexed through the service, so the UI field is still untouched.
+            "title": "Demo Paper B",
+            "original_path": "D:/proj/references/b.pdf",
+            "rag_status": "unavailable",
+            "metadata": {
+                "literature": {
+                    "fulltext": {"status": "indexed"},
+                    "index": {"chunk_count": 4},
+                }
+            },
+        },
+        {
             "id": "src_demo_0003",
             "title": "Demo Paper C",
             "original_path": None,
@@ -488,16 +511,24 @@ class TestLiteratureSourcesTool:
 
         payload = json.loads(result.output)
         assert payload["project_root"] == str(tmp_path.resolve())
-        first, second = payload["sources"]
+        assert payload["indexed_count"] == 2
+        first, second, third = payload["sources"]
+
         assert first["source_id"] == "src_demo_0001"
         assert first["title"] == "Demo Paper A"
         assert first["rag_status"] == "ready"
         assert first["fulltext_status"] == "indexed"
         assert first["already_indexed"] is True
         assert first["has_fulltext"] is True
+
+        # The service writes the index state into literature metadata; the UI
+        # field alone must never decide whether work is already done.
         assert second["rag_status"] == "unavailable"
-        assert second["already_indexed"] is False
-        assert second["has_fulltext"] is False
+        assert second["already_indexed"] is True
+
+        assert third["rag_status"] == "unavailable"
+        assert third["already_indexed"] is False
+        assert third["has_fulltext"] is False
 
     async def test_sources_is_refused_without_a_workspace(
         self, monkeypatch: pytest.MonkeyPatch
@@ -603,6 +634,124 @@ class TestAnswerNextActions:
         payload = json.loads(result.output)
         assert payload["search_execution_id"] == EXECUTION_ID
         assert payload["paper_ids"] == ["paper_demo_0001"]
+
+
+class TestFullTextAndIndexTools:
+    async def test_acquire_fulltext_posts_the_source_and_reports_state(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        calls: list[tuple[str, dict]] = []
+        patch_client(
+            monkeypatch,
+            {
+                "/api/literature/fulltext": _Response(
+                    {
+                        "source_id": "src_demo_0001",
+                        "status": "access_unavailable",
+                        "reused": False,
+                        "local_path": None,
+                        "failure_reason": "no open location",
+                    }
+                )
+            },
+            calls,
+        )
+        registry = build_registry(tmp_path)
+
+        result = await registry.execute(
+            "literature_acquire_fulltext", {"source_id": "src_demo_0001"}
+        )
+
+        assert result.is_error is False
+        _, body = calls[0]
+        assert body["project_path"] == str(tmp_path.resolve())
+        assert body["source_id"] == "src_demo_0001"
+        assert body["force"] is False
+
+        payload = json.loads(result.output)
+        assert payload["status"] == "access_unavailable"
+        assert payload["has_local_path"] is False
+        assert payload["failure_reason"] == "no open location"
+
+    async def test_index_posts_the_source_and_reports_chunk_counts(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        calls: list[tuple[str, dict]] = []
+        patch_client(
+            monkeypatch,
+            {
+                "/api/literature/index": _Response(
+                    {
+                        "source_id": "src_demo_0001",
+                        "status": "indexed",
+                        "reused": True,
+                        "chunk_count": 4,
+                        "page_count": 2,
+                        "artifact_sha256": "a" * 64,
+                    }
+                )
+            },
+            calls,
+        )
+        registry = build_registry(tmp_path)
+
+        result = await registry.execute("literature_index", {"source_id": "src_demo_0001"})
+
+        assert result.is_error is False
+        payload = json.loads(result.output)
+        assert payload["status"] == "indexed"
+        assert payload["reused"] is True
+        assert payload["chunk_count"] == 4
+        assert result.metadata["reused"] is True
+
+    @pytest.mark.parametrize("tool_name", ["literature_acquire_fulltext", "literature_index"])
+    async def test_source_id_is_required(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tool_name: str
+    ) -> None:
+        calls: list[tuple[str, dict]] = []
+        patch_client(monkeypatch, {}, calls)
+        registry = build_registry(tmp_path)
+
+        result = await registry.execute(tool_name, {})
+
+        assert result.is_error is True
+        assert "source_id" in result.output
+        assert calls == []
+
+    @pytest.mark.parametrize("tool_name", ["literature_acquire_fulltext", "literature_index"])
+    async def test_project_scope_is_required(
+        self, monkeypatch: pytest.MonkeyPatch, tool_name: str
+    ) -> None:
+        calls: list[tuple[str, dict]] = []
+        patch_client(monkeypatch, {}, calls)
+        registry = build_registry(None)
+
+        result = await registry.execute(tool_name, {"source_id": "src_demo_0001"})
+
+        assert result.is_error is True
+        assert "project_scope_unavailable" in result.output
+        assert calls == []
+
+    async def test_index_failure_carries_the_service_code(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        calls: list[tuple[str, dict]] = []
+        patch_client(
+            monkeypatch,
+            {
+                "/api/literature/index": _Response(
+                    {"detail": {"code": "source_artifact_missing", "message": "no pdf"}},
+                    status_code=409,
+                )
+            },
+            calls,
+        )
+        registry = build_registry(tmp_path)
+
+        result = await registry.execute("literature_index", {"source_id": "src_demo_0003"})
+
+        assert result.is_error is True
+        assert "source_artifact_missing" in result.output
 
 
 class TestRagSearchScope:

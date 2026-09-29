@@ -720,6 +720,89 @@ def register_academic_tools(registry: ToolRegistry) -> None:
             },
         )
 
+    async def literature_acquire_fulltext(args: dict) -> ToolResult:
+        """Ask the service for the declared open full text of one source."""
+
+        source_id = str(args.get("source_id", "")).strip()
+        force = bool(args.get("force", False))
+        if not source_id:
+            return ToolResult("error: source_id is required", is_error=True)
+        project = _workspace_project()
+        if isinstance(project, ToolResult):
+            return project
+        try:
+            import httpx
+
+            async with httpx.AsyncClient(timeout=120.0) as client:
+                response = await _post_service(
+                    client,
+                    "/api/literature/fulltext",
+                    {"project_path": project, "source_id": source_id, "force": force},
+                )
+                if response.status_code != 200:
+                    return _service_error(response, action="literature_acquire_fulltext")
+                result = response.json()
+        except Exception as exc:  # noqa: BLE001
+            return ToolResult(f"full text acquisition failed: {exc}", is_error=True)
+
+        payload = {
+            "source_id": result.get("source_id"),
+            "status": result.get("status"),
+            "reused": result.get("reused"),
+            "has_local_path": bool(result.get("local_path")),
+            "failure_reason": result.get("failure_reason"),
+        }
+        return ToolResult(
+            json.dumps(payload, ensure_ascii=False),
+            metadata={
+                "source_kind": "literature_acquire_fulltext",
+                "status": payload["status"],
+            },
+        )
+
+    async def literature_index(args: dict) -> ToolResult:
+        """Build the page-level evidence index for one source that has full text."""
+
+        source_id = str(args.get("source_id", "")).strip()
+        force = bool(args.get("force", False))
+        if not source_id:
+            return ToolResult("error: source_id is required", is_error=True)
+        project = _workspace_project()
+        if isinstance(project, ToolResult):
+            return project
+        try:
+            import httpx
+
+            async with httpx.AsyncClient(timeout=300.0) as client:
+                response = await _post_service(
+                    client,
+                    "/api/literature/index",
+                    {"project_path": project, "source_id": source_id, "force": force},
+                )
+                if response.status_code != 200:
+                    return _service_error(response, action="literature_index")
+                result = response.json()
+        except Exception as exc:  # noqa: BLE001
+            return ToolResult(f"literature indexing failed: {exc}", is_error=True)
+
+        payload = {
+            "source_id": result.get("source_id"),
+            "status": result.get("status"),
+            "reused": result.get("reused"),
+            "chunk_count": result.get("chunk_count"),
+            "page_count": result.get("page_count"),
+            "artifact_sha256": result.get("artifact_sha256"),
+        }
+        return ToolResult(
+            json.dumps(payload, ensure_ascii=False),
+            metadata={
+                "source_kind": "literature_index",
+                "status": payload["status"],
+                "reused": payload["reused"],
+                "chunk_count": payload["chunk_count"],
+            },
+        )
+
     async def literature_sources(args: dict) -> ToolResult:
         """List the current project's literature scope and its index state.
 
@@ -753,14 +836,21 @@ def register_academic_tools(registry: ToolRegistry) -> None:
             literature = metadata.get("literature") if isinstance(metadata, dict) else None
             fulltext = literature.get("fulltext") if isinstance(literature, dict) else None
             original_path = source.get("original_path")
+            fulltext_status = (fulltext or {}).get("status")
+            index_state = literature.get("index") if isinstance(literature, dict) else None
             sources.append(
                 {
                     "source_id": source.get("id"),
                     "title": source.get("title"),
                     "year": metadata.get("year"),
+                    # ``rag_status`` is the workspace UI field; the authoritative
+                    # index state belongs to the literature metadata the service
+                    # writes, so "already indexed" is derived from that.
                     "rag_status": source.get("rag_status"),
-                    "fulltext_status": (fulltext or {}).get("status"),
-                    "already_indexed": source.get("rag_status") == "ready",
+                    "fulltext_status": fulltext_status,
+                    "already_indexed": bool(
+                        fulltext_status == "indexed" or isinstance(index_state, dict)
+                    ),
                     "has_fulltext": bool(original_path),
                     "is_literature": isinstance(literature, dict),
                     "paper_id": metadata.get("paper_id"),
@@ -975,6 +1065,46 @@ def register_academic_tools(registry: ToolRegistry) -> None:
         },
         literature_sources,
         permission="read-only",
+    )
+
+    registry.register(
+        "literature_acquire_fulltext",
+        "Fetch the open full text the provider declared for one project source. "
+        "When it reports access_unavailable or acquire_failed, tell the user to "
+        "attach a local PDF instead of pretending the paper was downloaded.",
+        {
+            "type": "object",
+            "properties": {
+                "source_id": {"type": "string"},
+                "force": {"type": "boolean", "default": False},
+            },
+            "required": ["source_id"],
+        },
+        literature_acquire_fulltext,
+        permission="workspace-write",
+        effects={"network"},
+        approval_scope="exact-input",
+        network_scope={"local-literature-api"},
+    )
+
+    registry.register(
+        "literature_index",
+        "Build or rebuild the page-level evidence index for one source that already "
+        "has full text. Check literature_sources first: a source with "
+        "already_indexed=true must not be indexed again unless the user asks.",
+        {
+            "type": "object",
+            "properties": {
+                "source_id": {"type": "string"},
+                "force": {"type": "boolean", "default": False},
+            },
+            "required": ["source_id"],
+        },
+        literature_index,
+        permission="workspace-write",
+        effects={"network"},
+        approval_scope="exact-input",
+        network_scope={"local-literature-api"},
     )
 
     registry.register(
