@@ -26,6 +26,11 @@ from src.literature.models import (
 )
 from src.literature.providers.base import LiteratureProviderError, ProviderErrorCode
 from src.literature.service import (
+    DEFAULT_ANSWER_TOP_K,
+    MAX_ANSWER_SOURCES,
+    MAX_ANSWER_TOP_K,
+    EvidenceRetriever,
+    LiteratureAnswerResult,
     LiteratureEvidenceResult,
     LiteratureFullTextResult,
     LiteratureImportBatch,
@@ -36,6 +41,7 @@ from src.literature.service import (
     LiteratureServiceErrorCode,
     PageIndexStore,
     ProjectSourceStore,
+    RetrievedChunk,
 )
 from src.utils.atomic_io import atomic_write_json, locked_path
 
@@ -105,6 +111,21 @@ class LiteratureFullTextRequest(BaseModel):
     project_path: str = Field(min_length=1, max_length=1000)
     source_id: str = Field(min_length=1, max_length=64)
     force: bool = False
+
+
+class LiteratureAnswerRequest(BaseModel):
+    """P3 request: the caller chooses scope and question, never evidence.
+
+    ``source_ids`` may arrive empty so the service, not the schema, can answer
+    with the documented ``scope_required`` failure instead of a generic 422.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    project_path: str = Field(min_length=1, max_length=1000)
+    question: str = Field(min_length=1, max_length=2000)
+    source_ids: list[str] = Field(default_factory=list, max_length=MAX_ANSWER_SOURCES)
+    top_k: int = Field(default=DEFAULT_ANSWER_TOP_K, ge=1, le=MAX_ANSWER_TOP_K)
 
 
 class ProjectSourceManifestStore(ProjectSourceStore):
@@ -232,6 +253,61 @@ class RagPageIndexStore(PageIndexStore):
         return self._state["get_document"](doc_id)
 
 
+class RagPageRetriever(EvidenceRetriever):
+    """Adapter over the RAG router's scoped page query (plan 5.9, rule 2).
+
+    Retrieval is always project- and source-scoped: the answer service cannot ask
+    for a global search, and hits without a source identity are surfaced as
+    unresolved instead of being dropped.
+    """
+
+    def __init__(self, rag_state: Mapping[str, Any]) -> None:
+        self._state = rag_state
+
+    async def retrieve(
+        self,
+        *,
+        project_root: str,
+        source_ids: Sequence[str],
+        query: str,
+        top_k: int,
+    ) -> Sequence[RetrievedChunk]:
+        try:
+            hits = await self._state["query_pages"](
+                query=query,
+                top_k=top_k,
+                project_root=project_root,
+                source_ids=list(source_ids),
+                project_scoped=True,
+            )
+        except HTTPException as exc:
+            raise LiteratureServiceError(
+                LiteratureServiceErrorCode.RETRIEVAL_UNAVAILABLE
+                if exc.status_code == 503
+                else LiteratureServiceErrorCode.ANSWER_REQUEST_INVALID,
+                str(exc.detail),
+                details={"status_code": exc.status_code},
+            ) from exc
+
+        chunks: list[RetrievedChunk] = []
+        for hit in hits:
+            chunk_id = str(hit.get("chunk_id") or "")
+            if not chunk_id:
+                continue
+            metadata = hit.get("metadata")
+            source_id = ""
+            if isinstance(metadata, Mapping):
+                source_id = str(metadata.get("source_id") or "")
+            chunks.append(
+                RetrievedChunk(
+                    chunk_id=chunk_id,
+                    source_id=source_id,
+                    text=str(hit.get("text") or ""),
+                )
+            )
+        return chunks
+
+
 _PROVIDER_MESSAGES = {
     ProviderErrorCode.INVALID_REQUEST: "文献源拒绝了该请求",
     ProviderErrorCode.NOT_FOUND: "文献源中未找到该记录",
@@ -268,6 +344,12 @@ _SERVICE_STATUS = {
     LiteratureServiceErrorCode.INDEX_STORE_UNAVAILABLE: 503,
     LiteratureServiceErrorCode.CHUNK_NOT_FOUND: 404,
     LiteratureServiceErrorCode.EVIDENCE_UNRESOLVED: 422,
+    LiteratureServiceErrorCode.SCOPE_REQUIRED: 400,
+    LiteratureServiceErrorCode.ANSWER_REQUEST_INVALID: 400,
+    LiteratureServiceErrorCode.ANSWER_MODEL_UNAVAILABLE: 503,
+    LiteratureServiceErrorCode.ANSWER_GENERATION_FAILED: 502,
+    LiteratureServiceErrorCode.ANSWER_INVALID_RESPONSE: 502,
+    LiteratureServiceErrorCode.RETRIEVAL_UNAVAILABLE: 503,
 }
 
 
@@ -370,6 +452,20 @@ def register_literature_routes(
                 project_path=req.project_path,
                 source_id=req.source_id,
                 force=req.force,
+            )
+        except LiteratureServiceError as exc:
+            raise _service_http_error(exc) from exc
+
+    @app.post("/api/literature/answer", response_model=LiteratureAnswerResult)
+    async def answer_literature_question(req: LiteratureAnswerRequest):
+        """Answer from evidence scoped to one project and its selected sources."""
+
+        try:
+            return await service.answer_question(
+                project_path=req.project_path,
+                question=req.question,
+                source_ids=req.source_ids,
+                top_k=req.top_k,
             )
         except LiteratureServiceError as exc:
             raise _service_http_error(exc) from exc

@@ -285,6 +285,16 @@ class TestInsufficientEvidence:
         assert result.unresolved[0].reason == "chunk_not_found"
         assert model.prompts == []
 
+    async def test_hit_without_a_source_identity_is_unresolved(self, tmp_path: Path) -> None:
+        service, _, _, source_id, _, retriever, model = await make_answerable(tmp_path)
+        retriever.hits = [RetrievedChunk(chunk_id="chunk_flat_without_source")]
+
+        result = await answer(service, source_id)
+
+        assert result.insufficient_reason is InsufficientReason.NO_RESOLVABLE_EVIDENCE
+        assert result.unresolved[0].reason == "missing_source_scope"
+        assert model.prompts == []
+
     async def test_unresolvable_hit_does_not_block_resolvable_ones(self, tmp_path: Path) -> None:
         service, _, index_store, source_id, _, retriever, model = await make_answerable(tmp_path)
         retriever.hits = [
@@ -576,8 +586,13 @@ class TestAnswerFailureReporting:
 def test_retrieved_chunk_rejects_blank_fields() -> None:
     with pytest.raises(ValueError):
         RetrievedChunk(chunk_id="", source_id="src_a")
-    with pytest.raises(ValueError):
-        RetrievedChunk(chunk_id="chunk_a", source_id="")
+
+
+def test_retrieved_chunk_allows_a_sourceless_hit() -> None:
+    """A legacy flat chunk has no source identity; it must stay reportable."""
+
+    chunk = RetrievedChunk(chunk_id="chunk_a")
+    assert chunk.source_id == ""
 
 
 def test_fakes_satisfy_the_service_protocols() -> None:

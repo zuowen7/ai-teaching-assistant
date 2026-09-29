@@ -92,6 +92,8 @@ class OpenAiCompatProvider(BaseProvider):
     Connection strategy: system-proxy-aware → direct fallback.
     """
 
+    provider_name = "openai_compatible"
+
     def __init__(
         self,
         base_url: str = "https://api.openai.com/v1",

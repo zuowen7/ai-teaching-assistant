@@ -972,11 +972,43 @@ def create_app(*, cloud_only: bool = False) -> FastAPI:
     from routers.literature import (
         ProjectSourceManifestStore,
         RagPageIndexStore,
+        RagPageRetriever,
         register_literature_routes,
     )
+    from src.agent_v2.router import _create_provider
+    from src.literature.answer_model import AgentProviderAnswerModel
     from src.literature.fulltext import HttpFullTextDownloader
     from src.literature.providers.arxiv import ArxivProvider
     from src.literature.service import LiteratureService
+
+    # P3 answer model: reuse the existing Agent provider factory instead of
+    # introducing a second provider-selection path (decision D-028).
+    _answer_config = _load_config()
+    try:
+        _answer_provider = _create_provider(_answer_config)
+    except Exception as exc:  # pragma: no cover - misconfigured local environment
+        logger.warning("Literature answer model is unavailable: %s", type(exc).__name__)
+        _answer_provider = None
+
+    _answer_model = None
+    if _answer_provider is not None:
+        _agent_config = (
+            (_answer_config.get("agent") or {}) if isinstance(_answer_config, dict) else {}
+        )
+        _answer_model = AgentProviderAnswerModel(
+            provider=_answer_provider,
+            provider_name=str(
+                getattr(_answer_provider, "provider_name", None)
+                or _agent_config.get("provider")
+                or type(_answer_provider).__name__
+            ),
+            model=str(
+                getattr(_answer_provider, "model", None) or _agent_config.get("model") or "unknown"
+            ),
+            base_url=str(
+                getattr(_answer_provider, "base_url", "") or _agent_config.get("base_url") or ""
+            ),
+        )
 
     state_literature = register_literature_routes(
         app,
@@ -985,6 +1017,8 @@ def create_app(*, cloud_only: bool = False) -> FastAPI:
             project_store=ProjectSourceManifestStore(),
             index_store=RagPageIndexStore(state_rag),
             downloader=HttpFullTextDownloader(),
+            retriever=RagPageRetriever(state_rag),
+            answer_model=_answer_model,
         ),
     )
 

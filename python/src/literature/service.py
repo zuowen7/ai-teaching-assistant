@@ -171,12 +171,16 @@ class ArtifactStore(Protocol):
 
 
 class RetrievedChunk(BaseModel):
-    """One scoped retrieval hit: a chunk identity plus the source it belongs to."""
+    """One scoped retrieval hit: a chunk identity plus the source it belongs to.
+
+    ``source_id`` may be blank for a legacy flat-text chunk that carries no source
+    identity; the service reports those as unresolved instead of dropping them.
+    """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     chunk_id: str = Field(min_length=1, max_length=128)
-    source_id: str = Field(min_length=1, max_length=64)
+    source_id: str = Field(default="", max_length=64)
     text: str = Field(default="", max_length=100_000)
 
 
@@ -1467,6 +1471,16 @@ class LiteratureService:
         resolved: dict[str, LiteratureEvidenceResult] = {}
         unresolved: list[UnresolvedEvidence] = []
         for hit in unique_hits:
+            if not hit.source_id:
+                unresolved.append(
+                    UnresolvedEvidence(
+                        source_id="",
+                        chunk_id=hit.chunk_id,
+                        reason="missing_source_scope",
+                        detail="检索块没有来源标识，无法限定在所选文献范围内",
+                    )
+                )
+                continue
             if hit.source_id not in scoped_source_ids:
                 unresolved.append(
                     UnresolvedEvidence(

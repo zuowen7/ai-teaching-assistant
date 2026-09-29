@@ -22,6 +22,7 @@ import logging
 import os
 import tempfile
 import uuid
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -499,9 +500,21 @@ def register_rag_routes(
             logger.warning("RAG delete failed: %s", e)
             raise HTTPException(500, "RAG document delete failed")
 
-    @app.post("/api/rag/query")
-    async def rag_query(req: QueryRequest):
-        if req.project_scoped and (not req.project_root or not req.source_ids):
+    async def _query_pages(
+        *,
+        query: str,
+        top_k: int,
+        project_root: str | None = None,
+        source_ids: Sequence[str] | None = None,
+        project_scoped: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Run one scoped vector query and return de-duplicated hits.
+
+        The HTTP route and the P3 evidence answer service share this function so
+        that "project and source scoped" has exactly one implementation.
+        """
+
+        if project_scoped and (not project_root or not source_ids):
             raise HTTPException(
                 400,
                 "project_scoped queries require project_root and explicit source_ids",
@@ -512,18 +525,18 @@ def register_rag_routes(
         try:
             where: dict[str, Any] | None = None
             filters: list[dict[str, Any]] = []
-            if req.project_root is not None:
-                filters.append({"project_root": req.project_root})
-            if req.source_ids:
-                filters.append({"source_id": {"$in": req.source_ids}})
+            if project_root is not None:
+                filters.append({"project_root": project_root})
+            if source_ids:
+                filters.append({"source_id": {"$in": list(source_ids)}})
             if len(filters) == 1:
                 where = filters[0]
             elif filters:
                 where = {"$and": filters}
             query_kwargs: dict[str, Any] = {
-                "query_texts": [req.query],
+                "query_texts": [query],
                 # 多取候选，便于按文档去重后仍能凑满 top_k
-                "n_results": min(max(req.top_k * 3, 10), 50),
+                "n_results": min(max(top_k * 3, 10), 50),
             }
             if where is not None:
                 query_kwargs["where"] = where
@@ -535,10 +548,24 @@ def register_rag_routes(
             documents = (results.get("documents") or [[]])[0]
             metadatas = (results.get("metadatas") or [[]])[0]
             distances = (results.get("distances") or [[]])[0]
-            return {"hits": _dedupe_hits(ids, documents, metadatas, distances, req.top_k)}
+            return _dedupe_hits(ids, documents, metadatas, distances, top_k)
+        except HTTPException:
+            raise
         except Exception as exc:
             logger.warning("RAG query failed: %s", exc)
-            raise HTTPException(500, "RAG query failed")
+            raise HTTPException(500, "RAG query failed") from exc
+
+    @app.post("/api/rag/query")
+    async def rag_query(req: QueryRequest):
+        return {
+            "hits": await _query_pages(
+                query=req.query,
+                top_k=req.top_k,
+                project_root=req.project_root,
+                source_ids=req.source_ids,
+                project_scoped=req.project_scoped,
+            )
+        }
 
     state.update(
         {
@@ -547,6 +574,7 @@ def register_rag_routes(
             "get_document": lambda doc_id: _docs.get(doc_id),
             "delete_document": _delete_document,
             "embedding_identity": _embedding_identity,
+            "query_pages": _query_pages,
         }
     )
     return state
