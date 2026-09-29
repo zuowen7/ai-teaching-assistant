@@ -1,8 +1,8 @@
 # 科研辅助 PoC 规划与实施合同
 
-> 状态：生效；G0、P1、P2A、P2B 已完成；P3、P4、A1 及后续候选 P5 尚未完成，科研辅助 PoC 尚未整体跑通
+> 状态：生效；G0、P1、P2A、P2B 已完成；P3 规格已冻结（§5.9）而实现未完成；P4、A1 及后续候选 P5 未开始，科研辅助 PoC 尚未整体跑通
 >
-> 当前基线：`teaching-refactor@071c6b0`
+> 当前基线：`teaching-refactor@9293a26`（P2B 与 M5 已提交并推送）
 >
 > 生效日期：2026-09-20
 >
@@ -287,7 +287,7 @@ indexing  -> index_failed
 | P1 合同与夹具 | 建立规范化模型、Provider 接口、失败语义、FixtureProvider 和契约测试 | G0 | FixtureProvider 完整通过同一公开接口；无 UI 依赖 | 已完成（2026-09-20） |
 | P2A 文献发现与入库 | ArxivProvider、搜索 API、去重、选择、项目入库、全文状态 | P1 | 固定查询可在线或从明确标记的缓存返回结构化记录；重复加入不产生重复条目 | 已完成（2026-09-21；范围仅为文献发现、去重和项目入库） |
 | P2B 页级解析与索引 | 项目内容 API 保留页结构；页内 chunk；证据元数据；索引过期规则 | P1 | 任一检索 hit 均能解析回同一哈希文档的真实页码与精确原文 | 已完成（2026-09-22，见 5.6、5.8；含 M5 开放 PDF 获取） |
-| P3 证据问答 | 多文献选择、项目隔离检索、Evidence Answer Service、证据 UI、无证据拒答 | P2A + P2B | 每个渲染结论的证据均通过机器校验；无范围查询被拒绝 | 未开始 |
+| P3 证据问答 | 多文献选择、项目隔离检索、Evidence Answer Service、证据 UI、无证据拒答 | P2A + P2B | 每个渲染结论的证据均通过机器校验；无范围查询被拒绝 | 规格已冻结（2026-09-29，见 5.9）；实现未完成 |
 | P4 演示与技术评测 | 固定公开论文包、缓存路径、失败场景、重复运行、指标记录 | P3 | 在线与缓存模式均能完成同一演示脚本；失败不被伪装为成功 | 未开始 |
 | A1 单 Agent 接入 | 复用 Agent V2 规划任务、调用已验收服务、处理真实反馈与连续追问 | P4、M1–M10 全部门通过 | §2.4 场景通过；范围、证据和失败语义与服务入口一致；工具记录可复核 | 未开始（2026-09-29 新增计划） |
 | P5 后续候选 | 主题分类、第二公开源、Review/Argument Map、检索优化 | P4 | 逐项另行立项，不反向改变首版验收 | 未开始 |
@@ -423,6 +423,89 @@ P2B 只完成了 M5 的"用户手工附加"一半；本节在实现之前冻结�
 - 仍未完成：前端尚未提供"获取开放全文"按钮（P3 范围，当前只能通过 API 触发）；真实网络的 arXiv PDF 下载只做一次性人工冒烟，不作为自动化证据。
 - 汇总：Python 单元 `1654 passed, 5 skipped`；P2B/M5 集成与端到端共 6 例通过；前端 `845 passed` 且未受影响；Ruff 静态与格式检查通过；全量后端为 `2815 passed, 14 skipped, 8 failed`，8 个失败仍是 §5.3–5.5 记录的既存/环境问题。
 
+### 5.9 P3 证据问答规格（2026-09-29，文档先行）
+
+P3 阶段门是"每个渲染结论的证据均通过机器校验；无范围查询被拒绝"。本节在实现之前冻结 M8、M9 的接口、失败语义与分层验收；测试先写、再修实现，任一层暴露缺陷时先修实现并保留回归测试，不得通过放宽断言或跳过测试来"通过"。§2.4 的 A1 只调用本节的确定性服务，不新增第二套问答路径，也不得绕过本节的校验。
+
+影响文件：
+
+| 类型 | 路径 | 职责 |
+|---|---|---|
+| 新增 | `python/src/literature/answer.py` | 提示构造、模型输出解析、白名单与页码一致性校验、拒答原因；纯逻辑，无 I/O |
+| 新增 | `python/src/literature/answer_model.py` | `ModelIdentity`、`EvidenceAnswerModel` 窄协议、`AgentProviderAnswerModel` 适配器 |
+| 修改 | `python/src/literature/service.py` | `LiteratureService.answer_question(...)`、答案结果信封与新增错误码 |
+| 修改 | `python/routers/rag.py` | 把范围检索抽成可复用调用，路由与问答服务共用同一实现 |
+| 修改 | `python/routers/literature.py` | `POST /api/literature/answer`、范围检索适配器与错误码映射 |
+| 修改 | `python/api_factory.py` | 用既有 Provider 工厂装配答案模型（不新增模型层） |
+| 新增 | `src/composables/useLiteratureAnswer.ts` | 前端问答状态、多文献范围选择、结论与证据状态 |
+| 修改 | `src/components/SourceLibraryView.vue` | 多文献证据问答区、证据展开与"获取开放全文"入口 |
+
+接口：
+
+```python
+class LiteratureAnswerRequest(BaseModel):
+    project_path: str = Field(min_length=1, max_length=1000)
+    question: str = Field(min_length=1, max_length=2000)
+    source_ids: list[str] = Field(min_length=1, max_length=50)
+    top_k: int = Field(default=8, ge=1, le=20)
+```
+
+```python
+class LiteratureService:
+    async def answer_question(
+        self, *, project_path: str, question: str, source_ids: Sequence[str], top_k: int = 8
+    ) -> LiteratureAnswerResult: ...
+```
+
+结果信封（`service.py`，与既有 `Literature*Result` 同处）：
+
+```python
+class LiteratureAnswerResult(BaseModel):
+    question: str
+    project_root: str
+    source_ids: list[str]
+    status: AnswerStatus                 # answered | insufficient
+    insufficient_reason: InsufficientReason | None
+    claims: list[AnswerClaim]            # 只含通过校验的 supported/conflicting 结论
+    evidence: list[LiteratureEvidenceResult]   # 本轮被引用、且可机器解析回原文的证据
+    rejected_claims: list[RejectedClaim]
+    unresolved: list[UnresolvedEvidence]
+    retrieved_chunk_count: int
+    model_provider: str
+    model_name: str
+    model_config_hash: str
+    generated_at: datetime
+```
+
+`AnswerStatus` = `answered | insufficient`；`InsufficientReason` = `no_retrieval_hits | no_resolvable_evidence | model_reported_insufficient | all_claims_rejected`；`RejectedClaimReason` = `unknown_evidence_id | fabricated_page_reference | missing_evidence | model_reported_insufficient | empty_claim_text | claim_limit_exceeded`。
+
+规则（冻结）：
+
+1. **范围强制**。`project_path` 与去重后的非空 `source_ids`（1..50）缺一不可；集合中任一来源不属于该项目或不是文献条目时，以显式 `source_not_found`(404) / `source_not_literature`(409) 失败，不得从检索中静默剔除后再回答。
+2. **检索只走页级通道**。检索同时限定 `project_root` 与 `source_ids`；展平/翻译块即使被召回也不得作为证据，进入 `unresolved`（`missing_page_metadata`）。
+3. **先解析再生成**。每个命中块都必须经过与 `/api/literature/evidence` 相同的 `resolve_evidence` 路径（重新读文件、重新哈希、重新按页解析、坐标与块身份校验）。解析失败的块进入 `unresolved` 并保留子码（`artifact_hash_mismatch` / `stale_index` / `quote_mismatch` / `chunk_not_found` 等）。可用证据为 0 时**不调用模型**，直接返回 `insufficient`（`no_retrieval_hits` / `no_resolvable_evidence`）。
+4. **生成约束**。`temperature=0`；模型只能使用服务端下发的 `evidence_id` 白名单；输出必须是单个 JSON 对象 `{"claims":[{"text","evidence_ids","evidence_status"}]}`。非 JSON、缺字段、类型错误 → 显式 `answer_invalid_response`，不换模型、不静默重试制造成功。
+5. **渲染前机器校验**。任一不通过即拒绝该结论并记入 `rejected_claims`：引用不在本轮白名单内（`unknown_evidence_id`）；结论文本出现的页码未落在其绑定证据的页码集合内（`fabricated_page_reference`，识别 `第 N 页`、`第 A-B 页`、`p.N`、`page N`）；supported/conflicting 却没有任何 `evidence_ids`（`missing_evidence`）；模型自述证据不足（`model_reported_insufficient`）；空文本（`empty_claim_text`）；结论数超过上限 20（`claim_limit_exceeded`）。**被拒结论不得降级为"无引用的结论"进入结果。**
+6. **结果一致性**。`claims[*].evidence_ids` 必须是 `evidence[*].evidence_id` 的子集，`evidence[*].source_id` 必须是请求 `source_ids` 的子集；完全相同的结论按 `claim_id` 去重。全部结论被拒或模型未给出结论时 `status=insufficient`。
+7. **失败即失败**。模型不可用 → `answer_model_unavailable`(503)；调用异常或超时 → `answer_generation_failed`(502)；索引存储不可用 → `index_store_unavailable`(503)。
+8. **不缓存答案**。每次请求都真实执行检索与解析；`model_config_hash` 由 provider、模型名、base_url、temperature、max_tokens 与提示版本 `evidence_answer_v1` 规范化哈希得到，**不得包含任何密钥**。
+9. **证据展示（M9）**。`evidence` 条目必须携带 `source_id`、题名、`page_start`/`page_end`、`exact_quote`、`context_before`/`context_after`、`chunk_id` 与 `artifact_sha256`；前端不得渲染未出现在 `evidence` 中的引用，且必须显示 `rejected_claims` 与 `unresolved` 的条数与原因。
+
+分层验收：
+
+| 层 | 位置 | 必须证明 |
+|---|---|---|
+| 单元 | `python/tests/unit/test_literature_answer.py` | 提示构造只下发白名单；响应解析的每个失败码；五类拒绝原因各自的判定；无可用证据时不调用模型；结论去重与上限；结果一致性不变量 |
+| 单元 | `python/tests/unit/test_literature_answer_model.py` | 适配器身份与 `model_config_hash` 的稳定性；密钥、代理与无关配置不进入哈希；Provider 返回文本与异常各自的处理 |
+| 单元 | `python/tests/unit/test_literature_answer_limits.py` | 边界与极限：超长问题、`source_ids` 上限与重复、`top_k` 越界、模型返回海量结论、超长结论文本、重复证据 ID、控制字符、并发同一项目问答、证据在回答中途被替换 |
+| 单元 | `python/tests/unit/test_literature_router.py` | `/api/literature/answer` 的 HTTP 契约与错误码映射（真实项目存储） |
+| 集成 | `python/tests/integration/test_literature_answer_integration.py` | 真实 ChromaDB + 真实 PDF：范围内检索 → 证据解析 → 注入确定性模型 → 结论与证据一致，且引文等于页文本切片 |
+| 端到端 | `python/tests/integration/test_literature_evidence_e2e.py` | 真实应用 + 离线 fixture provider：检索 → 入库 → 全文（手工/自动）→ 页级索引 → **多文献问答** → 证据回链；无答案问题返回 `insufficient` 且 `claims` 为空；无范围查询 400 |
+
+约束：三层都必须离线可跑；依赖缺失只能以显式 `skip` 表达；每层结果分别记录，不允许用低层结果替代高层结论。
+
+本阶段明确不做：答案缓存、流式输出、rerank 与混合检索、多轮追问、跨项目问答（进入 P5 或 A1 之外的后续评估）。
+
 ## 6. 验证与毕设方法边界
 ### 6.1 当前可冻结的工程目标
 
@@ -527,7 +610,11 @@ P2B 只完成了 M5 的"用户手工附加"一半；本节在实现之前冻结�
 | D-024 | 端到端测试在 `create_app` 前替换下载器实现以保持离线；真实网络下载只做一次性人工冒烟，不进入自动化测试 | 本文冻结（2026-09-22） | 把网络波动当成回归信号会污染测试结论；同时保留“真实链路过一次”的人工证据 |
 | D-025 | 正式开题沿用用户提供的八部分模板；学校为哈尔滨工业大学（威海），专业为测控技术与仪器；研墨及现有项目为用户个人独立开发的前期基础 | 用户确认（2026-09-29） | 不再写成课题组成果；姓名、学号、导师和日期未提供则留空，进度只作暂定安排 |
 | D-026 | 增加 §2.4 的单 Agent 接入与 A1 验收，在 M1–M10/P4 完成后实施；开题稿建议题目突出智能体，最终备案题目仍待确认 | 用户要求保留 Agent 特色；具体边界由本次规划明确（2026-09-29） | 拒绝仅改名称的聊天包装、平行 Agent 状态库及恢复多智能体调度主线；新增工具集成覆盖，不改变证据数据模型，当前不使既有索引或缓存失效 |
-| D-027 | 本次验证目标仍为技术可行性；演示选工科或计算机文献；本地设备为天选4，拟使用 GPT/DeepSeek 接口，GLM 为后续候选，经费与额外指导支持尚未落实 | 用户确认（2026-09-29） | 不编造准确率门槛、经费金额、学校算力或指导资源已获批；文献综述理解为所选论文的有据归纳，实验建议留作后续拓展 |
+| D-027 | 本次验证目标仍为技术可行性；演示选工科或计算机文献；本地设备为天选4，拟使用 GPT/DeepSeek 接口，GLM 为后续候选，经费与额外指导支持尚未落实 | 基础条件与目标由用户确认；具体交付边界由本次规划明确（2026-09-29） | 不编造准确率门槛、经费金额、学校算力或指导资源已获批；文献综述理解为所选论文的有据归纳，实验建议留作后续拓展 |
+| D-028 | P3 答案生成复用既有模型 Provider，领域服务只依赖 `EvidenceAnswerModel` 窄协议（`identity` + `complete`）；Provider 选择仍由既有 `_create_provider` 完成，`src/literature` 不新建 provider 注册表、不直接读取模型配置文件 | 本文冻结（2026-09-29） | §3 要求"不另建平行 `ModelProvider` 抽象"；窄协议让领域服务保持离线可测，同时避免把 20 余项 provider 配置复制进领域层。被否决方案：在 `src/literature` 内新建模型抽象与注册表 |
+| D-029 | 渲染前机器校验与拒绝语义：证据白名单、页码一致性（`第 N 页`/`p.N`/`page N`）、supported/conflicting 必须有证据；不通过的结论记入 `rejected_claims` 并**不得**降级为无引用结论；可用证据为 0 时不调用模型 | 本文冻结（2026-09-29） | §4.5 与 §11.4 要求"前端不得渲染无法通过校验的证据引用"；把无证据结论照常渲染再加角标会让界面出现不可核验文本。被否决方案：渲染全部结论并标注"未验证" |
+| D-030 | 首版答案不缓存、`temperature=0`、`model_config_hash` 只含 provider/模型/base_url/temperature/max_tokens/提示版本且排除密钥；`/api/literature/answer` 为一次性 JSON，不引入 SSE 流式 | 本文冻结（2026-09-29） | §0 禁止缓存结果冒充在线；流式会把未校验文本提前送进界面，使"渲染前校验"无法成为唯一出口。被否决方案：先流式输出再由前端过滤 |
+| D-031 | A1 只调用 §5.9 的确定性问答与既有文献服务；`academic_tools.py` 的 `arxiv_search`（原始 Atom XML 截断）与 `rag_search`（无 `project_root`/`source_ids`）在 A1 中必须被替换，旧兼容测试同步重写，不作为回归基线 | 本文冻结（2026-09-29） | 无范围检索与原始响应会让 Agent 绕过 §4.5 的项目/文献范围与证据校验，与 §2.4 的 A1 验收直接冲突 |
 
 ### 9.2 待确认但不阻塞 P1–P3 的事项
 
@@ -559,18 +646,21 @@ P2B 只完成了 M5 的"用户手工附加"一半；本节在实现之前冻结�
 | 新增 | `python/src/literature/providers/base.py` | LiteratureProvider 契约 | P1 已实现 |
 | 新增 | `python/src/literature/providers/arxiv.py` | arXiv 结构化实现 | P2A.1 已实现 |
 | 新增 | `python/src/literature/providers/fixture.py` | 离线契约测试与缓存演示实现 | P1 已实现 |
-| 新增 | `python/src/literature/service.py` | 搜索执行、强身份去重、项目批量入库和初始全文状态编排；完成并持久化检索计划；P2B 增加页级索引与证据解析；M5 增加开放全文获取与状态机 | P2A.2–P2A.3、P2B、M5 已实现 |
+| 新增 | `python/src/literature/service.py` | 搜索执行、强身份去重、项目批量入库和初始全文状态编排；完成并持久化检索计划；P2B 增加页级索引与证据解析；M5 增加开放全文获取与状态机；P3 增加 `answer_question` 与答案结果信封 | P2A.2–P2A.3、P2B、M5 已实现；P3 未开始 |
 | 新增 | `python/src/literature/evidence.py` | 页内切块、坐标/块身份派生、索引指纹与证据校验；回答结构化仍属于 P3 | P2B 证据校验已实现 |
 | 新增 | `python/src/literature/fulltext.py` | M5 开放全文获取：只认 open + https 的 PDF 位置，大小/超时/Content-Type/魔数校验，显式错误码 | 已实现（2026-09-22） |
-| 新增 | `python/routers/literature.py` | Literature API 与现有 Project 存储的窄适配层；接收检索计划草案；P2B 增加索引与证据路由；M5 增加全文获取路由 | P2A.2–P2A.3、P2B、M5 已实现 |
-| 修改 | `python/api_factory.py` | 注册 Literature API，并在应用生命周期关闭 Provider 资源；P2B 注入 RAG 页级索引适配器 | P2A.2、P2B 已实现 |
+| 新增 | `python/src/literature/answer.py` | P3 提示构造、模型输出解析、白名单与页码一致性校验、拒答原因（§5.9） | 未开始 |
+| 新增 | `python/src/literature/answer_model.py` | P3 `ModelIdentity`、`EvidenceAnswerModel` 窄协议与既有 Provider 适配器（D-028） | 未开始 |
+| 新增 | `python/routers/literature.py` | Literature API 与现有 Project 存储的窄适配层；接收检索计划草案；P2B 增加索引与证据路由；M5 增加全文获取路由；P3 增加答案路由与范围检索适配器 | P2A.2–P2A.3、P2B、M5 已实现；P3 未开始 |
+| 修改 | `python/api_factory.py` | 注册 Literature API，并在应用生命周期关闭 Provider 资源；P2B 注入 RAG 页级索引适配器；P3 用既有 Provider 工厂装配答案模型（D-028） | P2A.2、P2B 已实现；P3 未开始 |
 | 修改 | `python/routers/project.py` | P2A.2 共享清单事务锁、内部路径与 manifest 版本边界；P2B 补页结构与文档哈希 | P2A.2、P2B 已实现 |
 | 修改 | `python/src/utils/atomic_io.py` | 提供同进程路径级可重入事务锁；不承诺跨进程协调 | P2A.2 后端已实现 |
-| 修改 | `python/routers/rag.py` | 页级 chunk、证据 metadata、索引版本和范围约束 | P2B 已实现（新增 `project_scoped` 查询模式；展平通道保持不变） |
+| 修改 | `python/routers/rag.py` | 页级 chunk、证据 metadata、索引版本和范围约束；P3 把范围检索抽成路由与问答服务共用的调用 | P2B 已实现（新增 `project_scoped` 查询模式；展平通道保持不变）；P3 未开始 |
 | 修改 | `src/composables/useSourceLibrary.ts` | P2B：把"建立索引"动作切到页级证据通道（PDF + 文献条目），其它来源保持展平通道 | P2B 已实现 |
 | 修改 | `python/src/agent_v2/tools/academic_tools.py` | 用结构化 Literature/RAG 工具替代原始 XML 与无范围查询 | 未开始 |
 | 新增 | `src/composables/useLiteratureDiscovery.ts` | 检索、选择、入库和状态管理 | P2A.3 已实现 |
-| 修改 | `src/components/SourceLibraryView.vue` | P2A.3：公开发现、检索计划确认、结果回执和多选入库；P3 再增加多文献问答与证据展示 | P2A.3 已实现；P3 未开始 |
+| 新增 | `src/composables/useLiteratureAnswer.ts` | P3 多文献范围选择、问答请求、结论与证据状态（§5.9） | 未开始 |
+| 修改 | `src/components/SourceLibraryView.vue` | P2A.3：公开发现、检索计划确认、结果回执和多选入库；P3 增加多文献问答、证据展开与"获取开放全文"入口 | P2A.3 已实现；P3 未开始 |
 | 新增/修改 | `python/tests/`、`src/__tests__/` | 契约、状态机、页码证据和端到端回归；A1 增加 Agent 工具接入与计划、确认、失败处理覆盖 | P1–P2B 已实现；P3 以后未开始 |
 | 后续新增 | `methods/literature_poc/` | 正式 RQ、语料、gold、协议和运行记录 | 未开始 |
 
