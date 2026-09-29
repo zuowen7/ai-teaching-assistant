@@ -163,7 +163,11 @@ class MemoryPageIndexStore:
         self.documents[doc_id] = entry
         return {**entry, "reused": False}
 
-    async def get_chunk(self, chunk_id: str) -> Mapping[str, Any] | None:
+    async def get_chunk(
+        self, chunk_id: str, *, source_id: str | None = None
+    ) -> Mapping[str, Any] | None:
+        # The in-memory store is keyed by content id only; the service still
+        # cross-checks that the chunk belongs to the requested source.
         return self.chunks.get(chunk_id)
 
     async def get_document(self, doc_id: str) -> Mapping[str, Any] | None:

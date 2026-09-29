@@ -19,6 +19,8 @@ Requires a working chromadb installation; skipped explicitly when it is missing.
 from __future__ import annotations
 
 import hashlib
+import json
+import re
 import shutil
 import sys
 import tempfile
@@ -139,6 +141,60 @@ class StubDownloader:
         return None
 
 
+EVIDENCE_ID_RE = re.compile(r"\[(evidence_[0-9a-f]{24})\]")
+UNANSWERABLE_MARKER = "UNANSWERABLE"
+
+
+class ScriptedAnswerProvider:
+    """Offline stand-in for the Agent provider behind the answer route.
+
+    It is injected through ``_create_provider`` before ``create_app`` runs, the
+    same way the metadata provider and the downloader are replaced (D-024).
+    """
+
+    provider_name = "scripted"
+    model = "scripted-answer-v1"
+    base_url = ""
+
+    def __init__(self) -> None:
+        self.prompts: list[str] = []
+
+    async def chat(
+        self,
+        messages,
+        tools=None,
+        system_prompt=None,
+        max_tokens=4096,
+        temperature=0.3,
+        tool_choice="auto",
+    ):
+        from src.agent_v2.types import ProviderResponse, TextBlock
+
+        prompt = messages[0].text_content() if messages else ""
+        self.prompts.append(prompt)
+        if UNANSWERABLE_MARKER in prompt:
+            payload = {
+                "claims": [
+                    {
+                        "text": "The selected corpus does not answer this question.",
+                        "evidence_ids": [],
+                        "evidence_status": "insufficient",
+                    }
+                ]
+            }
+        else:
+            payload = {
+                "claims": [
+                    {
+                        "text": "The selected paper reports this finding.",
+                        "evidence_ids": EVIDENCE_ID_RE.findall(prompt),
+                        "evidence_status": "supported",
+                    }
+                ]
+            }
+        return ProviderResponse(blocks=[TextBlock(text=json.dumps(payload))])
+
+
 def write_pdf(path: Path, page_texts: list[str]) -> Path:
     import fitz
 
@@ -171,7 +227,14 @@ def downloader() -> StubDownloader:
 
 
 @pytest.fixture(scope="module")
-def client(downloader: StubDownloader) -> Iterator[TestClient]:
+def answer_provider() -> ScriptedAnswerProvider:
+    return ScriptedAnswerProvider()
+
+
+@pytest.fixture(scope="module")
+def client(
+    downloader: StubDownloader, answer_provider: ScriptedAnswerProvider
+) -> Iterator[TestClient]:
     pytest.importorskip("chromadb")
     from api_factory import create_app
 
@@ -195,6 +258,7 @@ def client(downloader: StubDownloader) -> Iterator[TestClient]:
         patch("api_factory.BASE_DIR", test_dir),
         patch("src.literature.providers.arxiv.ArxivProvider", lambda *a, **k: provider),
         patch("src.literature.fulltext.HttpFullTextDownloader", lambda *a, **k: downloader),
+        patch("src.agent_v2.router._create_provider", lambda *a, **k: answer_provider),
     ):
         app = create_app()
         with TestClient(app) as test_client:
@@ -455,5 +519,154 @@ def test_acquired_open_pdf_reaches_verified_evidence(
             parsed_pages(local_path)[2][span["char_start"] : span["char_end"]]
             == span["exact_quote"]
         )
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def prepare_indexed_project(client: TestClient, workdir: Path, name: str) -> tuple[Path, str, Path]:
+    """Run the demo chain up to a page-indexed source and return its identity."""
+
+    location = workdir / "projects"
+    location.mkdir(parents=True, exist_ok=True)
+    created = client.post(
+        "/api/project/create",
+        json={
+            "name": name,
+            "location": str(location),
+            "template_id": "research_paper",
+            "init_git": False,
+        },
+    )
+    assert created.status_code == 200, created.text
+    project = Path(created.json()["project_path"])
+
+    searched = client.post(
+        "/api/literature/search",
+        json={
+            "provider": "fixture",
+            "query": {
+                "query": QUERY,
+                "page": 1,
+                "page_size": 10,
+                "sort_by": "relevance",
+                "sort_order": "descending",
+                "filters": {"year_from": None, "year_to": None, "categories": []},
+            },
+            "plan": {
+                "research_question": RESEARCH_QUESTION,
+                "suggested_query": QUERY,
+                "generation_method": "template",
+                "generation_model": None,
+                "generation_config": {"template": "arxiv_all_phrase_v1"},
+            },
+        },
+    )
+    assert searched.status_code == 200, searched.text
+    execution = searched.json()
+    paper_id = execution["page"]["records"][0]["paper_id"]
+
+    imported = client.post(
+        "/api/literature/import",
+        json={
+            "project_path": str(project),
+            "search_execution_id": execution["search_execution_id"],
+            "paper_ids": [paper_id],
+        },
+    )
+    assert imported.status_code == 200, imported.text
+    source_id = imported.json()["results"][0]["source_id"]
+
+    pdf = write_pdf(workdir / "answer.pdf", [PAGE_ONE, PAGE_TWO])
+    with pdf.open("rb") as stream:
+        attached = client.post(
+            "/api/project/sources/import",
+            data={"project_path": str(project), "source_id": source_id},
+            files={"file": (pdf.name, stream, "application/pdf")},
+        )
+    assert attached.status_code == 200, attached.text
+
+    indexed = client.post(
+        "/api/literature/index",
+        json={"project_path": str(project), "source_id": source_id},
+    )
+    assert indexed.status_code == 200, indexed.text
+    assert indexed.json()["status"] == "indexed"
+    return project, source_id, pdf
+
+
+def test_scoped_answer_cites_a_verified_page_quote(
+    client: TestClient,
+    answer_provider: ScriptedAnswerProvider,
+) -> None:
+    """P3: the demo chain ends in an answer whose every citation is verifiable."""
+
+    workdir = Path(tempfile.mkdtemp(prefix="p3-e2e-answer-"))
+    try:
+        project, source_id, pdf = prepare_indexed_project(client, workdir, "P3 EndToEnd")
+
+        answered = client.post(
+            "/api/literature/answer",
+            json={
+                "project_path": str(project),
+                "question": f"What does the paper say about the {PAGE_TWO_MARKER}?",
+                "source_ids": [source_id],
+                "top_k": 5,
+            },
+        )
+        assert answered.status_code == 200, answered.text
+        body = answered.json()
+
+        assert body["status"] == "answered"
+        assert body["insufficient_reason"] is None
+        assert body["source_ids"] == [source_id]
+        assert body["project_root"] == str(project)
+        assert body["model_provider"] == "scripted"
+        assert body["model_name"] == "scripted-answer-v1"
+        assert len(body["model_config_hash"]) == 64
+        assert answer_provider.prompts, "the answer model was never called"
+
+        evidence_ids = {item["span"]["evidence_id"] for item in body["evidence"]}
+        assert evidence_ids
+        for claim in body["claims"]:
+            assert claim["evidence_ids"]
+            assert set(claim["evidence_ids"]) <= evidence_ids
+
+        pages = parsed_pages(pdf)
+        for item in body["evidence"]:
+            span = item["span"]
+            assert item["source_id"] == source_id
+            assert span["coordinate_space"] == "normalized_page_text_v1"
+            assert span["page_start"] == span["page_end"]
+            assert (
+                pages[span["page_start"]][span["char_start"] : span["char_end"]]
+                == (span["exact_quote"])
+            )
+        assert any(PAGE_TWO_MARKER in item["span"]["exact_quote"] for item in body["evidence"])
+
+        # The same question asked with no scope must be refused outright.
+        unscoped = client.post(
+            "/api/literature/answer",
+            json={"project_path": str(project), "question": "Anything?", "source_ids": []},
+        )
+        assert unscoped.status_code == 400
+        assert unscoped.json()["detail"]["code"] == "scope_required"
+
+        # A question the corpus cannot answer yields an explicit insufficiency and
+        # never a fabricated citation.
+        unanswerable = client.post(
+            "/api/literature/answer",
+            json={
+                "project_path": str(project),
+                "question": f"{UNANSWERABLE_MARKER}: what is the airspeed of a swallow?",
+                "source_ids": [source_id],
+                "top_k": 5,
+            },
+        )
+        assert unanswerable.status_code == 200, unanswerable.text
+        unanswered = unanswerable.json()
+        assert unanswered["status"] == "insufficient"
+        assert unanswered["insufficient_reason"] == "model_reported_insufficient"
+        assert unanswered["claims"] == []
+        assert unanswered["evidence"] == []
     finally:
         shutil.rmtree(workdir, ignore_errors=True)

@@ -483,8 +483,8 @@ class LiteratureAnswerResult(BaseModel):
 
 1. **范围强制**。`project_path` 与去重后的非空 `source_ids`（1..50）缺一不可；集合中任一来源不属于该项目或不是文献条目时，以显式 `source_not_found`(404) / `source_not_literature`(409) 失败，不得从检索中静默剔除后再回答。
 2. **检索只走页级通道**。检索同时限定 `project_root` 与 `source_ids`；展平/翻译块即使被召回也不得作为证据，进入 `unresolved`（`missing_page_metadata`）。
-3. **先解析再生成**。每个命中块都必须经过与 `/api/literature/evidence` 相同的 `resolve_evidence` 路径（重新读文件、重新哈希、重新按页解析、坐标与块身份校验）。解析失败的块进入 `unresolved` 并保留子码（`artifact_hash_mismatch` / `stale_index` / `quote_mismatch` / `chunk_not_found` 等）。可用证据为 0 时**不调用模型**，直接返回 `insufficient`（`no_retrieval_hits` / `no_resolvable_evidence`）。
-4. **生成约束**。`temperature=0`；模型只能使用服务端下发的 `evidence_id` 白名单；输出必须是单个 JSON 对象 `{"claims":[{"text","evidence_ids","evidence_status"}]}`（允许整体包在一个 ```` ```json ```` 围栏内，不允许夹带解释性文字）。非 JSON、缺字段、类型错误、单条结论文本超过 20 000 字符、单条结论引用超过 100 个证据 ID、或响应体超过 200 000 字符 → 显式 `answer_invalid_response`，不换模型、不静默重试制造成功。
+3. **先解析再生成**。每个命中块都必须经过与 `/api/literature/evidence` 相同的 `resolve_evidence` 路径（重新读文件、重新哈希、重新按页解析、坐标与块身份校验）。解析失败的块进入 `unresolved` 并保留子码（`artifact_hash_mismatch` / `stale_index` / `quote_mismatch` / `chunk_not_found` 等）。可用证据为 0 时**不调用模型**，直接返回 `insufficient`（`no_retrieval_hits` / `no_resolvable_evidence`）。没有来源标识的命中以 `missing_source_scope` 记为未解析，不静默丢弃。去重后的命中数不得超过 `top_k` 上限 20；超出属于检索实现违约，以 `answer_request_invalid` 显式失败，**不裁剪证据去凑答案**（裁剪可能丢掉唯一可核验的引文）。
+4. **生成约束**。`temperature=0`；模型只能使用服务端下发的 `evidence_id` 白名单；输出必须是单个 JSON 对象 `{"claims":[{"text","evidence_ids","evidence_status"}]}`（允许整体包在一个 ```` ```json ```` 围栏内，不允许夹带解释性文字）。非 JSON、缺字段、类型错误、单条结论文本超过 20 000 字符、单条结论引用超过 100 个证据 ID、或响应体超过 200 000 字符 → 显式 `answer_invalid_response`，不换模型、不静默重试制造成功。结论文本中的控制字符在进入合同模型前被剥离。证据集合超出提示预算（总长或单条引文上限）时以 `answer_request_invalid` 显式失败。
 5. **渲染前机器校验**。任一不通过即拒绝该结论并记入 `rejected_claims`：引用不在本轮白名单内（`unknown_evidence_id`）；结论文本出现的页码未落在其绑定证据的页码集合内（`fabricated_page_reference`，识别 `第 N 页`、`第 A-B 页`、`p.N`、`page N`）；supported/conflicting 却没有任何 `evidence_ids`（`missing_evidence`）；模型自述证据不足（`model_reported_insufficient`）；空文本（`empty_claim_text`）；结论数超过上限 20（`claim_limit_exceeded`）。**被拒结论不得降级为"无引用的结论"进入结果。**
 6. **结果一致性**。`claims[*].evidence_ids` 必须是 `evidence[*].evidence_id` 的子集，`evidence[*].source_id` 必须是请求 `source_ids` 的子集；完全相同的结论按 `claim_id` 去重。全部结论被拒或模型未给出结论时 `status=insufficient`。
 7. **失败即失败**。模型不可用 → `answer_model_unavailable`(503)；调用异常或超时 → `answer_generation_failed`(502)；索引存储不可用 → `index_store_unavailable`(503)。
@@ -497,6 +497,7 @@ class LiteratureAnswerResult(BaseModel):
 |---|---|---|
 | 单元 | `python/tests/unit/test_literature_answer.py` | 提示构造只下发白名单；响应解析的每个失败码；五类拒绝原因各自的判定；无可用证据时不调用模型；结论去重与上限；结果一致性不变量 |
 | 单元 | `python/tests/unit/test_literature_answer_model.py` | 适配器身份与 `model_config_hash` 的稳定性；密钥、代理与无关配置不进入哈希；Provider 返回文本与异常各自的处理 |
+| 单元 | `python/tests/unit/test_literature_answer_service.py` | 服务编排：范围校验、检索与解析顺序、无证据时不调用模型、模型/响应失败码、拒绝结论不降级、相同请求不被缓存 |
 | 单元 | `python/tests/unit/test_literature_answer_limits.py` | 边界与极限：超长问题、`source_ids` 上限与重复、`top_k` 越界、模型返回海量结论、超长结论文本、重复证据 ID、控制字符、并发同一项目问答、证据在回答中途被替换 |
 | 单元 | `python/tests/unit/test_literature_router.py` | `/api/literature/answer` 的 HTTP 契约与错误码映射（真实项目存储） |
 | 集成 | `python/tests/integration/test_literature_answer_integration.py` | 真实 ChromaDB + 真实 PDF：范围内检索 → 证据解析 → 注入确定性模型 → 结论与证据一致，且引文等于页文本切片 |
@@ -615,6 +616,7 @@ class LiteratureAnswerResult(BaseModel):
 | D-029 | 渲染前机器校验与拒绝语义：证据白名单、页码一致性（`第 N 页`/`p.N`/`page N`）、supported/conflicting 必须有证据；不通过的结论记入 `rejected_claims` 并**不得**降级为无引用结论；可用证据为 0 时不调用模型 | 本文冻结（2026-09-29） | §4.5 与 §11.4 要求"前端不得渲染无法通过校验的证据引用"；把无证据结论照常渲染再加角标会让界面出现不可核验文本。被否决方案：渲染全部结论并标注"未验证" |
 | D-030 | 首版答案不缓存、`temperature=0`、`model_config_hash` 只含 provider/模型/base_url/temperature/max_tokens/提示版本且排除密钥；`/api/literature/answer` 为一次性 JSON，不引入 SSE 流式 | 本文冻结（2026-09-29） | §0 禁止缓存结果冒充在线；流式会把未校验文本提前送进界面，使"渲染前校验"无法成为唯一出口。被否决方案：先流式输出再由前端过滤 |
 | D-031 | A1 只调用 §5.9 的确定性问答与既有文献服务；`academic_tools.py` 的 `arxiv_search`（原始 Atom XML 截断）与 `rag_search`（无 `project_root`/`source_ids`）在 A1 中必须被替换，旧兼容测试同步重写，不作为回归基线 | 本文冻结（2026-09-29） | 无范围检索与原始响应会让 Agent 绕过 §4.5 的项目/文献范围与证据校验，与 §2.4 的 A1 验收直接冲突 |
+| D-032 | 页级 chunk 的**集合存储键**改为 `<doc_id>::<chunk_id>`；`chunk_id` 仍是不含项目 scope 的内容身份（artifact SHA-256 + 页码 + 坐标 + chunker 版本，D-020 不变），对外接口与证据字段只暴露该内容身份。查询命中与证据解析通过 metadata（`chunk_id`，可选再限定 `source_id`）定位行，并保留裸 id 回退以兼容本决策之前写入的行与展平块 | 本文冻结（2026-09-29） | P3 集成层发现的真实缺陷：同一份 PDF 在两个来源或两个项目下索引时内容身份相同，裸 id 使后写入的文档静默覆盖先写入文档的页元数据，跨项目隔离随之失效（违反 §7.2），且先建索引的一方只会看到 `chunk_not_found`。被否决方案：把 `doc_id` 混进 `chunk_id`（会改变 D-020 已冻结的内容身份并作废既有 `evidence_id`）；"只加来源校验不改存储键"（数据已被覆盖，校验只能报告失败而无法恢复）。影响范围：本决策之前建立的页级索引若曾被同内容文档覆盖，需要重新执行 `/api/literature/index`；旧行在本决策后仍可被读取 |
 
 ### 9.2 待确认但不阻塞 P1–P3 的事项
 
@@ -655,7 +657,7 @@ class LiteratureAnswerResult(BaseModel):
 | 修改 | `python/api_factory.py` | 注册 Literature API，并在应用生命周期关闭 Provider 资源；P2B 注入 RAG 页级索引适配器；P3 用既有 Provider 工厂装配答案模型（D-028） | P2A.2、P2B 已实现；P3 未开始 |
 | 修改 | `python/routers/project.py` | P2A.2 共享清单事务锁、内部路径与 manifest 版本边界；P2B 补页结构与文档哈希 | P2A.2、P2B 已实现 |
 | 修改 | `python/src/utils/atomic_io.py` | 提供同进程路径级可重入事务锁；不承诺跨进程协调 | P2A.2 后端已实现 |
-| 修改 | `python/routers/rag.py` | 页级 chunk、证据 metadata、索引版本和范围约束；P3 把范围检索抽成路由与问答服务共用的调用 | P2B 已实现（新增 `project_scoped` 查询模式；展平通道保持不变）；P3 未开始 |
+| 修改 | `python/routers/rag.py` | 页级 chunk、证据 metadata、索引版本和范围约束；P3 把范围检索抽成路由与问答服务共用的调用，并按 D-032 把存储键改为 `<doc_id>::<chunk_id>` | P2B 已实现（新增 `project_scoped` 查询模式；展平通道保持不变）；P3 进行中 |
 | 修改 | `src/composables/useSourceLibrary.ts` | P2B：把"建立索引"动作切到页级证据通道（PDF + 文献条目），其它来源保持展平通道 | P2B 已实现 |
 | 修改 | `python/src/agent_v2/tools/academic_tools.py` | 用结构化 Literature/RAG 工具替代原始 XML 与无范围查询 | 未开始 |
 | 新增 | `src/composables/useLiteratureDiscovery.ts` | 检索、选择、入库和状态管理 | P2A.3 已实现 |

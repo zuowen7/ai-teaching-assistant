@@ -146,8 +146,10 @@ class PageIndexStore(Protocol):
         """Write page-scoped chunks and return the stored document entry."""
         ...
 
-    async def get_chunk(self, chunk_id: str) -> Mapping[str, Any] | None:
-        """Return one stored chunk or ``None`` when it is not indexed."""
+    async def get_chunk(
+        self, chunk_id: str, *, source_id: str | None = None
+    ) -> Mapping[str, Any] | None:
+        """Return one stored chunk, optionally restricted to one source."""
         ...
 
     async def get_document(self, doc_id: str) -> Mapping[str, Any] | None:
@@ -1321,7 +1323,7 @@ class LiteratureService:
 
         index_store = self._require_index_store()
         source = self._require_literature_source(project_path, source_id)
-        chunk = await index_store.get_chunk(chunk_id)
+        chunk = await index_store.get_chunk(chunk_id, source_id=source_id)
         if chunk is None:
             raise LiteratureServiceError(
                 LiteratureServiceErrorCode.CHUNK_NOT_FOUND,
@@ -1466,6 +1468,17 @@ class LiteratureService:
                 continue
             seen_chunk_ids.add(hit.chunk_id)
             unique_hits.append(hit)
+        if len(unique_hits) > MAX_ANSWER_TOP_K:
+            # Silently trimming the evidence set could drop the only verifiable
+            # quote, so a retriever that ignores top_k fails loudly instead.
+            raise LiteratureServiceError(
+                LiteratureServiceErrorCode.ANSWER_REQUEST_INVALID,
+                f"检索返回的去重命中数超过上限 {MAX_ANSWER_TOP_K}",
+                details={
+                    "reason": "too_many_retrieval_hits",
+                    "hit_count": len(unique_hits),
+                },
+            )
 
         candidates: dict[str, AnswerEvidenceCandidate] = {}
         resolved: dict[str, LiteratureEvidenceResult] = {}
@@ -1552,10 +1565,21 @@ class LiteratureService:
                 rejected_claims=[],
             )
 
-        prompt = build_answer_prompt(
-            question=normalized_question,
-            candidates=list(candidates.values()),
-        )
+        try:
+            prompt = build_answer_prompt(
+                question=normalized_question,
+                candidates=list(candidates.values()),
+            )
+        except ValueError as exc:
+            raise LiteratureServiceError(
+                LiteratureServiceErrorCode.ANSWER_REQUEST_INVALID,
+                "证据集合超出提示预算",
+                details={
+                    "reason": str(exc),
+                    "candidate_count": len(candidates),
+                    "question_chars": len(normalized_question),
+                },
+            ) from exc
         try:
             raw_response = await answer_model.complete(
                 system_prompt=build_answer_system_prompt(),

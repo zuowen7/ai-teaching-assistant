@@ -39,6 +39,7 @@ MAX_PAGE_RANGE = 500
 
 _UNVERIFIABLE_PAGE = -1
 _WHITESPACE_RE = re.compile(r"\s+")
+_CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 
 
 class AnswerStatus(StrEnum):
@@ -136,7 +137,9 @@ _PAGE_SINGLE_PATTERNS = (
 
 
 def _collapse_whitespace(value: str) -> str:
-    return _WHITESPACE_RE.sub(" ", value).strip()
+    """Collapse whitespace and drop control characters a model may emit."""
+
+    return _WHITESPACE_RE.sub(" ", _CONTROL_RE.sub("", value)).strip()
 
 
 def referenced_page_numbers(text: str) -> set[int]:

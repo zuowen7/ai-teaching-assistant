@@ -103,7 +103,9 @@ def _dedupe_hits(
         hits.append(
             {
                 "doc_id": doc_id,
-                "chunk_id": chunk_id,
+                # Page chunks are stored under "<doc_id>::<chunk_id>" (D-032);
+                # callers always see the content-level id.
+                "chunk_id": str(metadata.get("chunk_id") or chunk_id),
                 "source": metadata.get("title", chunk_id),
                 "text": documents[index] if index < len(documents) else "",
                 "distance": distances[index] if index < len(distances) else None,
@@ -333,7 +335,10 @@ def register_rag_routes(
         if col is None:
             raise HTTPException(503, "RAG store not available")
 
-        ids = [chunk.chunk_id for chunk in chunks]
+        # Storage key = document scope + content identity (D-032).  Two documents
+        # with identical bytes produce identical content ids, so the bare id would
+        # let one document silently overwrite another's page metadata.
+        ids = [f"{doc_id}::{chunk.chunk_id}" for chunk in chunks]
         documents = [chunk.text for chunk in chunks]
         metadatas = [
             chunk_metadata(
@@ -390,18 +395,33 @@ def register_rag_routes(
             raise HTTPException(500, "RAG page indexing failed")
         return {**entry, "reused": False}
 
-    async def _get_chunk(chunk_id: str) -> dict[str, Any] | None:
-        """Fetch one stored chunk together with its evidence metadata."""
+    async def _get_chunk(chunk_id: str, source_id: str | None = None) -> dict[str, Any] | None:
+        """Fetch one stored chunk together with its evidence metadata.
+
+        Page chunks are stored under ``<doc_id>::<chunk_id>`` (D-032), so the
+        content-level ``chunk_id`` is resolved through chunk metadata instead of
+        through the storage key.  A bare id lookup stays as the fallback for rows
+        written before D-032 and for flat-text chunks.
+        """
 
         col = await _ensure_store()
         if col is None:
             raise HTTPException(503, "RAG store not available")
         try:
+            where: dict[str, Any] = {"chunk_id": chunk_id}
+            if source_id:
+                where = {"$and": [{"chunk_id": chunk_id}, {"source_id": source_id}]}
             result = await asyncio.to_thread(
                 col.get,
-                ids=[chunk_id],
+                where=where,
                 include=["documents", "metadatas"],
             )
+            if not (result.get("ids") or []):
+                result = await asyncio.to_thread(
+                    col.get,
+                    ids=[chunk_id],
+                    include=["documents", "metadatas"],
+                )
         except Exception as exc:
             logger.warning("RAG chunk lookup failed: %s", exc)
             raise HTTPException(500, "RAG chunk lookup failed")
@@ -410,10 +430,11 @@ def register_rag_routes(
             return None
         documents = result.get("documents") or []
         metadatas = result.get("metadatas") or []
+        metadata = dict(metadatas[0] or {}) if metadatas else {}
         return {
-            "chunk_id": str(ids[0]),
+            "chunk_id": str(metadata.get("chunk_id") or ids[0]),
             "text": str(documents[0]) if documents else "",
-            "metadata": dict(metadatas[0] or {}) if metadatas else {},
+            "metadata": metadata,
         }
 
     @app.post("/api/rag/ingest")

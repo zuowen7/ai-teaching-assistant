@@ -239,9 +239,11 @@ class RagPageIndexStore(PageIndexStore):
                 details={"doc_id": doc_id},
             ) from exc
 
-    async def get_chunk(self, chunk_id: str) -> Mapping[str, Any] | None:
+    async def get_chunk(
+        self, chunk_id: str, *, source_id: str | None = None
+    ) -> Mapping[str, Any] | None:
         try:
-            return await self._state["get_chunk"](chunk_id)
+            return await self._state["get_chunk"](chunk_id, source_id=source_id)
         except HTTPException as exc:
             raise LiteratureServiceError(
                 LiteratureServiceErrorCode.INDEX_STORE_UNAVAILABLE,
