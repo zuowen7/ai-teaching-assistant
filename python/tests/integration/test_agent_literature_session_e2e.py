@@ -74,12 +74,18 @@ class LibraryAgentProvider:
         self._helpers = helpers
         self.mode = mode
         self.turns = 0
+        self._baseline: int | None = None
+
+    def begin_turn(self) -> None:
+        """Forget earlier turns so a follow-up is planned from this turn alone."""
+
+        self._baseline = None
 
     # -- helpers ---------------------------------------------------------
     @staticmethod
-    def _results(messages) -> dict[str, list[ToolResultBlock]]:
+    def _results(messages, baseline: int = 0) -> dict[str, list[ToolResultBlock]]:
         by_name: dict[str, list[ToolResultBlock]] = {}
-        for message in messages:
+        for message in list(messages)[baseline:]:
             for block in getattr(message, "blocks", []):
                 if isinstance(block, ToolResultBlock):
                     by_name.setdefault(block.tool_name, []).append(block)
@@ -112,7 +118,9 @@ class LibraryAgentProvider:
         tool_choice="auto",
     ):
         self.turns += 1
-        by_name = self._results(messages)
+        if self._baseline is None:
+            self._baseline = len(messages)
+        by_name = self._results(messages, self._baseline)
 
         if "literature_sources" not in by_name:
             return self._call("literature_sources", {})
@@ -159,9 +167,19 @@ class LibraryAgentProvider:
         return self._answer(by_name, sources, source_ids=source_ids)
 
     def _answer(self, by_name, sources, *, source_ids=None, reuse=False):
-        if "literature_answer" in by_name:
-            answer = json.loads(by_name["literature_answer"][-1].output)
+        answers = by_name.get("literature_answer", [])
+        if answers:
+            answer = json.loads(answers[-1].output)
             if answer.get("status") == "insufficient":
+                if self.mode == "widen_after_insufficient":
+                    # Follow the tool's own next_actions: widen inside the project.
+                    already = answer.get("source_ids") or []
+                    remaining = [sid for sid in (source_ids or []) if sid not in already]
+                    if remaining:
+                        return self._call(
+                            "literature_answer",
+                            {"question": self._corpus.question, "source_ids": remaining},
+                        )
                 return self._say(
                     "证据不足：" + str(answer.get("insufficient_reason")) + "，我不会凭记忆回答。"
                 )
@@ -173,6 +191,9 @@ class LibraryAgentProvider:
         scope = source_ids or [
             item["source_id"] for item in sources["sources"] if item["already_indexed"]
         ]
+        if self.mode == "widen_after_insufficient" and scope:
+            # Start with the narrowest scope so the retry has room to widen.
+            scope = scope[:1]
         if not scope:
             return self._say("当前项目没有可用于回答的已索引文献。")
         return self._call(
@@ -200,6 +221,9 @@ class RoleRouter:
 
     def __init__(self) -> None:
         self.planner: LibraryAgentProvider | None = None
+        # Per-call script for the answering role, consumed in order.
+        self.answer_script: list[str] = []
+        self.answer_calls = 0
 
     @staticmethod
     def _is_answer_call(prompt: str, tools) -> bool:
@@ -217,23 +241,29 @@ class RoleRouter:
         prompt = messages[0].text_content() if messages else ""
         if self._is_answer_call(prompt, tools):
             evidence_ids = EVIDENCE_ID_RE.findall(prompt)
-            return ProviderResponse(
-                blocks=[
-                    TextBlock(
-                        text=json.dumps(
-                            {
-                                "claims": [
-                                    {
-                                        "text": "The selected demo papers report this protocol.",
-                                        "evidence_ids": evidence_ids,
-                                        "evidence_status": "supported",
-                                    }
-                                ]
-                            }
-                        )
-                    )
-                ]
+            mode = (
+                self.answer_script[self.answer_calls]
+                if self.answer_calls < len(self.answer_script)
+                else "supported"
             )
+            self.answer_calls += 1
+            if mode == "insufficient":
+                claims = [
+                    {
+                        "text": "The cited scope does not support an answer.",
+                        "evidence_ids": [],
+                        "evidence_status": "insufficient",
+                    }
+                ]
+            else:
+                claims = [
+                    {
+                        "text": "The selected demo papers report this protocol.",
+                        "evidence_ids": evidence_ids,
+                        "evidence_status": "supported",
+                    }
+                ]
+            return ProviderResponse(blocks=[TextBlock(text=json.dumps({"claims": claims}))])
         if self.planner is None:
             raise AssertionError("no planner script was installed for this turn")
         return await self.planner.chat(
@@ -366,6 +396,20 @@ def run_turn_sync(
     return asyncio.run(run_turn(runtime, message, decisions=decisions))
 
 
+def run_session_sync(runtime: ConversationRuntime, messages: list[str]) -> list[list]:
+    """Run several turns of one session inside a single event loop."""
+
+    import asyncio
+
+    async def drive() -> list[list]:
+        turns = []
+        for message in messages:
+            turns.append(await run_turn(runtime, message))
+        return turns
+
+    return asyncio.run(drive())
+
+
 def build_runtime(
     project: str, planner: LibraryAgentProvider, roles: RoleRouter
 ) -> ConversationRuntime:
@@ -473,6 +517,85 @@ def test_out_of_scope_source_is_refused_by_the_answer_tool(
     )
     assert answer_event.data.get("is_error") is True
     assert "source_not_found" in answer_event.data["output"]
+
+
+def test_insufficient_answer_leads_to_a_wider_scoped_retry(
+    client_and_patches, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """§2.4: when the evidence is insufficient, the Agent widens inside the project."""
+
+    client, app, corpus, helpers, test_dir, roles = client_and_patches
+    project = create_project(client, test_dir / "widen", "A1 Widen")
+    provider = LibraryAgentProvider(corpus, helpers, mode="widen_after_insufficient")
+    runtime = build_runtime(project, provider, roles)
+    roles.answer_script = ["insufficient"]
+    roles.answer_calls = 0
+    patch_tool_http(monkeypatch, app)
+
+    events = run_turn_sync(runtime, "先用最窄的范围回答")
+
+    answers = [
+        json.loads(event.data["output"])
+        for event in events
+        if event.type is AgentEventType.TOOL_RESULT
+        and event.data.get("tool_name") == "literature_answer"
+    ]
+    assert len(answers) == 2
+    assert answers[0]["status"] == "insufficient"
+    assert answers[0]["next_actions"] == [
+        "widen_scope_within_project",
+        "propose_new_query_for_confirmation",
+    ]
+    assert answers[0]["must_not_answer_from_memory"] is True
+
+    assert answers[1]["status"] == "answered"
+    assert len(answers[1]["source_ids"]) > len(answers[0]["source_ids"])
+    assert answers[1]["evidence"]
+
+    final = [e for e in events if e.type is AgentEventType.RESPONSE]
+    assert final and "引用证据" in final[-1].data.get("text", "")
+    assert "证据不足" not in final[-1].data.get("text", "")
+
+
+def test_follow_up_question_reuses_the_session_scope(
+    client_and_patches, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """§2.4: a follow-up in the same session answers without rebuilding anything."""
+
+    client, app, corpus, helpers, test_dir, roles = client_and_patches
+    project = create_project(client, test_dir / "followup", "A1 Follow-up")
+    provider = LibraryAgentProvider(corpus, helpers)
+    runtime = build_runtime(project, provider, roles)
+    roles.answer_script = []
+    roles.answer_calls = 0
+    patch_tool_http(monkeypatch, app)
+
+    import asyncio
+
+    provider.begin_turn()
+    first = asyncio.run(run_turn(runtime, "建库并回答"))
+    assert json.loads(output_for(first, "literature_answer"))["status"] == "answered"
+
+    # The follow-up sees the same session history.
+    provider.mode = "reuse_existing"
+    provider.begin_turn()
+
+    async def second_turn() -> list:
+        return await run_turn(runtime, "那这些论文的评测协议是什么？")
+
+    second = asyncio.run(second_turn())
+
+    second_calls = tool_names(second, AgentEventType.TOOL_CALL)
+    assert "literature_search" not in second_calls
+    assert "literature_import" not in second_calls
+    assert "literature_index" not in second_calls
+    assert "literature_acquire_fulltext" not in second_calls
+    assert second_calls == ["literature_sources", "literature_answer"]
+
+    answer = json.loads(output_for(second, "literature_answer"))
+    assert answer["status"] == "answered"
+    assert answer["claims"] and answer["evidence"]
+    assert answer["evidence"][0]["exact_quote"]
 
 
 def test_second_turn_reuses_existing_index_instead_of_reindexing(

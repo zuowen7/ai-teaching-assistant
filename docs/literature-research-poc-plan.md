@@ -289,7 +289,7 @@ indexing  -> index_failed
 | P2B 页级解析与索引 | 项目内容 API 保留页结构；页内 chunk；证据元数据；索引过期规则 | P1 | 任一检索 hit 均能解析回同一哈希文档的真实页码与精确原文 | 已完成（2026-09-22，见 5.6、5.8；含 M5 开放 PDF 获取） |
 | P3 证据问答 | 多文献选择、项目隔离检索、Evidence Answer Service、证据 UI、无证据拒答 | P2A + P2B | 每个渲染结论的证据均通过机器校验；无范围查询被拒绝 | 已完成（2026-09-29，见 5.9） |
 | P4 演示与技术评测 | 固定公开论文包、缓存路径、失败场景、重复运行、指标记录 | P3 | 在线与缓存模式均能完成同一演示脚本；失败不被伪装为成功 | 已完成（2026-09-29，见 5.10；"在线模式"由离线注入的 live provider 承担，真实 arXiv 运行仍为一次性人工冒烟） |
-| A1 单 Agent 接入 | 复用 Agent V2 规划任务、调用已验收服务、处理真实反馈与连续追问 | P4、M1–M10 全部门通过 | §2.4 场景通过；范围、证据和失败语义与服务入口一致；工具记录可复核 | 工具层与会话级验收已完成（2026-09-29，见 5.11、5.12）；多轮追问策略与真实在线会话未完成 |
+| A1 单 Agent 接入 | 复用 Agent V2 规划任务、调用已验收服务、处理真实反馈与连续追问 | P4、M1–M10 全部门通过 | §2.4 场景通过；范围、证据和失败语义与服务入口一致；工具记录可复核 | 工具层、会话级验收与前端引用展示已完成（2026-09-29，见 5.11、5.12）；真实在线会话与真实模型行为未验证 |
 | P5 后续候选 | 主题分类、第二公开源、Review/Argument Map、检索优化 | P4 | 逐项另行立项，不反向改变首版验收 | 未开始 |
 
 P2A 与 P2B 在 P1 合同冻结后可以并行；P3 不得在两者任一阶段门失败时提前开始。
@@ -653,12 +653,12 @@ M10 缓存路径规则：
 - 新增副作用工具 `literature_acquire_fulltext` 与 `literature_index`，使 Agent 能走完"检索 → 入库 → 获取开放全文 → 建立页级索引 → 证据问答"整条链；两者只调用既有服务接口，`access_unavailable` / `acquire_failed` 等失败码原样返回，工具描述要求失败时转告用户改用本地 PDF，不得声称已下载。
 - 确认不可绕过由注册契约保证：五个副作用工具的 `effects` 含 `network`，`ToolSpec.requires_approval` 为真，运行时在既有 `await_approval` 上暂停；即便会话开启自动批准，结果也会回显实际提交的检索式、`search_execution_id` + `paper_ids`、`question` + `source_ids`。
 - 证据不足必须改变下一步：`literature_answer` 在 `status=insufficient` 时额外返回 `next_actions=["widen_scope_within_project","propose_new_query_for_confirmation"]` 与 `must_not_answer_from_memory=true`，`answered` 时不返回这两个字段；工具描述写明"证据不足时不得凭记忆或常识作答"。
-- 会话级验收 `python/tests/integration/test_agent_literature_session_e2e.py` 4 例：真实 `ConversationRuntime` + 真实 `literature_*` 工具 + 真实应用（工具的 `SCHOLAR_API_BASE` 调用由 `httpx.ASGITransport` 直连同一应用，不启服务、不出网）。脚本模型只依据**真实工具结果**规划下一步，断言包括：七类副作用调用全部停在审批上且顺序与数量与导入结果一致；首个工具是 `literature_sources` 且初始 `source_count=0`；最终 `literature_answer` 为 `answered` 且每条证据都有真实页码与精确原文；拒绝审批时检索从未到达服务（结果中不出现 `search_exec_`）；越界 `source_id` 被服务以 `source_not_found` 拒绝；第二轮读到 `already_indexed` 后不再调用 `literature_index` 或 `literature_acquire_fulltext`。
+- 会话级验收 `python/tests/integration/test_agent_literature_session_e2e.py` 6 例：真实 `ConversationRuntime` + 真实 `literature_*` 工具 + 真实应用（工具的 `SCHOLAR_API_BASE` 调用由 `httpx.ASGITransport` 直连同一应用，不启服务、不出网）。脚本模型只依据**真实工具结果**规划下一步，断言包括：七类副作用调用全部停在审批上且顺序与数量与导入结果一致；首个工具是 `literature_sources` 且初始 `source_count=0`；最终 `literature_answer` 为 `answered` 且每条证据都有真实页码与精确原文；拒绝审批时检索从未到达服务（结果中不出现 `search_exec_`）；越界 `source_id` 被服务以 `source_not_found` 拒绝；第二轮读到 `already_indexed` 后不再调用 `literature_index` 或 `literature_acquire_fulltext`；**证据不足时按 `next_actions` 在同一项目内扩大 `source_ids` 重问并得到 `answered`**；**同一会话的追问只调用 `literature_sources` + `literature_answer`，不重新检索或重建索引**。
 - 会话级测试暴露一个真实缺陷并已修复：`literature_sources` 最初用工作区 UI 字段 `rag_status == "ready"` 判定 `already_indexed`，而该字段由前端在索引后自行更新——服务端索引成功时它仍是 `unavailable`，于是第二轮会重复索引。现在判定改为服务端写入的 literature 元数据（全文状态 `indexed` 或存在 `index` 记录），并有单元用例固化"UI 字段为 unavailable 但服务端已索引时 `already_indexed` 必须为真"。
 - 前端引用展示：新增 `AgentLiteratureEvidence.vue`（结论 → 可展开的页码级证据；`insufficient` 只显示原因；非合法 JSON 回退原文）；`AgentExecutionGroup.vue` 仅在工具名为 `literature_answer` 时改用该渲染器，SSE 事件名与 `tool_name` 契约未改动。
-- 测试与检查：`test_literature_agent_tools.py` 扩展到 39 例；前端 `AgentLiteratureEvidence.test.ts` 6 例与 `agentExecution.test.ts` 渲染分流 1 例（该文件改为保留真实 `createI18n`，使组件内 i18n 回退可被真实语言包校验）。全量后端为 `3022 passed, 14 skipped, 8 failed`，8 个失败仍是 §5.3–5.5 已记录且可在 `071c6b0` 复现的既存/环境问题；前端全量为 `869 passed`，Prettier、ESLint、`vue-tsc` 全部通过。
+- 测试与检查：`test_literature_agent_tools.py` 扩展到 39 例；会话级 6 例；前端 `AgentLiteratureEvidence.test.ts` 6 例与 `agentExecution.test.ts` 渲染分流 1 例（该文件改为保留真实 `createI18n`，使组件内 i18n 回退可被真实语言包校验）。全量后端为 `3024 passed, 14 skipped, 8 failed`，8 个失败仍是 §5.3–5.5 已记录且可在 `071c6b0` 复现的既存/环境问题；前端全量为 `869 passed`，Prettier、ESLint、`vue-tsc` 全部通过。
 - 工具失败与调用上限沿用 Agent V2 既有机制，未新增独立限制：连续工具错误上限由 `_DEFAULT_MAX_TOOL_ERRORS`（选择期 `_SELECTION_MAX_TOOL_ERRORS`）控制，回归用例为 `tests/agent_v2/test_conversation_runtime.py::test_tool_error_limit_counts_consecutive_failures`；停滞调用上限由 `max_stalled_tool_calls` 控制。
-- **仍未完成（A1 剩余部分）**：多轮追问仍完全依赖模型依据工具反馈自行决定，没有策略层保证；真实在线 arXiv 下的 Agent 会话未自动化；`methods/literature_poc/METHODOLOGY.md` 仍未建立。§2.4 的八项验收场景现已由会话级用例覆盖其中六项（计划与确认、跳过重复处理、证据不足、用户取消、工具失败与越界拒绝），"证据不足时补充范围内检索或提出新检索计划"只由 `next_actions` 提示、未验证模型是否照做。
+- **仍未完成（A1 剩余部分）**：真实在线 arXiv 下的 Agent 会话未自动化（仍按 D-024 只做一次性人工冒烟）；`methods/literature_poc/METHODOLOGY.md` 仍未建立；多轮追问与"证据不足后补检索"由工具反馈驱动，会话级用例证明了**脚本模型按提示行动时链路成立**，但**没有**证明任意真实模型都会照做（这属于模型行为，不是确定性的系统保证，不得写成系统保证）。§2.4 的八项验收场景现已全部有对应覆盖：计划与确认、跳过重复处理、证据不足后补检索、用户取消、工具失败与调用上限（沿用既有回归）、跨项目与未选文献拒绝、最终证据与普通服务入口一致（同一 `/api/literature/answer` 响应）。
 - 本节结果只证明"Agent 能读到项目范围、确认不可绕过、证据不足有明确的下一步、引用在界面上可展开核对，且整条链在会话中真的跑通"，不证明检索质量、回答正确性、教学效果或 A1 整体验收通过。
 
 ## 6. 验证与毕设方法边界
