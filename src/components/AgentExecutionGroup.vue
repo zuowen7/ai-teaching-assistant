@@ -42,7 +42,11 @@
           </div>
           <div v-if="step.result" class="detail-section">
             <span>{{ t('agent.execution.result') }}</span>
-            <pre :class="{ error: step.status === 'error' }">{{
+            <AgentLiteratureEvidence
+              v-if="step.toolName === 'literature_answer'"
+              :result="step.resultDetail || step.result"
+            />
+            <pre v-else :class="{ error: step.status === 'error' }">{{
               truncate(step.resultDetail || step.result)
             }}</pre>
           </div>
@@ -56,6 +60,7 @@
 import { computed, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 
+import AgentLiteratureEvidence from './AgentLiteratureEvidence.vue'
 import type { AgentEvent } from '../types'
 import {
   buildExecutionSteps,

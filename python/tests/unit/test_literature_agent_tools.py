@@ -49,6 +49,13 @@ class _Client:
                 return response
         raise AssertionError(f"unexpected request: {url}")
 
+    async def get(self, url: str, *, params: dict | None = None):
+        self._calls.append((url, params or {}))
+        for suffix, response in self._responses.items():
+            if url.endswith(suffix):
+                return response
+        raise AssertionError(f"unexpected request: {url}")
+
 
 def build_registry(tmp_path: Path | None = None) -> ToolRegistry:
     registry = ToolRegistry(tmp_path)
@@ -135,9 +142,15 @@ class TestToolRegistrationContract:
         assert registry.get("literature_search") is not None
         assert registry.get("literature_import") is not None
         assert registry.get("literature_answer") is not None
+        assert registry.get("literature_sources") is not None
 
     @pytest.mark.parametrize(
-        "tool_name", ["literature_search", "literature_import", "literature_answer"]
+        "tool_name",
+        [
+            "literature_search",
+            "literature_import",
+            "literature_answer",
+        ],
     )
     def test_confirmed_calls_use_the_exact_input_approval_scope(self, tool_name: str) -> None:
         spec = build_registry().get(tool_name)
@@ -147,10 +160,27 @@ class TestToolRegistrationContract:
         assert spec.network_scope is not None
         assert "local-literature-api" in set(spec.network_scope)
 
+    @pytest.mark.parametrize(
+        "tool_name",
+        ["literature_search", "literature_import", "literature_answer"],
+    )
+    def test_confirmed_calls_still_require_approval(self, tool_name: str) -> None:
+        """The effects must keep ``requires_approval`` true (plan 5.12 rule 2)."""
+
+        spec = build_registry().get(tool_name)
+
+        assert spec is not None
+        assert spec.requires_approval is True
+
     def test_literature_tools_never_ask_for_a_project_path(self) -> None:
         registry = build_registry()
 
-        for tool_name in ("literature_search", "literature_import", "literature_answer"):
+        for tool_name in (
+            "literature_search",
+            "literature_import",
+            "literature_answer",
+            "literature_sources",
+        ):
             schema = registry.get(tool_name).definition.input_schema
             assert "project_path" not in schema.get("properties", {})
             assert "project_root" not in schema.get("properties", {})
@@ -419,6 +449,160 @@ class TestLiteratureAnswerTool:
 
         assert result.is_error is True
         assert "source_not_found" in result.output
+
+
+SOURCES_PAYLOAD = {
+    "sources": [
+        {
+            "id": "src_demo_0001",
+            "title": "Demo Paper A",
+            "original_path": "D:/proj/references/a.pdf",
+            "rag_status": "ready",
+            "metadata": {"literature": {"fulltext": {"status": "indexed"}}, "paper_id": "paper_a"},
+        },
+        {
+            "id": "src_demo_0003",
+            "title": "Demo Paper C",
+            "original_path": None,
+            "rag_status": "unavailable",
+            "metadata": {"literature": {"fulltext": {"status": "metadata_only"}}},
+        },
+    ]
+}
+
+
+class TestLiteratureSourcesTool:
+    async def test_sources_describe_the_project_scope_and_its_index_state(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        calls: list[tuple[str, dict]] = []
+        patch_client(monkeypatch, {"/api/project/sources": _Response(SOURCES_PAYLOAD)}, calls)
+        registry = build_registry(tmp_path)
+
+        result = await registry.execute("literature_sources", {})
+
+        assert result.is_error is False
+        url, params = calls[0]
+        assert url.endswith("/api/project/sources")
+        assert params["project_path"] == str(tmp_path.resolve())
+
+        payload = json.loads(result.output)
+        assert payload["project_root"] == str(tmp_path.resolve())
+        first, second = payload["sources"]
+        assert first["source_id"] == "src_demo_0001"
+        assert first["title"] == "Demo Paper A"
+        assert first["rag_status"] == "ready"
+        assert first["fulltext_status"] == "indexed"
+        assert first["already_indexed"] is True
+        assert first["has_fulltext"] is True
+        assert second["rag_status"] == "unavailable"
+        assert second["already_indexed"] is False
+        assert second["has_fulltext"] is False
+
+    async def test_sources_is_refused_without_a_workspace(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        calls: list[tuple[str, dict]] = []
+        patch_client(monkeypatch, {}, calls)
+        registry = build_registry(None)
+
+        result = await registry.execute("literature_sources", {})
+
+        assert result.is_error is True
+        assert "project_scope_unavailable" in result.output
+        assert calls == []
+
+    async def test_sources_reports_service_failure(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        calls: list[tuple[str, dict]] = []
+        patch_client(
+            monkeypatch,
+            {"/api/project/sources": _Response({"detail": "boom"}, status_code=500)},
+            calls,
+        )
+        registry = build_registry(tmp_path)
+
+        result = await registry.execute("literature_sources", {})
+
+        assert result.is_error is True
+        assert "500" in result.output
+
+
+class TestAnswerNextActions:
+    async def test_insufficient_answer_offers_scoped_next_actions(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        calls: list[tuple[str, dict]] = []
+        patch_client(
+            monkeypatch,
+            {
+                "/api/literature/answer": _Response(
+                    {
+                        **ANSWER_PAYLOAD,
+                        "status": "insufficient",
+                        "insufficient_reason": "no_resolvable_evidence",
+                        "claims": [],
+                        "evidence": [],
+                    }
+                )
+            },
+            calls,
+        )
+        registry = build_registry(tmp_path)
+
+        result = await registry.execute(
+            "literature_answer", {"question": "Q?", "source_ids": ["src_demo_0001"]}
+        )
+
+        payload = json.loads(result.output)
+        assert payload["next_actions"] == [
+            "widen_scope_within_project",
+            "propose_new_query_for_confirmation",
+        ]
+        assert payload["must_not_answer_from_memory"] is True
+        # The submitted scope is echoed so the session record can be reviewed.
+        assert payload["question"] == "Q?"
+        assert payload["source_ids"] == ["src_demo_0001"]
+
+    async def test_answered_result_offers_no_next_actions(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        calls: list[tuple[str, dict]] = []
+        patch_client(monkeypatch, {"/api/literature/answer": _Response(ANSWER_PAYLOAD)}, calls)
+        registry = build_registry(tmp_path)
+
+        result = await registry.execute(
+            "literature_answer", {"question": "Q?", "source_ids": ["src_demo_0001"]}
+        )
+
+        payload = json.loads(result.output)
+        assert "next_actions" not in payload
+        assert "must_not_answer_from_memory" not in payload
+
+    async def test_import_echoes_the_confirmed_selection(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        calls: list[tuple[str, dict]] = []
+        patch_client(
+            monkeypatch,
+            {
+                "/api/literature/import": _Response(
+                    {"created_count": 1, "reused_count": 0, "results": []}
+                )
+            },
+            calls,
+        )
+        registry = build_registry(tmp_path)
+
+        result = await registry.execute(
+            "literature_import",
+            {"search_execution_id": EXECUTION_ID, "paper_ids": ["paper_demo_0001"]},
+        )
+
+        payload = json.loads(result.output)
+        assert payload["search_execution_id"] == EXECUTION_ID
+        assert payload["paper_ids"] == ["paper_demo_0001"]
 
 
 class TestRagSearchScope:

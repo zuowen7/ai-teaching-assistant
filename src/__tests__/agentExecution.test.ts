@@ -1,19 +1,30 @@
 import { mount } from '@vue/test-utils'
 import { describe, expect, it, vi } from 'vitest'
 
-vi.mock('vue-i18n', () => ({
-  useI18n: () => ({
-    t: (key: string, params?: Record<string, number | string>) => {
-      if (key === 'agent.execution.title') return '执行过程'
-      if (key === 'agent.execution.completed') return `已完成 · ${params?.count} 步`
-      if (key === 'agent.execution.failed')
-        return `共 ${params?.count} 步 · ${params?.failed} 步失败`
-      if (key === 'agent.execution.readFile') return `读取 ${params?.target}`
-      if (key === 'agent.execution.editFile') return `修改 ${params?.target}`
-      return key
-    },
-  }),
-}))
+vi.mock('vue-i18n', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('vue-i18n')>()
+  const zhCN = (await import('../i18n/locales/zh-CN.json')).default
+  const composer = actual.createI18n({
+    legacy: false,
+    locale: 'zh-CN',
+    fallbackLocale: 'zh-CN',
+    messages: { 'zh-CN': zhCN },
+  })
+  return {
+    ...actual,
+    useI18n: () => ({
+      t: (key: string, params?: Record<string, number | string>) => {
+        if (key === 'agent.execution.title') return '执行过程'
+        if (key === 'agent.execution.completed') return `已完成 · ${params?.count} 步`
+        if (key === 'agent.execution.failed')
+          return `共 ${params?.count} 步 · ${params?.failed} 步失败`
+        if (key === 'agent.execution.readFile') return `读取 ${params?.target}`
+        if (key === 'agent.execution.editFile') return `修改 ${params?.target}`
+        return params ? composer.global.t(key, params) : composer.global.t(key)
+      },
+    }),
+  }
+})
 
 import AgentExecutionGroup from '../components/AgentExecutionGroup.vue'
 import type { AgentEvent } from '../types'
@@ -146,6 +157,55 @@ describe('agent execution presentation', () => {
     const steps = buildExecutionSteps(resultEvents)
     expect(steps[0].result).toBe(longResult.slice(0, 200))
     expect(steps[0].resultDetail).toBe(longResult)
+  })
+
+  it('renders a literature answer as citations and other tools as raw text', () => {
+    const answer = JSON.stringify({
+      status: 'answered',
+      insufficient_reason: null,
+      claims: [
+        {
+          text: '评估使用了留出集。',
+          evidence_ids: [`evidence_${'a'.repeat(24)}`],
+          evidence_status: 'supported',
+        },
+      ],
+      evidence: [
+        {
+          evidence_id: `evidence_${'a'.repeat(24)}`,
+          source_id: 'src_demo_0001',
+          title: 'Demo Paper A',
+          page: 2,
+          exact_quote: 'Only this page mentions the held-out split.',
+          context_before: '',
+          context_after: '',
+        },
+      ],
+      rejected_claims: [],
+      unresolved_count: 0,
+    })
+    const literatureEvents: AgentEvent[] = [
+      {
+        type: 'tool_call',
+        content: 'literature_answer',
+        event_id: 'lit-1',
+        metadata: { tool_name: 'literature_answer', args: { question: 'Q?' } },
+      },
+      {
+        type: 'tool_result',
+        content: answer,
+        event_id: 'lit-1',
+        metadata: { tool_name: 'literature_answer' },
+      },
+    ]
+
+    const wrapper = mount(AgentExecutionGroup, { props: { events: literatureEvents } })
+
+    expect(wrapper.find('[data-testid="literature-answer"]').exists()).toBe(true)
+    expect(wrapper.get('[data-testid="literature-claim"]').text()).toContain('评估使用了留出集。')
+    // The result is rendered as citations, not as raw JSON.
+    expect(wrapper.find('[data-testid="literature-raw"]').exists()).toBe(false)
+    expect(wrapper.text()).not.toContain('"exact_quote"')
   })
 
   it('only treats unmatched approvals as pending attention', () => {

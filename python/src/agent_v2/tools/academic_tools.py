@@ -700,6 +700,8 @@ def register_academic_tools(registry: ToolRegistry) -> None:
             "created_count": batch.get("created_count", 0),
             "reused_count": batch.get("reused_count", 0),
             "metadata_updated_count": batch.get("metadata_updated_count", 0),
+            "search_execution_id": execution_id,
+            "paper_ids": paper_ids,
             "sources": [
                 {
                     "paper_id": item.get("paper_id"),
@@ -715,6 +717,67 @@ def register_academic_tools(registry: ToolRegistry) -> None:
                 "source_kind": "literature_import",
                 "created_count": payload["created_count"],
                 "reused_count": payload["reused_count"],
+            },
+        )
+
+    async def literature_sources(args: dict) -> ToolResult:
+        """List the current project's literature scope and its index state.
+
+        The Agent needs this to plan inside one project and to skip work that is
+        already done (``already_indexed``), instead of re-indexing or guessing
+        which sources exist.
+        """
+
+        project = _workspace_project()
+        if isinstance(project, ToolResult):
+            return project
+        limit = max(1, min(int(args.get("limit", 50)), 200))
+        try:
+            import httpx
+
+            api_base = os.environ.get("SCHOLAR_API_BASE", "http://localhost:18088")
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.get(
+                    f"{api_base}/api/project/sources",
+                    params={"project_path": project},
+                )
+                if response.status_code != 200:
+                    return _service_error(response, action="literature_sources")
+                payload = response.json()
+        except Exception as exc:  # noqa: BLE001
+            return ToolResult(f"literature sources lookup failed: {exc}", is_error=True)
+
+        sources = []
+        for source in (payload.get("sources") or [])[:limit]:
+            metadata = source.get("metadata") if isinstance(source.get("metadata"), dict) else {}
+            literature = metadata.get("literature") if isinstance(metadata, dict) else None
+            fulltext = literature.get("fulltext") if isinstance(literature, dict) else None
+            original_path = source.get("original_path")
+            sources.append(
+                {
+                    "source_id": source.get("id"),
+                    "title": source.get("title"),
+                    "year": metadata.get("year"),
+                    "rag_status": source.get("rag_status"),
+                    "fulltext_status": (fulltext or {}).get("status"),
+                    "already_indexed": source.get("rag_status") == "ready",
+                    "has_fulltext": bool(original_path),
+                    "is_literature": isinstance(literature, dict),
+                    "paper_id": metadata.get("paper_id"),
+                }
+            )
+        result = {
+            "project_root": project,
+            "source_count": len(sources),
+            "indexed_count": sum(1 for item in sources if item["already_indexed"]),
+            "sources": sources,
+        }
+        return ToolResult(
+            json.dumps(result, ensure_ascii=False),
+            metadata={
+                "source_kind": "literature_sources",
+                "source_count": result["source_count"],
+                "indexed_count": result["indexed_count"],
             },
         )
 
@@ -774,6 +837,10 @@ def register_academic_tools(registry: ToolRegistry) -> None:
         payload = {
             "status": answer.get("status"),
             "insufficient_reason": answer.get("insufficient_reason"),
+            # Echo the submitted scope so the session record stays reviewable even
+            # when the session runs with auto-approval enabled.
+            "question": question,
+            "source_ids": source_ids,
             "claims": [
                 {
                     "text": claim.get("text"),
@@ -794,6 +861,14 @@ def register_academic_tools(registry: ToolRegistry) -> None:
                 "config_hash": answer.get("model_config_hash"),
             },
         }
+        if payload["status"] == "insufficient":
+            # Plan 5.12 rule 3: an insufficiency must change the next step rather
+            # than invite an answer from memory.
+            payload["next_actions"] = [
+                "widen_scope_within_project",
+                "propose_new_query_for_confirmation",
+            ]
+            payload["must_not_answer_from_memory"] = True
         return ToolResult(
             json.dumps(payload, ensure_ascii=False),
             metadata={
@@ -857,7 +932,8 @@ def register_academic_tools(registry: ToolRegistry) -> None:
     registry.register(
         "literature_search",
         "Search structured literature. Requires the exact search query the user "
-        "confirmed; returns normalized records with their access state.",
+        "confirmed; returns normalized records with their access state. Call "
+        "literature_sources first to reuse an existing project scope.",
         {
             "type": "object",
             "properties": {
@@ -884,6 +960,21 @@ def register_academic_tools(registry: ToolRegistry) -> None:
         effects={"network"},
         approval_scope="exact-input",
         network_scope={"local-literature-api"},
+    )
+
+    registry.register(
+        "literature_sources",
+        "List the current project's literature sources with their index and full-text "
+        "state. Call this before searching or indexing so already indexed sources are "
+        "not processed twice.",
+        {
+            "type": "object",
+            "properties": {
+                "limit": {"type": "integer", "minimum": 1, "maximum": 200, "default": 50},
+            },
+        },
+        literature_sources,
+        permission="read-only",
     )
 
     registry.register(
@@ -914,7 +1005,9 @@ def register_academic_tools(registry: ToolRegistry) -> None:
         "literature_answer",
         "Answer a research question from evidence in the selected project sources. "
         "Requires an explicit source_ids scope; every claim comes back with its "
-        "page and exact quote, or the result states the evidence is insufficient.",
+        "page and exact quote. When the result says insufficient, do NOT answer "
+        "from memory or general knowledge: either widen the scope inside the "
+        "project or propose a new search query for the user to confirm.",
         {
             "type": "object",
             "properties": {

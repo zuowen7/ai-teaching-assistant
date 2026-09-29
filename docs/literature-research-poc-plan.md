@@ -580,8 +580,9 @@ M10 缓存路径规则：
 
 | 类型 | 路径 | 职责 |
 |---|---|---|
-| 修改 | `python/src/agent_v2/tools/academic_tools.py` | 移除 `arxiv_search`；新增 `literature_search` / `literature_import` / `literature_answer`；`rag_search` 改为强制范围内 |
+| 修改 | `python/src/agent_v2/tools/academic_tools.py` | 移除 `arxiv_search`；新增 `literature_search` / `literature_import` / `literature_answer` / `literature_sources`；`rag_search` 改为强制范围内 |
 | 新增 | `python/tests/unit/test_literature_agent_tools.py` | 工具层契约：工作区范围、确认元数据、结构化结果、失败码 |
+| 新增 | `src/components/AgentLiteratureEvidence.vue` | 把 `literature_answer` 的工具结果渲染成结论与页码级证据（见 §5.12） |
 | 修改 | `python/tests/agent_v2/test_academic_tools.py`、`test_router_prompt.py` | 按 D-031 重写旧 arXiv 工具与工具清单用例 |
 
 规则（冻结）：
@@ -612,6 +613,48 @@ M10 缓存路径规则：
 - 全量后端为 `2998 passed, 14 skipped, 8 failed`；8 个失败仍是 §5.3–5.5 已记录且可在 `071c6b0` 复现的既存/环境问题，未出现 A1 工具层改造引入的新失败；前端全量为 `862 passed` 并通过 Prettier、ESLint 与 `vue-tsc`。
 - **仍未完成（A1 剩余部分）**：Agent 前端侧的计划展示、确认交互、状态与引用渲染未改造（`AgentExecutionGroup.vue` 只补了工具名到标签的映射：`literature_search` → 检索项目文献、`literature_answer` → 基于证据回答）；连续追问的会话级编排、证据不足时由 Agent 主动补充范围内检索或提出新检索计划的策略、以及 §2.4 八项验收场景的会话级覆盖都还没有实现或测试。**因此 A1 未通过阶段门，不能报告"智能体版本已完成"。**
 - 本节结果只证明"Agent 只能通过确定性服务、在项目范围内、经用户确认地访问文献与证据"，不证明检索质量、回答正确性、教学效果或 A1 整体验收通过。
+
+### 5.12 A1 会话与前端规格（2026-09-29，文档先行）
+
+§5.11 只覆盖了工具层。本节冻结 A1 余下部分：会话侧的计划可见性、确认不可绕过、证据不足后的下一步，以及前端引用展示。
+
+影响文件：
+
+| 类型 | 路径 | 职责 |
+|---|---|---|
+| 修改 | `python/src/agent_v2/tools/academic_tools.py` | 新增只读的 `literature_sources`；`literature_answer` 在证据不足时返回 `next_actions` |
+| 新增 | `src/components/AgentLiteratureEvidence.vue` | 把 `literature_answer` 的结果渲染成结论与证据卡片 |
+| 修改 | `src/components/AgentExecutionGroup.vue` | 命中文献应答结果时改用证据渲染器，其余工具保持原样 |
+| 修改 | `python/tests/unit/test_literature_agent_tools.py`、`src/__tests__/` | 覆盖新增契约 |
+
+规则（冻结）：
+
+1. **计划可见**。Agent 在检索前必须能列出当前项目的文献范围与索引状态：`literature_sources` 返回每条来源的 `source_id`、题名、年份、`rag_status`、全文状态、`original_path` 是否存在与 `paper_id`；对 `rag_status=ready` 的来源，工具结果显式标注 `already_indexed=true`，使"已有索引下跳过重复处理"是**读得到的事实**而不是模型的猜测。
+2. **确认不可绕过**。`literature_search` / `literature_import` / `literature_answer` 的 `effects` 必须包含 `network`，使 `ToolSpec.requires_approval` 为真；即使会话开启了自动批准，工具结果也必须在文本中回显实际提交的检索式、`paper_ids` 与 `source_ids`，让执行记录可复核。
+3. **证据不足必须改变下一步**。`literature_answer` 在 `status=insufficient` 时返回 `next_actions`（`widen_scope_within_project` / `propose_new_query_for_confirmation`）与 `must_not_answer_from_memory=true`；工具描述同时写明"证据不足时不得凭记忆或常识作答"。`status=answered` 时不返回 `next_actions`。
+4. **前端引用展示**。`literature_answer` 的工具结果在会话中渲染为结论列表，每条结论可展开其证据（题名、页码、精确原文、上下文）；`status=insufficient` 时只显示不足原因、不显示任何结论；结果不是合法 JSON 时回退到原始文本，**不得隐藏或改写工具结果**。
+5. 其余工具（含 `literature_search` / `literature_import`）继续由现有 `AgentExecutionGroup` 渲染，不新增平行面板，也不改变既有 SSE 事件名与 `tool_name` 契约。
+
+分层验收：
+
+| 层 | 位置 | 必须证明 |
+|---|---|---|
+| 单元 | `python/tests/unit/test_literature_agent_tools.py` | `literature_sources` 的工作区范围与字段、`already_indexed` 标记、无工作区即失败；三个确认工具的 `requires_approval` 为真；`next_actions` 只在 `insufficient` 时出现；结果回显提交的检索式/论文/范围 |
+| 前端 | `src/__tests__/AgentLiteratureEvidence.test.ts` | 结论与证据渲染、证据展开与收起、`insufficient` 只显示原因、非 JSON 结果回退为原文、无证据的结论不产生空白卡片 |
+
+本阶段仍不做：多轮追问的自动策略引擎（由模型依据工具反馈决定）、真实在线 arXiv 的自动化运行、以及把 Agent 会话历史作为证据来源（证据只能来自 §5.9 的服务）。
+
+分层结果（2026-09-29，A1 会话与前端部分）：
+
+- 新增只读 `literature_sources`：返回工作区项目的文献范围与状态（`source_id`、题名、年份、`rag_status`、`fulltext_status`、`has_fulltext`、`is_literature`、`paper_id`），并对 `rag_status=ready` 的来源显式标注 `already_indexed=true`；因此"已有索引下跳过重复处理"是工具结果里读得到的事实，而不是模型猜测。它不声明 `effects`，所以不会被审批打断（只读项目元数据）。
+- 确认不可绕过由注册契约保证：三个确认工具的 `effects` 含 `network`，`ToolSpec.requires_approval` 为真，运行时在既有 `await_approval` 上暂停；即使会话开启自动批准，三个工具的结果也会回显实际提交的检索式（`confirmed_query`）、`search_execution_id` + `paper_ids`、以及 `question` + `source_ids`，使执行记录仍可复核。
+- 证据不足必须改变下一步：`literature_answer` 在 `status=insufficient` 时额外返回 `next_actions=["widen_scope_within_project","propose_new_query_for_confirmation"]` 与 `must_not_answer_from_memory=true`，`status=answered` 时不返回这两个字段；工具描述也写明"证据不足时不得凭记忆或常识作答"。
+- 前端引用展示：新增 `AgentLiteratureEvidence.vue`，把 `literature_answer` 的结果渲染为"结论 → 可展开的页码级证据（题名 / 第 N 页 / 精确原文 / 前后文）"，并显示未通过校验的结论数与未解析片段数；`insufficient` 时只显示不足原因、不渲染任何结论；结果不是合法 JSON 或缺字段时**回退显示原始文本**。`AgentExecutionGroup.vue` 只在工具名为 `literature_answer` 时改用该渲染器，其余工具保持原样，SSE 事件名与 `tool_name` 契约未改动。
+- 测试：`python/tests/unit/test_literature_agent_tools.py` 扩展到 28 例（新增 `literature_sources` 的三例、`requires_approval` 的三例、`next_actions` 的有/无两例、导入回显一例）；前端新增 `src/__tests__/AgentLiteratureEvidence.test.ts` 6 例与 `agentExecution.test.ts` 中的渲染分流一例（该文件同时改为保留真实 `createI18n`，使组件内的 i18n 回退逻辑可被真实语言包校验）。前端全量为 `869 passed`，Prettier、ESLint、`vue-tsc` 全部通过。
+- 工具失败与调用上限沿用 Agent V2 既有机制，未新增独立限制：连续工具错误上限由 `_DEFAULT_MAX_TOOL_ERRORS`（选择期 `_SELECTION_MAX_TOOL_ERRORS`）控制，已有回归用例 `tests/agent_v2/test_conversation_runtime.py::test_tool_error_limit_counts_consecutive_failures`；停滞调用上限由 `max_stalled_tool_calls` 控制，`tests/conversation_runtime` 中有 9 处覆盖。
+- 全量后端为 `3007 passed, 14 skipped, 8 failed`；8 个失败仍是 §5.3–5.5 已记录且可在 `071c6b0` 复现的既存/环境问题，未出现本轮改造引入的新失败。
+- **仍未完成（A1 剩余部分）**：§2.4 八项验收中"新问题下的计划与确认""用户取消""跨项目与未选文献拒绝""最终证据与普通服务入口一致"目前只由工具层与前端组件层用例分别覆盖，**没有**端到端的会话级用例（真实 SSE 会话 + 审批 + 多轮）；多轮追问仍完全依赖模型依据工具反馈自行决定，没有策略层保证。因此 A1 仍**未通过阶段门**。
+- 本节结果只证明"Agent 能读到项目范围、确认不可绕过、证据不足有明确的下一步、引用在界面上可展开核对"，不证明检索质量、回答正确性、教学效果或 A1 整体验收通过。
 
 ## 6. 验证与毕设方法边界
 
@@ -769,7 +812,7 @@ M10 缓存路径规则：
 | 修改 | `python/src/utils/atomic_io.py` | 提供同进程路径级可重入事务锁；不承诺跨进程协调 | P2A.2 后端已实现 |
 | 修改 | `python/routers/rag.py` | 页级 chunk、证据 metadata、索引版本和范围约束；P3 把范围检索抽成路由与问答服务共用的调用，并按 D-032 把存储键改为 `<doc_id>::<chunk_id>` | P2B 已实现（新增 `project_scoped` 查询模式；展平通道保持不变）；P3 进行中 |
 | 修改 | `src/composables/useSourceLibrary.ts` | P2B：把"建立索引"动作切到页级证据通道（PDF + 文献条目），其它来源保持展平通道 | P2B 已实现 |
-| 修改 | `python/src/agent_v2/tools/academic_tools.py` | 用结构化 Literature/RAG 工具替代原始 XML 与无范围查询 | 未开始 |
+| 修改 | `python/src/agent_v2/tools/academic_tools.py` | 用结构化 Literature/RAG 工具替代原始 XML 与无范围查询；A1 增加 `literature_sources` 与证据不足后的 `next_actions` | A1 工具层已实现（2026-09-29，见 5.11、5.12） |
 | 新增 | `src/composables/useLiteratureDiscovery.ts` | 检索、选择、入库和状态管理 | P2A.3 已实现 |
 | 新增 | `src/composables/useLiteratureAnswer.ts` | P3 多文献范围选择、问答请求、结论与证据状态（§5.9） | 未开始 |
 | 修改 | `src/components/SourceLibraryView.vue` | P2A.3：公开发现、检索计划确认、结果回执和多选入库；P3 增加多文献问答、证据展开与"获取开放全文"入口 | P2A.3 已实现；P3 未开始 |
