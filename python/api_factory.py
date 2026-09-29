@@ -977,9 +977,33 @@ def create_app(*, cloud_only: bool = False) -> FastAPI:
     )
     from src.agent_v2.router import _create_provider
     from src.literature.answer_model import AgentProviderAnswerModel
+    from src.literature.demo_corpus import (
+        DemoCorpusError,
+        build_fixture_provider,
+        load_demo_corpus,
+    )
     from src.literature.fulltext import HttpFullTextDownloader
     from src.literature.providers.arxiv import ArxivProvider
     from src.literature.service import LiteratureService
+
+    _literature_providers: list = [ArxivProvider()]
+    # M10/D-033: the fixed demo corpus only adds an explicitly labelled offline
+    # provider.  A missing or corrupt corpus degrades to "no cached provider"; it
+    # never blocks startup and never masquerades as the live provider.
+    try:
+        _demo_corpus = load_demo_corpus()
+    except DemoCorpusError as exc:
+        logger.warning("Demo corpus unavailable (%s); fixture provider not registered", exc.code)
+    else:
+        _demo_fixture = build_fixture_provider(_demo_corpus)
+        if any(provider.name == _demo_fixture.name for provider in _literature_providers):
+            logger.warning(
+                "A provider named %s is already registered; demo corpus not added",
+                _demo_fixture.name,
+            )
+        else:
+            _literature_providers.append(_demo_fixture)
+            logger.info("Demo corpus %s registered as the fixture provider", _demo_corpus.corpus_id)
 
     # P3 answer model: reuse the existing Agent provider factory instead of
     # introducing a second provider-selection path (decision D-028).
@@ -1013,7 +1037,7 @@ def create_app(*, cloud_only: bool = False) -> FastAPI:
     state_literature = register_literature_routes(
         app,
         service=LiteratureService(
-            providers=[ArxivProvider()],
+            providers=_literature_providers,
             project_store=ProjectSourceManifestStore(),
             index_store=RagPageIndexStore(state_rag),
             downloader=HttpFullTextDownloader(),

@@ -1,8 +1,8 @@
 # 科研辅助 PoC 规划与实施合同
 
-> 状态：生效；G0、P1、P2A、P2B 已完成；P3 规格已冻结（§5.9）而实现未完成；P4、A1 及后续候选 P5 未开始，科研辅助 PoC 尚未整体跑通
+> 状态：生效；G0、P1、P2A、P2B、P3、P4 已完成；A1 及后续候选 P5 未开始，科研辅助 PoC 的确定性链路已跑通而智能体接入待完成
 >
-> 当前基线：`teaching-refactor@9293a26`（P2B 与 M5 已提交并推送）
+> 当前基线：`teaching-refactor@b856dcf`（P4 提交后更新）
 >
 > 生效日期：2026-09-20
 >
@@ -287,8 +287,8 @@ indexing  -> index_failed
 | P1 合同与夹具 | 建立规范化模型、Provider 接口、失败语义、FixtureProvider 和契约测试 | G0 | FixtureProvider 完整通过同一公开接口；无 UI 依赖 | 已完成（2026-09-20） |
 | P2A 文献发现与入库 | ArxivProvider、搜索 API、去重、选择、项目入库、全文状态 | P1 | 固定查询可在线或从明确标记的缓存返回结构化记录；重复加入不产生重复条目 | 已完成（2026-09-21；范围仅为文献发现、去重和项目入库） |
 | P2B 页级解析与索引 | 项目内容 API 保留页结构；页内 chunk；证据元数据；索引过期规则 | P1 | 任一检索 hit 均能解析回同一哈希文档的真实页码与精确原文 | 已完成（2026-09-22，见 5.6、5.8；含 M5 开放 PDF 获取） |
-| P3 证据问答 | 多文献选择、项目隔离检索、Evidence Answer Service、证据 UI、无证据拒答 | P2A + P2B | 每个渲染结论的证据均通过机器校验；无范围查询被拒绝 | 规格已冻结（2026-09-29，见 5.9）；实现未完成 |
-| P4 演示与技术评测 | 固定公开论文包、缓存路径、失败场景、重复运行、指标记录 | P3 | 在线与缓存模式均能完成同一演示脚本；失败不被伪装为成功 | 未开始 |
+| P3 证据问答 | 多文献选择、项目隔离检索、Evidence Answer Service、证据 UI、无证据拒答 | P2A + P2B | 每个渲染结论的证据均通过机器校验；无范围查询被拒绝 | 已完成（2026-09-29，见 5.9） |
+| P4 演示与技术评测 | 固定公开论文包、缓存路径、失败场景、重复运行、指标记录 | P3 | 在线与缓存模式均能完成同一演示脚本；失败不被伪装为成功 | 已完成（2026-09-29，见 5.10；"在线模式"由离线注入的 live provider 承担，真实 arXiv 运行仍为一次性人工冒烟） |
 | A1 单 Agent 接入 | 复用 Agent V2 规划任务、调用已验收服务、处理真实反馈与连续追问 | P4、M1–M10 全部门通过 | §2.4 场景通过；范围、证据和失败语义与服务入口一致；工具记录可复核 | 未开始（2026-09-29 新增计划） |
 | P5 后续候选 | 主题分类、第二公开源、Review/Argument Map、检索优化 | P4 | 逐项另行立项，不反向改变首版验收 | 未开始 |
 
@@ -507,7 +507,73 @@ class LiteratureAnswerResult(BaseModel):
 
 本阶段明确不做：答案缓存、流式输出、rerank 与混合检索、多轮追问、跨项目问答（进入 P5 或 A1 之外的后续评估）。
 
+分层结果（2026-09-29）：
+
+- 单元层：`test_literature_answer.py` 43 例（提示只下发本轮白名单、响应解析的每个失败码、六类拒绝原因、结论去重与上限、无证据不调用模型）、`test_literature_answer_model.py` 16 例（身份与 `model_config_hash` 稳定、换密钥不改哈希、Provider 文本与异常）、`test_literature_answer_service.py` 30 例（范围校验、先解析再生成、模型/响应失败码、拒绝不降级、相同请求不被缓存）、`test_literature_answer_limits.py` 19 例（问题长度、来源与 `top_k` 上限、检索实现违约、结论洪泛、控制字符、并发、附件在回答中途被替换）、`test_literature_router.py` 新增 6 例 HTTP 契约（400/404/422/502/503 与"禁止客户端提交坐标或引文"）。Python 单元回归为 `1788 passed, 5 skipped`。
+- 集成层：`test_literature_answer_integration.py` 2 例（真实 ChromaDB + 真实 PDF + 出货 `RagPageRetriever`，仅替换模型）：范围内问答的每条证据回链到重新解析的页文本切片，且不引用范围外来源；未索引来源返回 `insufficient` 且不调用模型。
+- 端到端层：`test_literature_evidence_e2e.py` 新增 1 例（真实应用 `create_app` + 离线 fixture provider + 经 `_create_provider` 注入的确定性答案模型）：检索 → 入库 → 附加 PDF → 页级索引 → 范围内问答 → 证据回链，且引文等于页文本切片；无范围问题返回 400 `scope_required`；语料无法回答的问题返回 `insufficient` + `model_reported_insufficient`，`claims` 与 `evidence` 均为空。
+- 集成层在首轮暴露一个单元层无法发现的真实缺陷并已修复（D-032）：页级 chunk 只用内容身份作为集合存储键，同一份 PDF 在两个来源或两个项目下索引时会互相覆盖页元数据，跨项目隔离失效。修复后同一份 PDF 的两个来源在真实 ChromaDB 中各自保持可检索，回归断言写入集成层。
+- 前端：`useLiteratureAnswer.test.ts` 13 例、`SourceLibraryEvidenceAnswer.test.ts` 4 例覆盖范围选择、请求体、结论与证据绑定、证据展开、拒绝与未解析提示、`insufficient` 不渲染结论、获取开放全文后重新读取库。前端全量为 `862 passed`，并通过 Prettier、ESLint、`vue-tsc` 与 Vite 生产构建。
+- 全量后端为 `2952 passed, 14 skipped, 8 failed`；8 个失败仍全部是 §5.3–5.5 已记录且可在 `071c6b0` 复现的既存/环境问题，未出现本次改造引入的新失败。
+- 本节结果只证明"回答中的每条结论都能机器校验回真实页码与精确原文，且失败与不足都有明确状态"，不证明检索质量、回答正确性或教学效果。
+
+### 5.10 P4 演示与技术评测规格（2026-09-29，文档先行）
+
+P4 阶段门是"在线与缓存模式均能完成同一演示脚本；失败不被伪装为成功"。本节在实现之前冻结 M10 的缓存路径、固定演示脚本、失败场景与运行记录。缓存语料只服务演示与回归，不充当方法协议中的效果评测语料（§6.2）。
+
+影响文件：
+
+| 类型 | 路径 | 职责 |
+|---|---|---|
+| 新增 | `config/literature_demo_corpus.json` | 固定公开论文包：稳定顺序的记录元数据 + 逐页文本 |
+| 新增 | `python/src/literature/demo_corpus.py` | 读取固定语料、构造 `PaperRecord`、物化离线 PDF；缺文件即显式不可用 |
+| 新增 | `python/src/literature/demo_run.py` | 演示运行记录：步骤、状态、原因、耗时、计数、模式 |
+| 修改 | `python/api_factory.py` | 语料可用时把 `fixture` provider 注册进运行中的应用（M10） |
+| 新增 | `python/scripts/literature_demo.py` | 固定演示脚本 CLI：按 §7.1 顺序驱动既有 HTTP API，并写运行记录 |
+| 新增 | `python/tests/unit/test_literature_demo.py`、`python/tests/integration/test_literature_demo_e2e.py` | 语料、注册、运行记录与两种模式的一致性 |
+
+M10 缓存路径规则：
+
+1. 运行中的应用在固定语料可加载时，除 `ArxivProvider` 外再注册 `fixture` provider；语料缺失或损坏只记录警告并保持在线 provider 可用，**不得让应用启动失败，也不得让 fixture 冒充 arxiv**。语料定位与 `providers.yaml` 一致：打包后 `_MEIPASS/config/`，开发态仓库根 `config/`。
+2. `SearchPage.result_mode` 必须保持 `live` / `fixture` 的区分，缓存结果不得标成在线结果（§0）。
+3. 固定语料是**演示与回归**用途；正式语料的纳入、排除与授权规则仍由 `methods/literature_poc/METHODOLOGY.md` 冻结。
+
+固定演示脚本（§7.1 的可执行版本）：按顺序执行并逐步记录——检索（只用调用方已确认的检索式）→ 选择全部返回记录并入库 → 获取全文（在线走开放 PDF，缓存走离线包）→ 建立页级索引 → 对选定文献提问 → 解析一条证据。每步记录 `status`（`ok` / `failed` / `skipped`）、`reason`、`duration_ms` 与计数。
+
+失败场景（必须显式记录，不得静默跳过）：
+
+1. 无开放全文的记录 → 该步 `failed` 且 `reason=access_unavailable`；脚本继续处理其余文献。
+2. 问题在语料中没有答案 → 回答步仍为 `ok`，但 `answer_status=insufficient` 并带不足原因；"证据不足"是成功执行，不是检索失败。
+3. provider 不可用或限流 → 记录 `failed` 与结构化错误码，不重试成"成功"。
+4. 解析或索引失败 → 记录 `failed` 与原因，依赖它的问答步记为 `skipped`，**不得凭空回答**。
+
+运行记录：
+
+- 每次运行写一份 JSON 记录，至少含 `run_id`、`mode`（`live` / `fixture`）、`provider`、`confirmed_query`、`steps`、`totals`（step/ok/failed/skipped）、`started_at`、`finished_at`、`duration_ms`、`answer_status`、`git_commit`。
+- 同一语料与同一确认检索式下重复运行必须产生**结构相同、逐字段可比**的记录（时间戳与 `run_id` 除外）；记录写入 `methods/literature_poc/runs/`（运行记录，不是方法协议）。
+- 记录不得包含任何密钥；`model_config_hash` 沿用 §5.9 的无密钥口径。
+
+分层验收：
+
+| 层 | 位置 | 必须证明 |
+|---|---|---|
+| 单元 | `python/tests/unit/test_literature_demo.py` | 语料解析与稳定顺序、缺失/损坏语料的显式失败、fixture 记录的 `result_mode=fixture`、步骤状态与计数聚合、四类失败场景的原因码、记录中不出现密钥 |
+| 集成 | `python/tests/integration/test_literature_demo_e2e.py` | 真实应用 + 真实 ChromaDB：在线模式（离线注入元数据 provider）与缓存模式（fixture provider）跑同一脚本，步骤结构一致，且两种模式都能得到带页码与精确原文的回答；失败场景以 `failed` / `insufficient` 记录而不是成功 |
+
+本阶段明确不做：服务端"一键演示"端点（D-034）、演示指标阈值（属于 §6.3 的候选指标，须由方法协议冻结）、把缓存结果包装成在线结果。
+
+分层结果（2026-09-29）：
+
+- 固定语料 `config/literature_demo_corpus.json`：3 条合成演示记录（标识统一 `demo-` 前缀、无 DOI/arXiv 编号、全部不声明开放全文位置），逐页正文用于离线演示；`provenance` 字段明确写出"合成演示语料，不得作为检索质量或领域覆盖证据"。
+- 单元层 `python/tests/unit/test_literature_demo.py` 23 例：语料加载与记录顺序、每条记录都带逐页文本、标识不可能被误认成真实论文、缺失/损坏/版本不符/类型不符/空记录/引用不存在记录等六类结构错误、`fixture` provider 的 `result_mode` 与来源标签、离线 PDF 物化后可被重新解析回同一页文本、运行记录的步骤顺序与计数、`run_id` 只随结果变化、非 ok 步骤必须带原因、密钥类键被拒绝、记录文件名逐次运行唯一。
+- 集成层 `python/tests/integration/test_literature_demo_e2e.py` 4 例（真实应用 `create_app` + 真实 ChromaDB，离线替换元数据 provider、下载器与答案模型）：`fixture` provider 确实注册进运行中的应用且 `result_mode=fixture`；同一脚本在缓存模式与在线模式跑出**相同的七步顺序**，缓存模式的 `acquire_fulltext` 记为 `failed/access_unavailable`（3 条记录都无开放全文）后由 `attach_fulltext` 走既有本地附加路径完成，在线模式则相反（获取成功、附加 `skipped/user_attachment_required`），两者最终都得到 `answered` 且证据回链到真实页码与坐标空间；重复运行产生逐字段可比、`run_id` 相同的记录；无答案问题记为 `answer=ok` + `answer_status=insufficient`，证据步 `skipped/no_evidence_to_resolve`。
+- 回归影响：M10 让运行中的应用多出一个名为 `fixture` 的 provider，与既有端到端测试注入的 fixture 实现同名。应用侧改为"同名已存在时只记警告不再注册"，而不是让服务在构造时抛错；P2A/P2B/P3 的既有端到端用例因此未被削弱或跳过。
+- 仍未完成：CLI 只做了一次性人工检查（`--help` 与语料缺失时返回 `corpus_missing` 且退出码 2），完整脚本的自动化覆盖在集成层，**没有**在真实服务器上自动化运行 CLI；真实在线（arXiv）模式下的演示运行仍未自动化，按 D-024 只做一次性人工冒烟；方法协议 `methods/literature_poc/METHODOLOGY.md` 仍未建立，因此"指标记录"只记录过程事实，不含任何效果指标；`methods/literature_poc/runs/` 当前只由 CLI 写入，集成测试写到临时目录。
+- 全量后端为 `2979 passed, 14 skipped, 8 failed`；8 个失败仍是 §5.3–5.5 已记录且可在 `071c6b0` 复现的既存/环境问题，未出现 P4 改造引入的新失败。
+- 本节结果只证明"同一演示脚本能在缓存与在线两种模式下跑完，且失败与不足如实记录"，不证明检索质量、回答正确性或教学效果。
+
 ## 6. 验证与毕设方法边界
+
 ### 6.1 当前可冻结的工程目标
 
 - 验证完整技术链路可执行；
@@ -617,6 +683,9 @@ class LiteratureAnswerResult(BaseModel):
 | D-030 | 首版答案不缓存、`temperature=0`、`model_config_hash` 只含 provider/模型/base_url/temperature/max_tokens/提示版本且排除密钥；`/api/literature/answer` 为一次性 JSON，不引入 SSE 流式 | 本文冻结（2026-09-29） | §0 禁止缓存结果冒充在线；流式会把未校验文本提前送进界面，使"渲染前校验"无法成为唯一出口。被否决方案：先流式输出再由前端过滤 |
 | D-031 | A1 只调用 §5.9 的确定性问答与既有文献服务；`academic_tools.py` 的 `arxiv_search`（原始 Atom XML 截断）与 `rag_search`（无 `project_root`/`source_ids`）在 A1 中必须被替换，旧兼容测试同步重写，不作为回归基线 | 本文冻结（2026-09-29） | 无范围检索与原始响应会让 Agent 绕过 §4.5 的项目/文献范围与证据校验，与 §2.4 的 A1 验收直接冲突 |
 | D-032 | 页级 chunk 的**集合存储键**改为 `<doc_id>::<chunk_id>`；`chunk_id` 仍是不含项目 scope 的内容身份（artifact SHA-256 + 页码 + 坐标 + chunker 版本，D-020 不变），对外接口与证据字段只暴露该内容身份。查询命中与证据解析通过 metadata（`chunk_id`，可选再限定 `source_id`）定位行，并保留裸 id 回退以兼容本决策之前写入的行与展平块 | 本文冻结（2026-09-29） | P3 集成层发现的真实缺陷：同一份 PDF 在两个来源或两个项目下索引时内容身份相同，裸 id 使后写入的文档静默覆盖先写入文档的页元数据，跨项目隔离随之失效（违反 §7.2），且先建索引的一方只会看到 `chunk_not_found`。被否决方案：把 `doc_id` 混进 `chunk_id`（会改变 D-020 已冻结的内容身份并作废既有 `evidence_id`）；"只加来源校验不改存储键"（数据已被覆盖，校验只能报告失败而无法恢复）。影响范围：本决策之前建立的页级索引若曾被同内容文档覆盖，需要重新执行 `/api/literature/index`；旧行在本决策后仍可被读取 |
+| D-033 | 固定公开论文包（`config/literature_demo_corpus.json`）只用于演示与回归：应用在语料可加载时额外注册 `fixture` provider，但 `result_mode` 必须保持 `live`/`fixture` 区分，语料缺失或损坏时只降级为"无缓存 provider"，不得阻止启动，也不得让缓存结果冒充在线 | 本文冻结（2026-09-29） | §2.1 M10 要求"具备带来源标记的缓存语料，公网失败时仍可演示同一条技术链路"；§0 禁止缓存结果与真实在线结果混写。被否决方案：把缓存作为 arxiv 的静默回退（会让在线失败看起来像检索成功） |
+| D-034 | 固定演示脚本以 CLI 形式按 §7.1 顺序驱动既有 HTTP API，不新增服务端"一键演示"端点；检索式与文献选择仍由调用方显式给出 | 本文冻结（2026-09-29） | §7.1 的第 2、4 步是用户确认点；服务端自动跑完全程会把"确认过的检索式"和"用户选择"变成脚本内部行为，无法再声称链路包含确认环节 |
+| D-035 | 每次演示运行写一份 JSON 记录到 `methods/literature_poc/runs/`，含步骤状态/原因/耗时、计数、模式与确认检索式；该目录只存运行记录，正式方法协议仍单独冻结 | 本文冻结（2026-09-29） | §5 的 P4 要求"重复运行、指标记录"，§6.2 要求正式评测前另建方法协议；把运行记录与方法协议混在一处会让"过程记录"被误当成"评测协议已冻结" |
 
 ### 9.2 待确认但不阻塞 P1–P3 的事项
 
