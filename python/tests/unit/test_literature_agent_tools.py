@@ -754,6 +754,68 @@ class TestFullTextAndIndexTools:
         assert "source_artifact_missing" in result.output
 
 
+class TestProviderDiscovery:
+    """A real model guessed "semantic_scholar"; the tools must steer it right."""
+
+    async def test_providers_tool_lists_the_registry(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        calls: list[tuple[str, dict]] = []
+        patch_client(
+            monkeypatch,
+            {
+                "/api/literature/providers": _Response(
+                    {
+                        "providers": [
+                            {"provider": "arxiv", "result_mode": "live", "supports_search": True},
+                            {
+                                "provider": "fixture",
+                                "result_mode": "fixture",
+                                "supports_search": True,
+                            },
+                        ]
+                    }
+                )
+            },
+            calls,
+        )
+        registry = build_registry(tmp_path)
+
+        result = await registry.execute("literature_providers", {})
+
+        payload = json.loads(result.output)
+        assert payload["provider_count"] == 2
+        assert [item["provider"] for item in payload["providers"]] == ["arxiv", "fixture"]
+        assert payload["providers"][1]["result_mode"] == "fixture"
+
+    async def test_unknown_provider_error_names_the_registered_ones(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        calls: list[tuple[str, dict]] = []
+        patch_client(
+            monkeypatch,
+            {
+                "/api/literature/search": _Response(
+                    {"detail": {"code": "provider_not_found", "message": "no such provider"}},
+                    status_code=404,
+                ),
+                "/api/literature/providers": _Response(
+                    {"providers": [{"provider": "arxiv"}, {"provider": "fixture"}]}
+                ),
+            },
+            calls,
+        )
+        registry = build_registry(tmp_path)
+
+        result = await registry.execute(
+            "literature_search", {"provider": "semantic_scholar", "query": 'all:"x"'}
+        )
+
+        assert result.is_error is True
+        assert "provider_not_found" in result.output
+        assert "available providers: arxiv, fixture" in result.output
+
+
 class TestAnswerPayloadBudget:
     async def test_a_multi_paper_answer_is_not_truncated_into_invalid_json(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

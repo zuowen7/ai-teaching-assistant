@@ -392,6 +392,21 @@ def _literature_answer_mode(config: dict) -> str:
     return "fixture" if str(raw or "").strip().casefold() == "fixture" else "model"
 
 
+def _literature_answer_max_tokens(config: dict) -> int:
+    """Output budget for the answer call (``literature.answer.max_tokens``)."""
+
+    from src.literature.answer_model import DEFAULT_MAX_TOKENS
+
+    literature = config.get("literature") if isinstance(config, dict) else None
+    answer = literature.get("answer") if isinstance(literature, dict) else None
+    raw = answer.get("max_tokens") if isinstance(answer, dict) else None
+    try:
+        configured = int(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_MAX_TOKENS
+    return configured if configured > 0 else DEFAULT_MAX_TOKENS
+
+
 def _apply_env_overrides(cfg: dict) -> None:
     env_key = os.environ.get("SCHOLAR_CLOUD_API_KEY", "").strip()
     if env_key:
@@ -997,7 +1012,7 @@ def create_app(*, cloud_only: bool = False) -> FastAPI:
     from src.agent_v2.router import _create_provider
     from src.literature.answer_model import (
         AgentProviderAnswerModel,
-        force_deterministic_thinking,
+        effective_thinking_mode,
     )
     from src.literature.demo_corpus import (
         DemoCorpusError,
@@ -1049,14 +1064,12 @@ def create_app(*, cloud_only: bool = False) -> FastAPI:
             _answer_provider = None
 
         if _answer_provider is not None:
-            # temperature=0 is only honoured when thinking is off; this provider
-            # instance belongs to the answer model alone (plan 5.9 rule 8).
-            _previous_thinking = force_deterministic_thinking(_answer_provider)
-            if _previous_thinking is not None and _previous_thinking != "disabled":
-                logger.info(
-                    "Literature answer provider pinned from thinking=%s to disabled",
-                    _previous_thinking,
-                )
+            # Report what the provider is configured to do; the answer path never
+            # overrides the user's model settings (plan 5.9 rule 8).
+            logger.info(
+                "Literature answer thinking mode: %s",
+                effective_thinking_mode(_answer_provider) or "n/a",
+            )
             _agent_config = (
                 (_answer_config.get("agent") or {}) if isinstance(_answer_config, dict) else {}
             )
@@ -1075,6 +1088,8 @@ def create_app(*, cloud_only: bool = False) -> FastAPI:
                 base_url=str(
                     getattr(_answer_provider, "base_url", "") or _agent_config.get("base_url") or ""
                 ),
+                # Thinking models need headroom for reasoning plus the JSON answer.
+                max_tokens=_literature_answer_max_tokens(_answer_config),
             )
 
     state_literature = register_literature_routes(

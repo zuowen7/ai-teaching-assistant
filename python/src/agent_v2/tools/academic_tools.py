@@ -573,6 +573,32 @@ def register_academic_tools(registry: ToolRegistry) -> None:
             is_error=True,
         )
 
+    def _error_code_of(response) -> str:
+        """Structured error code from a service response, or an HTTP fallback."""
+
+        try:
+            detail = response.json().get("detail")
+        except Exception:  # noqa: BLE001 - a non-JSON error body is still an error
+            return f"http_{response.status_code}"
+        if isinstance(detail, dict) and detail.get("code"):
+            return str(detail["code"])
+        return f"http_{response.status_code}"
+
+    async def _available_providers(client) -> list[str]:
+        """Registered literature providers, for an actionable error message."""
+
+        try:
+            response = await client.get(f"{_api_base()}/api/literature/providers")
+            if response.status_code != 200:
+                return []
+            providers = response.json().get("providers") or []
+        except Exception:  # noqa: BLE001 - the hint is optional
+            return []
+        return [str(item.get("provider")) for item in providers if item.get("provider")]
+
+    def _api_base() -> str:
+        return os.environ.get("SCHOLAR_API_BASE", "http://localhost:18088")
+
     async def _post_service(client, path: str, payload: dict):
         api_base = os.environ.get("SCHOLAR_API_BASE", "http://localhost:18088")
         return await client.post(f"{api_base}{path}", json=payload)
@@ -585,9 +611,47 @@ def register_academic_tools(registry: ToolRegistry) -> None:
             return "restricted"
         return "unknown"
 
+    async def literature_providers(args: dict) -> ToolResult:
+        """List registered literature providers so a model need not guess names."""
+
+        try:
+            import httpx
+
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.get(
+                    f"{os.environ.get('SCHOLAR_API_BASE', 'http://localhost:18088')}"
+                    "/api/literature/providers"
+                )
+                if response.status_code != 200:
+                    return _service_error(response, action="literature_providers")
+                payload = response.json()
+        except Exception as exc:  # noqa: BLE001 - report, never silently degrade
+            return ToolResult(f"literature providers lookup failed: {exc}", is_error=True)
+
+        providers = [
+            {
+                "provider": item.get("provider"),
+                "result_mode": item.get("result_mode"),
+                "supports_search": item.get("supports_search"),
+            }
+            for item in (payload.get("providers") or [])
+        ]
+        return ToolResult(
+            json.dumps(
+                {
+                    "provider_count": len(providers),
+                    "providers": providers,
+                    "note": (
+                        "'fixture' serves the offline demo corpus; 'arxiv' is the live "
+                        "public API. Search results must never be relabelled across modes."
+                    ),
+                },
+                ensure_ascii=False,
+            )
+        )
+
     async def literature_search(args: dict) -> ToolResult:
         """Run a confirmed query against the structured literature service."""
-
         provider = str(args.get("provider", "")).strip()
         query = str(args.get("query", "")).strip()
         research_question = str(args.get("research_question", "")).strip() or query
@@ -626,7 +690,18 @@ def register_academic_tools(registry: ToolRegistry) -> None:
                     },
                 )
                 if response.status_code != 200:
-                    return _service_error(response, action="literature_search")
+                    error = _service_error(response, action="literature_search")
+                    # A model that invents a provider name must be told which ones
+                    # exist, otherwise it burns the turn guessing (observed with a
+                    # real model asking for "semantic_scholar").
+                    if _error_code_of(response) == "provider_not_found":
+                        available = await _available_providers(client)
+                        if available:
+                            error = ToolResult(
+                                f"{error.output}\navailable providers: {', '.join(available)}",
+                                is_error=True,
+                            )
+                    return error
                 execution = response.json()
         except Exception as exc:  # noqa: BLE001 - report, never silently degrade
             return ToolResult(f"literature search failed: {exc}", is_error=True)
@@ -1032,7 +1107,15 @@ def register_academic_tools(registry: ToolRegistry) -> None:
         {
             "type": "object",
             "properties": {
-                "provider": {"type": "string", "description": "Literature provider name"},
+                "provider": {
+                    "type": "string",
+                    "description": (
+                        "Registered literature provider name: 'arxiv' for the live "
+                        "public API, 'fixture' for the offline demo corpus. Use "
+                        "literature_providers to list what is registered instead of "
+                        "guessing a name."
+                    ),
+                },
                 "query": {
                     "type": "string",
                     "description": "The confirmed provider-native search expression",
@@ -1055,6 +1138,16 @@ def register_academic_tools(registry: ToolRegistry) -> None:
         effects={"network"},
         approval_scope="exact-input",
         network_scope={"local-literature-api"},
+    )
+
+    registry.register(
+        "literature_providers",
+        "List the literature providers this installation has registered, with their "
+        "result mode. Call this before literature_search instead of guessing a "
+        "provider name.",
+        {"type": "object", "properties": {}},
+        literature_providers,
+        permission="read-only",
     )
 
     registry.register(

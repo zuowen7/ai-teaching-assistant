@@ -15,11 +15,14 @@ import pytest
 
 from src.literature.answer import ANSWER_PROMPT_VERSION
 from src.literature.answer_model import (
+    DEFAULT_MAX_TOKENS,
+    JSON_RESPONSE_FORMAT,
     AgentProviderAnswerModel,
+    AnswerModelError,
     EvidenceAnswerModel,
     ModelIdentity,
     build_model_identity,
-    force_deterministic_thinking,
+    effective_thinking_mode,
 )
 
 BASE_URL = "https://api.openai.com/v1"
@@ -39,13 +42,55 @@ class FakeProvider:
         *,
         api_key: str = "sk-secret-one",
         thinking_mode: str | None = None,
+        model: str = "",
+        base_url: str = "",
+        stop_reason: str = "stop",
     ) -> None:
         self.text = text
         self.api_key = api_key
         self.calls: list[dict] = []
         self.failure: Exception | None = None
+        self._stop_reason = stop_reason
         if thinking_mode is not None:
             self.thinking_mode = thinking_mode
+        if model:
+            self.model = model
+        if base_url:
+            self.base_url = base_url
+
+    async def chat(
+        self,
+        messages,
+        tools=None,
+        system_prompt=None,
+        max_tokens=4096,
+        temperature=0.3,
+        tool_choice="auto",
+        response_format=None,
+    ):
+        self.calls.append(
+            {
+                "messages": messages,
+                "tools": tools,
+                "system_prompt": system_prompt,
+                "max_tokens": max_tokens,
+                "temperature": temperature,
+                "response_format": response_format,
+            }
+        )
+        if self.failure is not None:
+            raise self.failure
+        from src.agent_v2.types import ProviderResponse, TextBlock
+
+        return ProviderResponse(blocks=[TextBlock(text=self.text)], stop_reason=self._stop_reason)
+
+
+class PlainProvider:
+    """Provider whose ``chat`` has no ``response_format`` parameter at all."""
+
+    def __init__(self, text: str = '{"claims":[]}') -> None:
+        self.text = text
+        self.calls: list[dict] = []
 
     async def chat(
         self,
@@ -56,21 +101,10 @@ class FakeProvider:
         temperature=0.3,
         tool_choice="auto",
     ):
-        self.calls.append(
-            {
-                "messages": messages,
-                "tools": tools,
-                "system_prompt": system_prompt,
-                "max_tokens": max_tokens,
-                "temperature": temperature,
-                "tool_choice": tool_choice,
-            }
-        )
-        if self.failure is not None:
-            raise self.failure
         from src.agent_v2.types import ProviderResponse, TextBlock
 
-        return ProviderResponse(blocks=[TextBlock(text=self.text)])
+        self.calls.append({"messages": messages, "max_tokens": max_tokens})
+        return ProviderResponse(blocks=[TextBlock(text=self.text)], stop_reason="stop")
 
 
 class TestModelIdentity:
@@ -184,12 +218,18 @@ class TestAgentProviderAnswerModel:
         assert call["tools"] is None
         assert [block.text for block in call["messages"][0].blocks] == ["prompt"]
 
-    async def test_complete_returns_empty_text_when_the_provider_has_none(self) -> None:
+    async def test_an_empty_provider_response_is_an_explicit_failure(self) -> None:
+        """Thinking models can exhaust max_tokens; that must not look like 'no claims'."""
+
         provider = FakeProvider(text="")
         adapter = AgentProviderAnswerModel(
             provider=provider, provider_name="openai", model="gpt-4o"
         )
-        assert await adapter.complete(system_prompt="s", prompt="p") == ""
+
+        with pytest.raises(AnswerModelError) as excinfo:
+            await adapter.complete(system_prompt="s", prompt="p")
+
+        assert "empty structured response" in str(excinfo.value)
 
     async def test_complete_propagates_provider_failure(self) -> None:
         provider = FakeProvider()
@@ -201,24 +241,107 @@ class TestAgentProviderAnswerModel:
             await adapter.complete(system_prompt="s", prompt="p")
 
 
-class TestDeterministicThinking:
-    """Rule 8: the recorded temperature=0 must actually reach the provider."""
-    def test_thinking_is_pinned_to_disabled_and_the_previous_mode_returned(self) -> None:
-        provider = FakeProvider(thinking_mode="auto")
+class TestJsonOutputMode:
+    """DeepSeek's JSON Output guide: ask for json_object and leave token headroom."""
 
-        previous = force_deterministic_thinking(provider)
+    def test_the_default_budget_leaves_room_for_thinking_plus_the_answer(self) -> None:
+        # 2048 truncated real answers (finish_reason=length, empty content).
+        assert DEFAULT_MAX_TOKENS >= 8_192
 
-        assert previous == "auto"
-        assert provider.thinking_mode == "disabled"
+    async def test_json_mode_is_requested_when_the_provider_supports_it(self) -> None:
+        provider = FakeProvider(text='{"claims":[]}')
+        adapter = AgentProviderAnswerModel(
+            provider=provider, provider_name="deepseek", model="deepseek-flash"
+        )
 
-    def test_a_provider_without_thinking_control_is_left_alone(self) -> None:
+        await adapter.complete(system_prompt="s", prompt="p")
+
+        assert provider.calls[0]["response_format"] == JSON_RESPONSE_FORMAT
+
+    async def test_a_provider_without_the_option_is_called_without_it(self) -> None:
+        provider = PlainProvider()
+        adapter = AgentProviderAnswerModel(
+            provider=provider, provider_name="openai", model="gpt-4o"
+        )
+
+        assert await adapter.complete(system_prompt="s", prompt="p") == '{"claims":[]}'
+        assert provider.calls[0]["max_tokens"] == DEFAULT_MAX_TOKENS
+
+    async def test_the_real_provider_accepts_json_mode(self) -> None:
+        from src.agent_v2.providers.openai_compat import OpenAiCompatProvider
+
+        provider = OpenAiCompatProvider(
+            api_key="k", model="deepseek-flash", base_url="https://api.deepseek.com"
+        )
+        adapter = AgentProviderAnswerModel(
+            provider=provider, provider_name="deepseek", model="deepseek-flash"
+        )
+
+        assert adapter._request_json is True
+
+    async def test_a_truncated_response_names_the_stop_reason(self) -> None:
+        provider = FakeProvider(text="", stop_reason="length")
+        adapter = AgentProviderAnswerModel(
+            provider=provider, provider_name="deepseek", model="deepseek-flash"
+        )
+
+        with pytest.raises(AnswerModelError) as excinfo:
+            await adapter.complete(system_prompt="s", prompt="p")
+
+        assert "stop_reason=length" in str(excinfo.value)
+
+
+class TestThinkingModeReporting:
+    """The answer path must never override the user's model configuration."""
+
+    def test_a_provider_without_thinking_control_reports_none(self) -> None:
         provider = FakeProvider()
 
-        assert force_deterministic_thinking(provider) is None
+        assert effective_thinking_mode(provider) is None
         assert not hasattr(provider, "thinking_mode")
 
-    def test_pinning_twice_is_idempotent(self) -> None:
-        provider = FakeProvider(thinking_mode="enabled")
+    def test_an_explicit_enabled_mode_is_reported_and_left_untouched(self) -> None:
+        provider = FakeProvider(
+            thinking_mode="enabled", model="deepseek-flash", base_url="https://api.deepseek.com"
+        )
 
-        assert force_deterministic_thinking(provider) == "enabled"
-        assert force_deterministic_thinking(provider) == "disabled"
+        assert effective_thinking_mode(provider) == "enabled"
+        # Reporting is read-only: the provider keeps the configuration the user set.
+        assert provider.thinking_mode == "enabled"
+
+    def test_the_vendor_default_is_reported_for_a_deepseek_v4_model(self) -> None:
+        provider = FakeProvider(
+            thinking_mode="auto", model="deepseek-flash", base_url="https://api.deepseek.com"
+        )
+
+        assert effective_thinking_mode(provider) == "disabled"
+
+    def test_identity_records_thinking_mode_and_whether_temperature_applied(self) -> None:
+        thinking = AgentProviderAnswerModel(
+            provider=FakeProvider(
+                thinking_mode="enabled",
+                model="deepseek-flash",
+                base_url="https://api.deepseek.com",
+            ),
+            provider_name="deepseek",
+            model="deepseek-flash",
+            base_url="https://api.deepseek.com",
+        )
+        assert thinking.identity.thinking_mode == "enabled"
+        assert thinking.identity.temperature_applied is False
+
+        plain = AgentProviderAnswerModel(
+            provider=FakeProvider(thinking_mode="disabled"),
+            provider_name="openai",
+            model="gpt-4o",
+        )
+        assert plain.identity.thinking_mode == "disabled"
+        assert plain.identity.temperature_applied is True
+
+    def test_thinking_mode_changes_the_recorded_config_hash(self) -> None:
+        base = build_model_identity(provider="deepseek", model="deepseek-flash")
+        thinking = build_model_identity(
+            provider="deepseek", model="deepseek-flash", thinking_mode="enabled"
+        )
+
+        assert base.config_hash != thinking.config_hash

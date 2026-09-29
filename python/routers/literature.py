@@ -376,10 +376,12 @@ def _provider_http_error(error: LiteratureProviderError) -> HTTPException:
 
 
 def _service_http_error(error: LiteratureServiceError) -> HTTPException:
-    return HTTPException(
-        status_code=_SERVICE_STATUS[error.code],
-        detail={"code": error.code.value, "message": str(error)},
-    )
+    detail: dict[str, Any] = {"code": error.code.value, "message": str(error)}
+    # Structured context (parse reason, provider stop_reason, ...) is what makes a
+    # 502 diagnosable instead of a dead end for the operator.
+    if error.details:
+        detail["details"] = dict(error.details)
+    return HTTPException(status_code=_SERVICE_STATUS[error.code], detail=detail)
 
 
 def register_literature_routes(

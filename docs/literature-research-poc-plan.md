@@ -2,7 +2,7 @@
 
 > 状态：生效；G0、P1、P2A、P2B、P3、P4 已完成；A1 的工具层、会话级验收与前端引用展示已完成，真实在线 arXiv 已做一次性人工冒烟、真实模型行为仍未验证（见 5.11、5.12）；后续候选 P5 未开始
 >
-> 当前基线：`teaching-refactor@6ae2e1b`（复核订正提交后；第三轮修复见 5.13 的 V-16…V-21）
+> 当前基线：`teaching-refactor@6740486`（DeepSeek 策略修复后；第四轮真实模型验证见 5.14，缺陷见 5.13 的 V-22…V-26）
 >
 > 生效日期：2026-09-20
 >
@@ -731,13 +731,46 @@ V-14 与 V-15 是本次复核顺带修掉的**与文献链路无关的既存缺�
 | V-20 | 运行记录缺少本次作用的项目，两份记录无法逐字段比对 | 记录新增 `project_path` |
 | V-21 | "CLI 只在真实服务器上人工跑过" | 新增 `test_literature_demo_live_server.py` 2 例：真实 uvicorn 子进程 + 真实 HTTP + 真实 ChromaDB，`--create-location` 跑完七步并写出记录（退出码 0），非项目目录在跑任何步骤前退出 4 |
 
+**第四轮（2026-09-29 真实 DeepSeek 模型验证后）新增**
+
+这一轮的缺陷全部由"真实模型 + 真实论文"暴露，且都能在离线测试里复现：
+
+| # | 项 | 处理 |
+|---|---|---|
+| V-22 | 官方把 V4.1 Flash 的模型名改为 `deepseek-flash`（旧的 `deepseek-v4-flash` 已下线但仍可调用），而仓库"V4 系列默认关思考以约束延迟"的策略与 `reasoning_effort` 开关只匹配 `deepseek-v4-`，改名后**静默失效** | 两处共用同一个"V4 系列前缀"常量，同时覆盖官方名与旧别名；12 例策略测试（含 `deepseek-chat`/`deepseek-reasoner` 必须保持 provider 默认的反向用例） |
+| V-23 | **高**：思考模式下答案调用稳定返回 `answer_invalid_response`(502)。日志显示 `finish=length, text_len=0` —— 思考 token 吃完了 `max_tokens=2048`，正文为空 | 按官方 JSON Output 文档改用 `response_format={"type":"json_object"}`（仅答案调用、仅当 provider 支持；Agent 循环不受影响），输出预算提到 8192 并支持 `literature.answer.max_tokens` 覆盖。真实模型下同一问题由"稳定 502"变为"稳定 6 条结论" |
+| V-24 | 空响应被当成"模型返回了不可解析的文本"，操作者拿不到真因（截断？拒答？） | 适配器对空正文抛出带 `stop_reason` 的显式错误；HTTP 错误体开始携带 `details`（解析原因、provider 停止原因），使 502 可诊断而不是死路 |
+| V-25 | 四个 D-040 决策要求的"fixture 与 live 可区分"在真实链路里没有端到端证据 | §5.14 记录真实运行：`result_mode` 分别为 `live`/`fixture`，答案身份固定 `deepseek-flash`，两种模式都被真实模型跑通 |
+| V-26 | 真实模型会**凭空指定 provider 名**（实测要 `semantic_scholar`，而注册的只有 `arxiv`/`fixture`），错误信息也不告诉它有哪些可用 | 新增只读工具 `literature_providers` 列出注册表；`literature_search` 在 `provider_not_found` 时把可用 provider 名附在错误里；工具 schema 明确说明 `arxiv`=在线、`fixture`=离线演示语料。真实模型在下一轮会话中确实先调用了该工具再检索 |
+
 **仍未验证 / 已知限制**
 
-- 真实**模型**的会话行为未自动化（D-024、D-030）：脚本模型只证明"按提示行动时链路成立"。本机既无 Ollama 也无任何云端凭据，因此本轮**无法**做真实模型验证；D-040 的 fixture 答案模型让链路可离线演示，但它**不是**模型，其结论不得用于任何回答质量主张。
-- 真实**在线 arXiv** 已按 D-024 做一次性人工冒烟（2026-09-29）：`all:"retrieval augmented generation"` 返回 `result_mode=live`、`total_results=6011`、3 条真实记录（`2411.18583`、`2502.00306`、`2510.22344`，年份 2024/2025），三条均声明开放 PDF。这是一次人工观测，**不是**自动化用例，也不构成任何质量指标。
+- 真实**模型**的行为目前只有**一个模型、一套配置**的观测记录（§5.14：DeepSeek `deepseek-flash`、思考模式开启、2026-09-29）：它证明了"真实模型在真实接口下能按契约走完并如实报告不足"，**不构成**对其他模型、其他 provider 或"任意模型都会照做"的保证，也不是质量指标。换模型后必须重新观测。
+- 真实**在线 arXiv** 已按 D-024 做一次性人工冒烟（2026-09-29），并在 §5.14 观测 2/4 中与真实模型一起跑通了"检索 → 入库 → 获取开放 PDF → 页级索引 → 证据问答"；这仍是人工观测，**不是**自动化用例，也不构成任何质量指标。
 - 页码伪造检测仍是**有限枚举**的定位词表（中/英/西/德/日/葡/意/法），未收录语言的定位词（如 `página` 之外的写法）仍可绕过。
-- CLI 的七步已在真实 uvicorn 服务上自动化（V-21），但**真实在线模式下的 Agent 会话**仍是人工步骤。
+- CLI 的七步已在真实 uvicorn 服务上自动化（V-21），但**真实在线模式下的 Agent 会话**仍是人工步骤（§5.14 观测 4）。
+- **Agent 没有附加本地 PDF 的工具**：离线语料下 Agent 无法独自走完整问答（§5.14 观测 6）；需要在界面或 CLI 先附加全文。
 - `methods/literature_poc/METHODOLOGY.md` 目前只是**未生效的骨架**：正式 RQ、语料、gold、指标与阈值均标注【待确认】，需用户与指导教师填写后才成为协议（§6.2 与 D-039；§5.10、§5.12 记录中的"仍未建立"指当时的提交状态）。
+
+### 5.14 真实模型验证记录（DeepSeek V4.1 Flash，2026-09-29）
+
+一次性人工验证：真实 DeepSeek API（官方现行模型名 `deepseek-flash`，思考模式**开启**、effort 默认 `high`），凭据写在 gitignore 的 `python/config/default.local.yaml`（不提交、不打印）。**这不是自动化用例，也不构成任何质量指标**；它验证的是"真实模型在真实接口下会不会按契约行事"。
+
+复现方式：对运行中的服务执行 `python scripts/literature_live_check.py --provider fixture|arxiv --query ... --question ...`。该脚本走检索 → 入库 → 获取/附加全文 → 页级索引 → 问答，并打印结论、证据页码与原文、被拒结论与未解析项；退出码 0=answered、1=insufficient、2=服务或传输失败。
+
+**观测 1：答案契约（离线语料）** —— `status=answered`，5 条结论全部 `supported` 且各带 `evidence_ids`；证据解析到 p.1/p.2 的真实页码与原文；`unresolved=[]`；答案身份 `openai_compatible/deepseek-flash`。模型还给出了跨文献判断（"两篇论文并不共享同一套证据校验协议"）并同时引用两条证据。
+
+**观测 2：真实论文（arXiv live）** —— 检索 `all:"retrieval augmented generation"` → 2 篇真实论文 → 自动获取开放 PDF（`2411.18583`、`2502.00306`）→ 页级索引 6 页 / 27 页 → `answered`，6 条结论全部 `supported`，证据落在 p.2/p.4/p.12/p.16，内容含 ROUGE、SciTLDR、TREC-COVID 等真实细节。**其中 1 条结论被拒**：`model_reported_insufficient`（模型自己写"证据不支持两篇共享同一协议"），按规则进 `rejected_claims` 而未被当作结论渲染——说明校验器在真实模型输出上确实会触发。
+
+**观测 3：证据不足路径** —— 问一个语料答不出的问题（钨的熔点）→ `status=insufficient`、`insufficient_reason=model_reported_insufficient`、`claims=[]`、`evidence=[]`；模型明确说明所列证据没有涉及该问题，**没有编造**。
+
+**观测 4：A1 真实会话（模型自己决定工具顺序）** —— 真实 `ConversationRuntime` + 真实 DeepSeek + 真实 arXiv：模型依次调用 `literature_sources` → `literature_providers` → `literature_search` → `literature_import` → `literature_acquire_fulltext`×2 → `literature_index`×2 → `literature_answer`；**9 次副作用调用全部停在 `await_approval`**（共 7 次审批）；最终 `literature_answer` 返回 `answered`（6 条结论），最终回复按页码给出原文引用。
+
+**观测 5：行为边界（是模型的选择，不是系统保证）** —— 同一会话中模型曾对同一检索式连发 9 次检索，并从 `arxiv` 与 `fixture` 两个 provider 混合入库（记录里 `result_mode` 仍分别标注，未混淆）；对 arXiv 上不存在的检索式（`all:"evidence traceable question answering"` → 0 条）它如实停下、列出未执行的步骤并说明证据不足。换模型或换提示词，这些行为都可能不同。
+
+**观测 6：离线语料在 Agent 会话中的缺口** —— fixture 语料不声明开放全文，而 Agent 侧**没有"附加本地 PDF"的工具**：模型按流程走到 `literature_index` 会得到 `source_artifact_missing`，最终只能如实报告证据不足（它确实这么做，并去工作区找过 PDF）。因此**离线演示要走完整问答，需先由用户或 CLI 附加 PDF**；这是已记录的产品边界，不是模型幻觉，也不在 A1 的既定范围内。
+
+**本轮由真实模型暴露并修掉的缺陷**见 §5.13 的 V-22…V-26。最关键的一条：`answer_invalid_response` 的真因不是"模型不听话"，而是思考模式耗尽 `max_tokens=2048`（`finish_reason=length`、`content` 为空）；按官方 JSON Output 文档改为 `response_format={"type":"json_object"}` 并把输出预算提到 8192 后，同一问题稳定返回 6 条结论。
 
 ## 6. 验证与毕设方法边界
 
@@ -860,6 +893,8 @@ V-14 与 V-15 是本次复核顺带修掉的**与文献链路无关的既存缺�
 | D-039 | `methods/literature_poc/METHODOLOGY.md` 先落**未生效骨架**：只列必须冻结的字段并逐项标注【待确认】，不代填 RQ、语料、gold、指标或阈值 | 本文冻结（2026-09-29） | AGENTS.md 与本合同 §6.2 一致要求这些取值由用户与指导教师确认；骨架让"缺什么"可见，同时不产生任何可被误读为协议的约束力。被否决方案：由我拟定一套指标与阈值（会把未经确认的取值伪装成协议）；或继续不建文件（缺项不可见） |
 | D-040 | 增设**确定性、非 LLM** 的 fixture 答案模型（`provider="fixture"`、`model="deterministic-extractive-v1"`），仅在 `literature.answer.mode: fixture` 或 `SCHOLAR_LITERATURE_ANSWER_MODE=fixture` 时启用 | 本文冻结（2026-09-29） | 无模型/无网络时（答辩笔记本、CI）整条链仍须可演示，但**不得**让 fixture 结果看起来像模型产出：该模型不读问题、不做摘要，只为每条检索到的证据抽取一句原文作为结论，因此每条结论都字面存在于它的引用里；身份字段随答案落盘，fixture 与 live 始终可区分。被否决方案：离线时静默回退到某个云端模型（需要网络与密钥）；或让演示在没有模型时直接失败（无法离线演示） |
 | D-041 | 演示 CLI 先确认项目目标再跑七步：`--project-path` 或 `--create-location`+`--project-name` 二选一；退出码细化为 0/1/2/3/4；语料可用 `demo.expected_failures` **声明**预期失败 | 本文冻结（2026-09-29） | 在真实服务器上的端到端运行暴露出两个问题：新目录直接以"存档导入失败"告终（归因错误、不可操作），以及 `access_unavailable` 这个**由语料自身性质决定**的失败让演示永远以非零码结束。声明只是让调用方区分"预期失败"与"回归"：记录中的状态与原因**一律照旧**（仍是 `failed/access_unavailable`），仅额外标记 `detail.expected="true"`。被否决方案：把预期失败记成 `skipped`（掩盖真实失败）；或让 fixture 语料谎称有开放全文（会把演示建立在不成立的网络假设上） |
+| D-042 | 答案调用按 DeepSeek 官方接口文档加固：开启 JSON Output（`response_format={"type":"json_object"}`，仅答案调用、仅当 provider 支持），输出预算默认 2048 → **8192** 且可用 `literature.answer.max_tokens` 覆盖；空正文与截断一律作为**显式失败**并携带 `stop_reason`，HTTP 错误体开始带 `details` | 本文冻结（2026-09-29） | 真实模型实测：思考模式开启时 `max_tokens=2048` 被思考 token 耗尽（日志 `finish=length, text_len=0`），答案步稳定 502 `answer_invalid_response`；官方 JSON Output 文档明确要求"合理设置 max_tokens 防止 JSON 被截断"并提供 `response_format`。**不得**用"关掉思考模式"来绕过（用户明确要求保留思考模式），因此只改预算与输出模式。被否决方案：把思考模式强制关掉（剥夺用户配置且掩盖真因）；在 502 时按"无结论"静默返回（把配置缺陷伪装成模型结论） |
+| D-043 | 新增只读工具 `literature_providers` 列出已注册 provider；`literature_search` 遇 `provider_not_found` 时把可用名附在错误里；工具 schema 写明 `arxiv`=在线、`fixture`=离线演示语料 | 本文冻结（2026-09-29） | 真实模型实测会**凭空指定 provider**（要 `semantic_scholar`，而注册的只有 arxiv/fixture），原错误信息也不告诉它有哪些可用，于是浪费轮次试探。只读发现工具不改变审批与范围规则：它无副作用、不需要审批，检索仍须停在审批上。被否决方案：让服务端在未知 provider 时静默回退到 arxiv（会把"检索式来自哪个库"变成不可见事实） |
 
 ### 9.2 待确认但不阻塞 P1–P3 的事项
 
