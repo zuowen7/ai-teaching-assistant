@@ -203,7 +203,6 @@ class TestAgentProviderAnswerModel:
 
 class TestDeterministicThinking:
     """Rule 8: the recorded temperature=0 must actually reach the provider."""
-
     def test_thinking_is_pinned_to_disabled_and_the_previous_mode_returned(self) -> None:
         provider = FakeProvider(thinking_mode="auto")
 
