@@ -8,6 +8,9 @@ before cleaning.
 Two detection strategies:
   A) Title + author + journal info pattern (when visible at article start)
   B) Content heuristics: truncated paragraph starts signal new articles
+  C) Stranded initial: the extractor puts the opening word's first letter on its
+     own line ("I" then "n 2023, extreme heat ..."), which leaves no blank line
+     for strategy B to key on
 """
 
 from __future__ import annotations
@@ -63,6 +66,11 @@ def detect_articles(raw_text: str) -> list[tuple[int, int, str]]:
         [(start_pos, end_pos, title), ...] — sorted by start_pos.
         If ≤1 article found, returns a single entry spanning the whole text.
     """
+    # Strategy C: a stranded opening letter is the most precise signal.
+    boundaries_c = _detect_by_split_initial(raw_text)
+    if len(boundaries_c) > 1:
+        return boundaries_c
+
     # Strategy A: title + author + journal info
     boundaries_a = _detect_by_title_author(raw_text)
     if len(boundaries_a) > 1:
@@ -87,7 +95,7 @@ def extract_articles(raw_text: str) -> list[str]:
 
     articles = []
     for start, end, _title in boundaries:
-        articles.append(raw_text[start:end])
+        articles.append(_repair_split_initial(raw_text[start:end]))
 
     logger.info(
         "Split into %d articles: %s",
@@ -95,6 +103,80 @@ def extract_articles(raw_text: str) -> list[str]:
         [t[:50] if t else f"(article {i + 1})" for i, (_, _, t) in enumerate(boundaries)],
     )
     return articles
+
+
+# ---------------------------------------------------------------------------
+# Strategy C: stranded opening letter
+# ---------------------------------------------------------------------------
+
+_LONE_LETTER_RE = re.compile(r"^[A-Za-z]$")
+
+
+def _repaired_word(fragment: str) -> str | None:
+    """Return the full word for a known truncated fragment, else None."""
+
+    key = fragment.lower().rstrip(".,;:!?")
+    return _TRUNCATION_FIXES.get(key) or _TRUNCATED_WORD_FIXES.get(key)
+
+
+def _repair_split_initial(text: str) -> str:
+    """Rejoin a first letter the extractor stranded on its own line."""
+
+    if re.match(r"^[A-Za-z]\n[a-z]", text) is None:
+        return text
+    return text[0] + text[2:]
+
+
+def _detect_by_split_initial(raw_text: str) -> list[tuple[int, int, str]]:
+    """Detect boundaries where the opening word lost its first letter.
+
+    The extractor sometimes emits::
+
+        Laurie S. Huning and Manuela I. Brunner
+        I
+        n 2023, extreme heat propelled the spread of severe
+
+    so the truncated start is not preceded by a blank line and strategy B cannot
+    see it.  The lone letter must be the missing capital of a *known* truncated
+    word, which keeps the rule free of ordinary "I" pronoun lines.
+    """
+
+    boundaries: list[tuple[int, int, str]] = []
+
+    lines = raw_text.split("\n")
+    line_offsets: list[int] = []
+    pos = 0
+    for line in lines:
+        line_offsets.append(pos)
+        pos += len(line) + 1
+
+    for i in range(1, len(lines)):
+        letter = lines[i - 1].strip()
+        if not _LONE_LETTER_RE.match(letter):
+            continue
+        candidate = lines[i].strip()
+        if not candidate:
+            continue
+        fragment = candidate.split()[0].rstrip(".,;:!?")
+        repaired = _repaired_word(fragment)
+        if repaired is None:
+            continue
+        if (letter + fragment).lower() != repaired.lower():
+            continue
+        boundaries.append((line_offsets[i - 1], -1, repaired))
+
+    if not boundaries:
+        return [(0, len(raw_text), "")]
+
+    if boundaries[0][0] > 0:
+        boundaries.insert(0, (0, boundaries[0][0], ""))
+
+    for idx in range(len(boundaries) - 1):
+        s, _, t = boundaries[idx]
+        boundaries[idx] = (s, boundaries[idx + 1][0], t)
+    s, _, t = boundaries[-1]
+    boundaries[-1] = (s, len(raw_text), t)
+    return boundaries
 
 
 # ---------------------------------------------------------------------------

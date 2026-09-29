@@ -124,17 +124,26 @@ class UnresolvedEvidence(BaseModel):
     detail: str = Field(default="", max_length=1_000)
 
 
+#: Locator vocabulary that introduces a page number.  This is a curated list, not
+#: a general page-reference parser: a locator in a language that is not listed can
+#: still carry a fabricated page past the check, which plan 5.9 records as a known
+#: limitation of the rule.
+_PAGE_WORD = r"(?:pp?|pg|pgs|pages?|p[áa]g(?:ina|inas|s)?|pagina|pagine|seite|seiten)"
+_PAGE_LETTER = r"(?:[pPsS])"
+_CJK_PAGE = r"(?:页|頁|ページ|페이지)"
+
 _PAGE_RANGE_PATTERNS = (
-    re.compile(r"第\s*(\d{1,7})\s*[-–—~至到]\s*(\d{1,7})\s*[页頁]"),
+    re.compile(rf"第\s*(\d{{1,7}})\s*[-–—~至到]\s*(\d{{1,7}})\s*{_CJK_PAGE}"),
     # Long digit runs stay inside the range pattern so an absurd range is caught
     # as unverifiable instead of leaking its first page as a plausible citation.
-    re.compile(r"(?i)\b(?:pp?|pg|pages?)\.?\s*(\d{1,7})\s*[-–—~]\s*(\d{1,7})"),
+    re.compile(rf"(?i)\b{_PAGE_WORD}\.?\s*(\d{{1,7}})\s*[-–—~]\s*(\d{{1,7}})"),
 )
 _PAGE_SINGLE_PATTERNS = (
-    re.compile(r"第\s*(\d{1,5})\s*[页頁]"),
+    re.compile(rf"第\s*(\d{{1,5}})\s*{_CJK_PAGE}"),
     # A bare "9 页" counts too: without it, dropping the 第 would evade the check.
-    re.compile(r"(\d{1,5})\s*[页頁]"),
-    re.compile(r"(?i)\b(?:pp?|pg|pages?)\.?\s*(\d{1,5})\b"),
+    re.compile(rf"(\d{{1,5}})\s*{_CJK_PAGE}"),
+    re.compile(rf"(?i)\b{_PAGE_WORD}\.?\s*(\d{{1,5}})\b"),
+    re.compile(rf"\b{_PAGE_LETTER}\.\s*(\d{{1,5}})\b"),
 )
 
 

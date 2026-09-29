@@ -293,6 +293,10 @@ class TestReferencedPageNumbers:
             ("see (p 9)", {9}),
             ("see page9", {9}),
             ("see pp 4-6", {4, 5, 6}),
+            ("véase la página 9", {9}),
+            ("siehe S. 9", {9}),
+            ("pág. 9", {9}),
+            ("9 ページ", {9}),
         ],
     )
     def test_page_references_are_extracted(self, text: str, expected: set[int]) -> None:

@@ -96,6 +96,23 @@ def build_model_identity(
     )
 
 
+def force_deterministic_thinking(provider: Any) -> str | None:
+    """Pin a provider to non-thinking mode so ``temperature=0`` is honoured.
+
+    Official DeepSeek endpoints drop ``temperature`` when thinking is enabled, so
+    an answer recorded as ``temperature=0`` would not actually be sampled that way.
+    The answer model owns this provider instance, so pinning it here cannot change
+    the Agent loop's own provider.  Returns the previous mode, or ``None`` when the
+    provider has no thinking control.
+    """
+
+    if not hasattr(provider, "thinking_mode"):
+        return None
+    previous = str(provider.thinking_mode)
+    provider.thinking_mode = "disabled"
+    return previous
+
+
 class AgentProviderAnswerModel:
     """Adapter over an existing Agent provider; adds no provider selection."""
 
@@ -148,4 +165,5 @@ __all__ = [
     "EvidenceAnswerModel",
     "ModelIdentity",
     "build_model_identity",
+    "force_deterministic_thinking",
 ]

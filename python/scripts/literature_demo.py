@@ -371,7 +371,7 @@ def _http_client(base_url: str) -> Any:
     return httpx.Client(base_url=base_url, timeout=120.0)
 
 
-def main(argv: Sequence[str] | None = None) -> int:
+def main(argv: Sequence[str] | None = None, *, client_factory=None) -> int:
     parser = argparse.ArgumentParser(description="Run the fixed literature PoC demo")
     parser.add_argument("--base-url", default="http://127.0.0.1:18088")
     parser.add_argument("--project-path", required=True)
@@ -390,7 +390,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(json.dumps({"error": exc.code, "message": str(exc)}, ensure_ascii=False))
         return 2
 
-    with _http_client(args.base_url) as client:
+    factory = client_factory or _http_client
+    with factory(args.base_url) as client:
         run = run_demo(
             client,
             project_path=args.project_path,

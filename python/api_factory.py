@@ -976,7 +976,10 @@ def create_app(*, cloud_only: bool = False) -> FastAPI:
         register_literature_routes,
     )
     from src.agent_v2.router import _create_provider
-    from src.literature.answer_model import AgentProviderAnswerModel
+    from src.literature.answer_model import (
+        AgentProviderAnswerModel,
+        force_deterministic_thinking,
+    )
     from src.literature.demo_corpus import (
         DemoCorpusError,
         build_fixture_provider,
@@ -1016,6 +1019,14 @@ def create_app(*, cloud_only: bool = False) -> FastAPI:
 
     _answer_model = None
     if _answer_provider is not None:
+        # temperature=0 is only honoured when thinking is off; this provider
+        # instance belongs to the answer model alone (plan 5.9 rule 8).
+        _previous_thinking = force_deterministic_thinking(_answer_provider)
+        if _previous_thinking is not None and _previous_thinking != "disabled":
+            logger.info(
+                "Literature answer provider pinned from thinking=%s to disabled",
+                _previous_thinking,
+            )
         _agent_config = (
             (_answer_config.get("agent") or {}) if isinstance(_answer_config, dict) else {}
         )

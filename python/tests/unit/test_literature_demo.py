@@ -225,6 +225,12 @@ class _StubClient:
         self._responses = responses
         self.calls: list[str] = []
 
+    def __enter__(self) -> _StubClient:
+        return self
+
+    def __exit__(self, *_args) -> None:
+        return None
+
     def post(self, url: str, json=None, data=None, files=None):
         self.calls.append(url)
         for suffix, response in self._responses.items():
@@ -356,6 +362,148 @@ class TestDemoRunFailureScenarios:
         assert steps["attach_fulltext"].reason == "user_attachment_required"
         assert steps["index"].reason == "no_indexed_source"
         assert steps["answer"].reason == "dependency_failed"
+
+
+class TestDemoCli:
+    """The CLI's own logic: exit codes, record writing, corpus failures."""
+
+    def _happy_responses(self) -> dict[str, _StubResponse]:
+        return {
+            "/api/literature/search": _search_page(),
+            "/api/literature/import": _StubResponse(
+                {
+                    "created_count": 1,
+                    "reused_count": 0,
+                    "results": [{"paper_id": "paper_demo_0001", "source_id": "src_demo_0001"}],
+                }
+            ),
+            "/api/literature/fulltext": _StubResponse(
+                {"source_id": "src_demo_0001", "status": "fulltext_ready", "local_path": "x.pdf"}
+            ),
+            "/api/literature/index": _StubResponse(
+                {
+                    "source_id": "src_demo_0001",
+                    "status": "indexed",
+                    "reused": False,
+                    "chunk_count": 2,
+                    "page_count": 1,
+                    "artifact_sha256": "a" * 64,
+                }
+            ),
+            "/api/literature/answer": _StubResponse(
+                {
+                    "status": "answered",
+                    "insufficient_reason": None,
+                    "claims": [
+                        {"claim_id": "claim_x", "text": "c", "evidence_ids": ["evidence_x"]}
+                    ],
+                    "evidence": [
+                        {
+                            "source_id": "src_demo_0001",
+                            "chunk_id": "chunk_x",
+                            "title": "Demo Paper A",
+                            "span": {
+                                "evidence_id": "evidence_x",
+                                "page_start": 1,
+                                "evidence_quote": "q",
+                                "exact_quote": "q",
+                                "coordinate_space": "normalized_page_text_v1",
+                            },
+                        }
+                    ],
+                    "rejected_claims": [],
+                    "unresolved": [],
+                    "model_config_hash": "b" * 64,
+                }
+            ),
+            "/api/literature/evidence": _StubResponse(
+                {
+                    "source_id": "src_demo_0001",
+                    "chunk_id": "chunk_x",
+                    "span": {
+                        "page_start": 1,
+                        "exact_quote": "q",
+                        "coordinate_space": "normalized_page_text_v1",
+                    },
+                }
+            ),
+        }
+
+    def test_successful_run_exits_zero_and_writes_a_record(self, tmp_path: Path) -> None:
+        from scripts.literature_demo import main
+
+        records = tmp_path / "runs"
+        client = _StubClient(self._happy_responses())
+        code = main(
+            [
+                "--project-path",
+                str(tmp_path),
+                "--provider",
+                "arxiv",
+                "--corpus",
+                str(REPO_CORPUS),
+                "--workspace",
+                str(tmp_path / "workspace"),
+                "--records-dir",
+                str(records),
+            ],
+            client_factory=lambda _url: client,
+        )
+
+        assert code == 0
+        written = list(records.glob("*.json"))
+        assert len(written) == 1
+        record = json.loads(written[0].read_text(encoding="utf-8"))
+        assert record["totals"] == {"step": 7, "ok": 6, "failed": 0, "skipped": 1}
+        assert record["answer_status"] == "answered"
+        assert record["answer_model_config_hash"] == "b" * 64
+        assert record["mode"] == "live"
+
+    def test_a_failed_step_exits_one(self, tmp_path: Path) -> None:
+        from scripts.literature_demo import main
+
+        client = _StubClient(
+            {
+                "/api/literature/search": _StubResponse(
+                    {"detail": {"code": "rate_limited"}}, status_code=429
+                )
+            }
+        )
+        code = main(
+            [
+                "--project-path",
+                str(tmp_path),
+                "--provider",
+                "arxiv",
+                "--corpus",
+                str(REPO_CORPUS),
+                "--records-dir",
+                str(tmp_path / "runs"),
+            ],
+            client_factory=lambda _url: client,
+        )
+
+        assert code == 1
+
+    def test_missing_corpus_exits_two_without_touching_the_service(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture
+    ) -> None:
+        from scripts.literature_demo import main
+
+        code = main(
+            [
+                "--project-path",
+                str(tmp_path),
+                "--corpus",
+                str(tmp_path / "absent.json"),
+                "--records-dir",
+                str(tmp_path / "runs"),
+            ],
+            client_factory=lambda _url: pytest.fail("the client must not be built"),
+        )
+
+        assert code == 2
+        assert "corpus_missing" in capsys.readouterr().out
 
 
 class TestDemoRunRecorder:

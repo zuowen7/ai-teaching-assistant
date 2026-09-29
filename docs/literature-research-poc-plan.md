@@ -1,8 +1,8 @@
 # 科研辅助 PoC 规划与实施合同
 
-> 状态：生效；G0、P1、P2A、P2B、P3、P4 已完成；A1 的工具层、会话级验收与前端引用展示已完成，真实在线会话与真实模型行为未验证（见 5.11、5.12）；后续候选 P5 未开始
+> 状态：生效；G0、P1、P2A、P2B、P3、P4 已完成；A1 的工具层、会话级验收与前端引用展示已完成，真实在线 arXiv 已做一次性人工冒烟、真实模型行为仍未验证（见 5.11、5.12）；后续候选 P5 未开始
 >
-> 当前基线：`teaching-refactor@3f3a351`（独立复核与订正提交后更新，见 5.13）
+> 当前基线：`teaching-refactor@df20abb`（§5.13 复核记录提交后；本轮修复见 5.13 的 V-10…V-15）
 >
 > 生效日期：2026-09-20
 >
@@ -657,7 +657,7 @@ M10 缓存路径规则：
 - 会话级验收 `python/tests/integration/test_agent_literature_session_e2e.py` 6 例：真实 `ConversationRuntime` + 真实 `literature_*` 工具 + 真实应用（工具的 `SCHOLAR_API_BASE` 调用由 `httpx.ASGITransport` 直连同一应用，不启服务、不出网）。脚本模型只依据**真实工具结果**规划下一步，断言包括：该链路全部 9 次副作用调用（检索、入库、3×获取全文、3×建索引、应答）逐一停在审批上且顺序与数量与导入结果一致；首个工具是 `literature_sources` 且初始 `source_count=0`；最终 `literature_answer` 为 `answered` 且每条证据都有真实页码与精确原文，并与直接调用 `/api/literature/answer` 的结论 ID 与证据（ID/页码/精确原文）逐项相等；结果经 `agent_event_to_sse` 转换后 `result_detail` 仍可 `json.loads` 且含证据（证明 SSE 边界不额外截断）；拒绝审批时**由计数传输层实测**只有 `/api/project/sources` 到达应用、检索从未发出；越界 `source_id` 被服务以 `source_not_found` 拒绝；第二轮读到本轮所建来源的 `already_indexed=true` 后不再调用 `literature_index` 或 `literature_acquire_fulltext`；**证据不足时按 `next_actions` 在同一项目内扩大 `source_ids` 重问并得到 `answered`**；**同一会话的追问只调用 `literature_sources` + `literature_answer`，不重新检索或重建索引**。
 - 会话级测试暴露一个真实缺陷并已修复：`literature_sources` 最初用工作区 UI 字段 `rag_status == "ready"` 判定 `already_indexed`，而该字段由前端在索引后自行更新——服务端索引成功时它仍是 `unavailable`，于是第二轮会重复索引。现在判定改为服务端写入的 literature 元数据（全文状态 `indexed` 或存在 `index` 记录），并有单元用例固化"UI 字段为 unavailable 但服务端已索引时 `already_indexed` 必须为真"。
 - 前端引用展示：新增 `AgentLiteratureEvidence.vue`（结论 → 可展开的页码级证据；`insufficient` 只显示原因；非合法 JSON 回退原文）；`AgentExecutionGroup.vue` 仅在工具名为 `literature_answer` 时改用该渲染器，SSE 事件名与 `tool_name` 契约未改动。
-- 测试与检查：`test_literature_agent_tools.py` 扩展到 41 例；会话级 6 例；前端 `AgentLiteratureEvidence.test.ts` 7 例与 `agentExecution.test.ts` 渲染分流 1 例（该文件改为保留真实 `createI18n`，使组件内 i18n 回退可被真实语言包校验），另有 i18n 重复键守卫 2 例。全量后端为 `3046 passed, 14 skipped, 8 failed`（§5.13 复核后），8 个失败仍是 §5.3–5.5 已记录且已独立复现于 `071c6b0` 的既存/环境问题；前端全量为 `874 passed`，Prettier、ESLint、`vue-tsc` 全部通过。
+- 测试与检查：`test_literature_agent_tools.py` 扩展到 41 例；会话级 6 例；前端 `AgentLiteratureEvidence.test.ts` 7 例与 `agentExecution.test.ts` 渲染分流 1 例（该文件改为保留真实 `createI18n`，使组件内 i18n 回退可被真实语言包校验），另有 i18n 重复键守卫 2 例。全量后端最终为 `3068 passed, 14 skipped, 0 failed`（§5.13 的 V-14/V-15 修复后；本小节提交时为 `3046 passed, 14 skipped, 8 failed`，其中 8 例失败已分别定位并修复）；前端全量为 `874 passed`，Prettier、ESLint、`vue-tsc` 全部通过。
 - 工具失败与调用上限沿用 Agent V2 既有机制，未新增独立限制：连续工具错误上限由 `_DEFAULT_MAX_TOOL_ERRORS`（选择期 `_SELECTION_MAX_TOOL_ERRORS`）控制，回归用例为 `tests/agent_v2/test_conversation_runtime.py::test_tool_error_limit_counts_consecutive_failures`；停滞调用上限由 `max_stalled_tool_calls` 控制。
 - **仍未完成（A1 剩余部分）**：真实在线 arXiv 下的 Agent 会话未自动化（仍按 D-024 只做一次性人工冒烟）；`methods/literature_poc/METHODOLOGY.md` 仍未建立；多轮追问与"证据不足后补检索"由工具反馈驱动，会话级用例证明了**脚本模型按提示行动时链路成立**，但**没有**证明任意真实模型都会照做（这属于模型行为，不是确定性的系统保证，不得写成系统保证）。§2.4 的八项验收场景现已全部有对应覆盖：计划与确认、跳过重复处理、证据不足后补检索、用户取消、工具失败与调用上限（沿用既有回归）、跨项目与未选文献拒绝、最终证据与普通服务入口一致（同一 `/api/literature/answer` 响应）。
 - 本节结果只证明"Agent 能读到项目范围、确认不可绕过、证据不足有明确的下一步、引用在界面上可展开核对，且整条链在会话中真的跑通"，不证明检索质量、回答正确性、教学效果或 A1 整体验收通过。
@@ -668,11 +668,11 @@ M10 缓存路径规则：
 
 **验证方法（可复现）**
 
-- 全量后端：`cd python && pytest tests/ -q` → `3046 passed, 14 skipped, 8 failed`。
-- "8 个失败是既存问题"：`git worktree add <tmp> 071c6b0` 后在干净基线单跑这 8 个用例 → `8 failed, 17 passed`，失败集合与当前逐项相同。**该说法现已独立复现，不再只继承自 §5.5 的记录。**
+- 全量后端：`cd python && pytest tests/ -q` → **`3068 passed, 14 skipped, 0 failed`**（V-14/V-15 修复后；修复前为 `3046 passed, 14 skipped, 8 failed`）。
+- "那 8 个失败是既存问题"：`git worktree add <tmp> 071c6b0` 后在干净基线单跑这 8 个用例 → `8 failed, 17 passed`，失败集合与修复前逐项相同。**该说法已独立复现，不再只继承自 §5.5 的记录**；其中 5 例（多文章拆分）由 V-15 修复、3 例（`NO_PROXY` 解析）由 V-14 修复，现全部通过。§5.1–§5.12 各阶段记录中的失败数保持不变，它们是当时的真实观测。
 - P3 历史快照：`git worktree add <tmp> b856dcf` 后 `pytest tests/unit/ -q` → `1788 passed, 5 skipped`，与 §5.9 一致。
 - 例数：`pytest --collect-only -q <file>` 逐文件实测（参数化用例按实际收集数计）。
-- 前端：`npx vitest run` → `874 passed`；Prettier、ESLint、`vue-tsc` 通过。
+- 前端：`npx vitest run` → `874 passed`；Prettier、ESLint、`vue-tsc`、生产构建通过。
 
 **复核发现并已修复的缺陷**
 
@@ -698,13 +698,26 @@ M10 缓存路径规则：
 
 **复核确认成立的部分**（不重复证据）：坐标派生引文且调用方不能提交引文/坐标、项目与文献双范围强制、无可用证据不调用模型、被拒结论不降级、D-032 存储键与内容身份分离、运行中应用注册 `fixture` provider 且 `result_mode` 不混用、五个副作用工具 `requires_approval` 为真且项目范围不可由入参覆盖、`already_indexed` 由服务端元数据判定、`next_actions` 仅在 `insufficient` 出现、前端 i18n 键对称与分组正确、SSE 事件名与 `tool_name` 契约未被改动。
 
+**本轮（2026-09-29 第二次复核后）进一步修复**
+
+| # | 项 | 处理 |
+|---|---|---|
+| V-10 | 页码伪造检测可被未枚举写法绕过 | 定位词表扩展为多语言（中/英/西/德/日/葡/意/法）并保留裸 `N 页/頁`；仍明确是有限枚举 |
+| V-11 | 思考模式下 `temperature` 被 provider 丢弃，"temperature=0"名不副实 | 答案模型持有独立 provider 实例，构造时经 `force_deterministic_thinking` 固定为非思考模式（3 例单测）；文档同步该口径 |
+| V-12 | CLI 自身逻辑（退出码、记录落盘）无自动化 | `main()` 支持注入客户端；新增"成功=0 且写记录""失败步=1""语料缺失=2 且不建客户端"三例 |
+| V-13 | P4 运行记录缺可比较的模型身份 | `answer_model_config_hash` 写入记录并在 CLI 用例中断言 |
+| V-14 | **`NO_PROXY` 含 `[::1]` 使 httpx 报 `Invalid port: ':1]'`**，导致 3 个与文献无关的用例失败 | 根因定位后，在 `python/tests/conftest.py` 中丢弃 httpx 无法解析的方括号 IPv6 条目（保留其余绕过项）；3 例转为通过 |
+| V-15 | **多文章拆分漏检"首字母被单独成行"的边界**（`I` + `n 2023` / `nflammation`）：检测器只认"空行 + 截断开头"，该形态无空行 | `src/parser/article_detector.py` 新增策略 C：孤立首字母 + 已知截断片段且二者拼回即为该词时才判为边界，并在切分后修复首词（`I`+`n` → `In`）。4 例合成单测（含两个反例）+ 真实样例集成测试 21 例通过 |
+
+V-14 与 V-15 是本次复核顺带修掉的**与文献链路无关的既存缺陷**，此前一直被记为"环境问题"与"既存失败"；两者现在都有可复现的测试证据。
+
 **仍未验证 / 已知限制**
 
-- 真实在线 arXiv 模式与真实模型的会话行为未自动化（D-024）。
-- 页码伪造检测是有限枚举，`página 9` 等未枚举写法仍可绕过。
-- 思考模式下采样温度不可控。
-- CLI 完整流程未在真实服务器上自动化。
-- `methods/literature_poc/METHODOLOGY.md` 仍未建立；运行记录只含过程事实。
+- 真实**模型**的会话行为未自动化（D-024、D-030）：脚本模型只证明"按提示行动时链路成立"。
+- 真实**在线 arXiv** 已按 D-024 做一次性人工冒烟（2026-09-29）：`all:"retrieval augmented generation"` 返回 `result_mode=live`、`total_results=6011`、3 条真实记录（`2411.18583`、`2502.00306`、`2510.22344`，年份 2024/2025），三条均声明开放 PDF。这是一次人工观测，**不是**自动化用例，也不构成任何质量指标。
+- 页码伪造检测仍是**有限枚举**的定位词表（中/英/西/德/日/葡/意/法），未收录语言的定位词（如 `página` 之外的写法）仍可绕过。
+- CLI 自身的逻辑（参数、退出码 0/1/2、运行记录落盘）已由注入式客户端自动化覆盖；但**在真实 uvicorn 服务上的完整 CLI 运行**仍是人工步骤。
+- `methods/literature_poc/METHODOLOGY.md` 目前只是**未生效的骨架**：正式 RQ、语料、gold、指标与阈值均标注【待确认】，需用户与指导教师填写后才成为协议（§6.2 与 D-039；§5.10、§5.12 记录中的"仍未建立"指当时的提交状态）。
 
 ## 6. 验证与毕设方法边界
 
@@ -725,6 +738,8 @@ M10 缓存路径规则：
 - 问题及证据 gold 的制作与复核方式；
 - 主要指标、次要指标、阈值和失败处理；
 - 代码、输入、配置、模型响应与输出的哈希/版本记录。
+
+截至 2026-09-29，该文件已存在但**尚未生效**：`methods/literature_poc/METHODOLOGY.md` 目前是按上述清单搭好的骨架，每一项取值都标注【待确认】（决策 D-039）。它**不是**协议，不得据以开展或报告效果实验；只有用户与指导教师填入取值并确认后，该文件才产生约束力。
 
 未经该方法协议，不得开展或报告正式效果实验。根目录现有 `METHODOLOGY.md` 继续只服务 Reviewer/Ledger/Anchor 研究，不得被描述为本 PoC 的方法方案。
 
@@ -820,6 +835,9 @@ M10 缓存路径规则：
 | D-034 | 固定演示脚本以 CLI 形式按 §7.1 顺序驱动既有 HTTP API，不新增服务端"一键演示"端点；检索式与文献选择仍由调用方显式给出 | 本文冻结（2026-09-29） | §7.1 的第 2、4 步是用户确认点；服务端自动跑完全程会把"确认过的检索式"和"用户选择"变成脚本内部行为，无法再声称链路包含确认环节 |
 | D-035 | 每次演示运行写一份 JSON 记录到 `methods/literature_poc/runs/`，含步骤状态/原因/耗时、计数、模式与确认检索式；该目录只存运行记录，正式方法协议仍单独冻结 | 本文冻结（2026-09-29） | §5 的 P4 要求"重复运行、指标记录"，§6.2 要求正式评测前另建方法协议；把运行记录与方法协议混在一处会让"过程记录"被误当成"评测协议已冻结" |
 | D-036 | A1 的 Agent 工具只包装 §5.9 的确定性服务：`project_root` 恒取工具注册表的工作区且不可由入参覆盖，检索式/论文选择/问答范围三个确认点以 `approval_scope="exact-input"` 复用既有 `await_approval` 契约，`arxiv_search` 与"无 `source_ids` 的 `rag_search`"直接移除而非保留兼容分支 | 本文冻结（2026-09-29） | §2.4 要求"Agent 通过确定性服务完成操作，不维护第二套状态"且"参数非法、失败、证据不足必须显式停止"；保留旧路径会让 Agent 能在无范围、无证据校验的情况下给出答案（违反 §4.5）。被否决方案：保留 `arxiv_search` 并标注"仅调试用"（调试路径同样会进入模型上下文并可能被当成证据） |
+| D-037 | 修复独立复核发现的缺陷时，**只修可证伪的行为**并同时补回归测试；若某条承诺无法在离线环境证伪（如真实模型行为），则改文档措辞而不是加"看起来通过"的测试 | 本文冻结（2026-09-29） | §5.13 的 V-1…V-9 中，凡是"测试没红过"的承诺都被改为可证伪（例如故意构造 `insufficient` + 非空 claims 的违约载荷、用计数传输层实测请求路径）；真实模型行为与在线会话仍列在"仍未验证"，不以脚本模型的结果冒充。被否决方案：把在线/真实模型场景写成 `xfail` 或跳过（会掩盖未验证状态） |
+| D-038 | 与文献链路无关但阻塞全量回归的既存缺陷一并修复：`NO_PROXY` 中的方括号 IPv6 条目在测试基础设施层规范化；多文章拆分的"孤立首字母"边界在检测器中新增策略 C | 本文冻结（2026-09-29） | 两者都让全量套件长期带红（`8 failed`），使"新增失败"与"既存失败"难以区分，直接削弱回归证据的价值。修复都带可复现测试（合成夹具 + 真实样例），且不改变对外契约。被否决方案：继续在文档里把它们记作"环境问题/既存失败"（读者无法据此判断回归是否引入新问题） |
+| D-039 | `methods/literature_poc/METHODOLOGY.md` 先落**未生效骨架**：只列必须冻结的字段并逐项标注【待确认】，不代填 RQ、语料、gold、指标或阈值 | 本文冻结（2026-09-29） | AGENTS.md 与本合同 §6.2 一致要求这些取值由用户与指导教师确认；骨架让"缺什么"可见，同时不产生任何可被误读为协议的约束力。被否决方案：由我拟定一套指标与阈值（会把未经确认的取值伪装成协议）；或继续不建文件（缺项不可见） |
 
 ### 9.2 待确认但不阻塞 P1–P3 的事项
 

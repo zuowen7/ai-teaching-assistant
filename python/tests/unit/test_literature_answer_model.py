@@ -19,6 +19,7 @@ from src.literature.answer_model import (
     EvidenceAnswerModel,
     ModelIdentity,
     build_model_identity,
+    force_deterministic_thinking,
 )
 
 BASE_URL = "https://api.openai.com/v1"
@@ -32,11 +33,19 @@ def identity() -> ModelIdentity:
 class FakeProvider:
     """Minimal stand-in for the existing Agent provider surface."""
 
-    def __init__(self, text: str = "{}", *, api_key: str = "sk-secret-one") -> None:
+    def __init__(
+        self,
+        text: str = "{}",
+        *,
+        api_key: str = "sk-secret-one",
+        thinking_mode: str | None = None,
+    ) -> None:
         self.text = text
         self.api_key = api_key
         self.calls: list[dict] = []
         self.failure: Exception | None = None
+        if thinking_mode is not None:
+            self.thinking_mode = thinking_mode
 
     async def chat(
         self,
@@ -190,3 +199,27 @@ class TestAgentProviderAnswerModel:
         )
         with pytest.raises(RuntimeError):
             await adapter.complete(system_prompt="s", prompt="p")
+
+
+class TestDeterministicThinking:
+    """Rule 8: the recorded temperature=0 must actually reach the provider."""
+
+    def test_thinking_is_pinned_to_disabled_and_the_previous_mode_returned(self) -> None:
+        provider = FakeProvider(thinking_mode="auto")
+
+        previous = force_deterministic_thinking(provider)
+
+        assert previous == "auto"
+        assert provider.thinking_mode == "disabled"
+
+    def test_a_provider_without_thinking_control_is_left_alone(self) -> None:
+        provider = FakeProvider()
+
+        assert force_deterministic_thinking(provider) is None
+        assert not hasattr(provider, "thinking_mode")
+
+    def test_pinning_twice_is_idempotent(self) -> None:
+        provider = FakeProvider(thinking_mode="enabled")
+
+        assert force_deterministic_thinking(provider) == "enabled"
+        assert force_deterministic_thinking(provider) == "disabled"
