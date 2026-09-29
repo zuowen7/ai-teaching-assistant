@@ -969,7 +969,12 @@ def create_app(*, cloud_only: bool = False) -> FastAPI:
         data_root=data_root,
     )
 
-    from routers.literature import ProjectSourceManifestStore, register_literature_routes
+    from routers.literature import (
+        ProjectSourceManifestStore,
+        RagPageIndexStore,
+        register_literature_routes,
+    )
+    from src.literature.fulltext import HttpFullTextDownloader
     from src.literature.providers.arxiv import ArxivProvider
     from src.literature.service import LiteratureService
 
@@ -978,6 +983,8 @@ def create_app(*, cloud_only: bool = False) -> FastAPI:
         service=LiteratureService(
             providers=[ArxivProvider()],
             project_store=ProjectSourceManifestStore(),
+            index_store=RagPageIndexStore(state_rag),
+            downloader=HttpFullTextDownloader(),
         ),
     )
 

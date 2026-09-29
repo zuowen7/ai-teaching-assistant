@@ -41,6 +41,7 @@ QUERY = 'all:"research assistance"'
 class MemoryProjectStore:
     def __init__(self) -> None:
         self.projects: dict[str, list[dict[str, Any]]] = {}
+        self.artifacts: dict[str, str] = {}
         self.replace_count = 0
         self.fail_replace = False
 
@@ -52,6 +53,19 @@ class MemoryProjectStore:
         if sources != current:
             self.projects[project_path] = deepcopy(sources)
             self.replace_count += 1
+
+    def read_sources(self, project_path: str) -> list[dict[str, Any]]:
+        return deepcopy(self.projects.get(project_path, []))
+
+    def resolve_source_artifact(self, project_path: str, source) -> str:
+        path = self.artifacts.get(str(source.get("id")))
+        if path is None:
+            raise LiteratureServiceError(
+                LiteratureServiceErrorCode.SOURCE_ARTIFACT_MISSING,
+                "文献附件不存在",
+                details={"source_id": source.get("id")},
+            )
+        return path
 
 
 class StaticProvider:

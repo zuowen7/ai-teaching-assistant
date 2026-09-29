@@ -14,6 +14,7 @@ from fastapi.testclient import TestClient
 
 from routers.literature import ProjectSourceManifestStore, register_literature_routes
 from routers.project import ProjectSourceUpsert, _upsert_source, register_project
+from src.literature.evidence import sha256_file
 from src.literature.models import ExternalIdentifiers, PaperRecord, SearchQuery
 from src.literature.providers.base import (
     LiteratureProviderError,
@@ -22,6 +23,12 @@ from src.literature.providers.base import (
 )
 from src.literature.providers.fixture import FixtureProvider
 from src.literature.service import LiteratureService
+from tests.unit.test_literature_indexing import (
+    PAGE_ONE,
+    PAGE_TWO,
+    MemoryPageIndexStore,
+    write_pdf,
+)
 
 NOW = datetime(2026, 9, 20, 3, 0, tzinfo=UTC)
 QUERY = 'all:"multi agent writing"'
@@ -82,7 +89,7 @@ def make_provider(
     )
 
 
-def make_app(tmp_path: Path, provider: FixtureProvider) -> FastAPI:
+def make_app(tmp_path: Path, provider: FixtureProvider, *, index_store=None) -> FastAPI:
     app = FastAPI()
     register_project(
         app,
@@ -96,6 +103,7 @@ def make_app(tmp_path: Path, provider: FixtureProvider) -> FastAPI:
         service=LiteratureService(
             providers=[provider],
             project_store=ProjectSourceManifestStore(),
+            index_store=index_store,
         ),
     )
     return app
@@ -188,6 +196,132 @@ def test_search_select_import_and_repeat_reuse_existing_project_source(tmp_path:
         assert confirmed_at.tzinfo is not None
         assert executed_at.tzinfo is not None
         assert executed_at >= confirmed_at
+
+
+def test_index_and_resolve_evidence_over_http(tmp_path: Path) -> None:
+    """The two P2B routes compose the real project store with a page index."""
+
+    record = make_record()
+    index_store = MemoryPageIndexStore()
+    with TestClient(
+        make_app(tmp_path, make_provider(records=[record]), index_store=index_store)
+    ) as client:
+        project = create_project(client, tmp_path)
+        execution = execute_search(client)
+        imported = client.post(
+            "/api/literature/import",
+            json={
+                "project_path": str(project),
+                "search_execution_id": execution["search_execution_id"],
+                "paper_ids": [record.paper_id],
+            },
+        )
+        assert imported.status_code == 200
+        source_id = imported.json()["results"][0]["source_id"]
+
+        pdf = write_pdf(tmp_path / "attached.pdf", [PAGE_ONE, PAGE_TWO])
+
+        missing = client.post(
+            "/api/literature/index",
+            json={"project_path": str(project), "source_id": source_id},
+        )
+        assert missing.status_code == 409
+        assert missing.json()["detail"]["code"] == "source_artifact_missing"
+
+        with pdf.open("rb") as stream:
+            attached = client.post(
+                "/api/project/sources/import",
+                data={"project_path": str(project), "source_id": source_id},
+                files={"file": (pdf.name, stream, "application/pdf")},
+            )
+        assert attached.status_code == 200
+        assert attached.json()["id"] == source_id
+        assert attached.json()["metadata"]["literature"]["fulltext"]["status"] == "metadata_only"
+
+        indexed = client.post(
+            "/api/literature/index",
+            json={"project_path": str(project), "source_id": source_id},
+        )
+        assert indexed.status_code == 200
+        body = indexed.json()
+        assert body["status"] == "indexed"
+        assert body["chunk_count"] == len(index_store.chunks) >= 2
+        assert body["page_count"] == 2
+        assert body["artifact_sha256"] == sha256_file(pdf)
+        assert body["reused"] is False
+
+        chunk_id = index_store.chunk_ids_on_page(2)[0]
+        resolved = client.post(
+            "/api/literature/evidence",
+            json={"project_path": str(project), "source_id": source_id, "chunk_id": chunk_id},
+        )
+        assert resolved.status_code == 200
+        span = resolved.json()["span"]
+        assert span["page_start"] == span["page_end"] == 2
+        assert span["artifact_sha256"] == body["artifact_sha256"]
+        assert span["coordinate_space"] == "normalized_page_text_v1"
+        assert span["exact_quote"]
+        assert resolved.json()["paper_id"] == record.paper_id
+
+        unknown = client.post(
+            "/api/literature/evidence",
+            json={
+                "project_path": str(project),
+                "source_id": source_id,
+                "chunk_id": "chunk_missing",
+            },
+        )
+        assert unknown.status_code == 404
+        assert unknown.json()["detail"]["code"] == "chunk_not_found"
+
+        sources = client.get("/api/project/sources", params={"project_path": str(project)}).json()
+        literature = sources["sources"][0]["metadata"]["literature"]
+        assert literature["fulltext"]["status"] == "indexed"
+        assert literature["index"]["chunk_count"] == body["chunk_count"]
+        assert literature["index"]["artifact_sha256"] == body["artifact_sha256"]
+
+
+def test_fulltext_route_reports_missing_wiring_and_unknown_sources(tmp_path: Path) -> None:
+    """HTTP mapping for M5 acquisition: unknown source is 404, unwired downloader 503."""
+
+    record = make_record()
+    with TestClient(make_app(tmp_path, make_provider(records=[record]))) as client:
+        project = create_project(client, tmp_path)
+        execution = execute_search(client)
+        imported = client.post(
+            "/api/literature/import",
+            json={
+                "project_path": str(project),
+                "search_execution_id": execution["search_execution_id"],
+                "paper_ids": [record.paper_id],
+            },
+        )
+        assert imported.status_code == 200
+        source_id = imported.json()["results"][0]["source_id"]
+
+        unknown = client.post(
+            "/api/literature/fulltext",
+            json={"project_path": str(project), "source_id": "src_lit_unknown"},
+        )
+        assert unknown.status_code == 404
+        assert unknown.json()["detail"]["code"] == "source_not_found"
+
+        unwired = client.post(
+            "/api/literature/fulltext",
+            json={"project_path": str(project), "source_id": source_id},
+        )
+        assert unwired.status_code == 503
+        assert unwired.json()["detail"]["code"] == "downloader_unavailable"
+
+        rejected = client.post(
+            "/api/literature/fulltext",
+            json={
+                "project_path": str(project),
+                "source_id": source_id,
+                "local_path": "D:/tmp/evil.pdf",
+            },
+        )
+        assert rejected.status_code == 422
 
 
 def test_regular_source_update_cannot_delete_or_replace_literature_metadata(

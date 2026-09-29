@@ -169,4 +169,78 @@ describe('useSourceLibrary', () => {
     expect(saved.rag_status).toBe('ready')
     expect(saved.metadata).toMatchObject({ rag_doc_id: 'project:src_1', chunk_count: 2 })
   })
+
+  it('indexes a literature PDF through the page-aware evidence route', async () => {
+    const source = {
+      id: 'src_lit_1',
+      title: 'Paper',
+      original_path: 'D:/papers/project-a/references/paper.pdf',
+      translated_path: null,
+      translation_task_id: null,
+      rag_status: 'unavailable' as const,
+      reading_status: 'unread' as const,
+      cited: false,
+      metadata: { literature: { schema_version: 1 } },
+      created_at: '2026-07-26T00:00:00Z',
+      updated_at: '2026-07-26T00:00:00Z',
+    }
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementation(async (url, init) => {
+      const target = String(url)
+      if (target.endsWith('/api/literature/index')) {
+        return new Response(
+          JSON.stringify({ doc_id: 'project:src_lit_1', chunk_count: 7, status: 'indexed' }),
+          { status: 200 },
+        )
+      }
+      // The literature service rewrites metadata.literature while indexing, so the
+      // server's view after indexing differs from the object the caller held.
+      if (target.includes('/api/project/sources?')) {
+        return new Response(
+          JSON.stringify({
+            sources: [
+              {
+                ...source,
+                metadata: { literature: { schema_version: 1, fulltext: { status: 'indexed' } } },
+              },
+            ],
+          }),
+          { status: 200 },
+        )
+      }
+      if (target.includes('/content') || target.endsWith('/api/rag/ingest')) {
+        return new Response(JSON.stringify({ text: 'must not be sent' }), { status: 200 })
+      }
+      const body = JSON.parse(String(init?.body))
+      return new Response(
+        JSON.stringify({
+          ...source,
+          ...body,
+          id: 'src_lit_1',
+          metadata: body.metadata,
+          rag_status: body.rag_status,
+        }),
+        { status: 200 },
+      )
+    })
+
+    const saved = await useSourceLibrary().indexSource(source)
+
+    const indexCall = fetchMock.mock.calls.find(([url]) =>
+      String(url).endsWith('/api/literature/index'),
+    )
+    expect(JSON.parse(String(indexCall?.[1]?.body))).toEqual({
+      project_path: 'D:/papers/project-a',
+      source_id: 'src_lit_1',
+    })
+    expect(fetchMock.mock.calls.some(([url]) => String(url).endsWith('/api/rag/ingest'))).toBe(
+      false,
+    )
+    const upsertBodies = fetchMock.mock.calls
+      .filter(([url]) => String(url).endsWith('/api/project/sources'))
+      .map(([, init]) => JSON.parse(String(init?.body)))
+    const readyBody = upsertBodies.find((body) => body.rag_status === 'ready')
+    expect(readyBody?.metadata.literature.fulltext.status).toBe('indexed')
+    expect(saved.rag_status).toBe('ready')
+    expect(saved.metadata).toMatchObject({ rag_doc_id: 'project:src_lit_1', chunk_count: 7 })
+  })
 })

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -212,6 +213,11 @@ class TestProjectSources:
         assert stored_path.is_file()
         assert stored_path.parent == project_path / "references"
         assert source["metadata"]["chars"] == 49
+        assert (
+            source["metadata"]["document_sha256"]
+            == hashlib.sha256(b"Attention lets a model retrieve relevant context.").hexdigest()
+        )
+        assert "page_texts" not in source["metadata"]
 
         content = client.get(
             f"/api/project/sources/{source['id']}/content",
@@ -312,6 +318,135 @@ class TestProjectSources:
         assert payload["metadata"]["zotero_key"] == "ABC123"
         assert payload["metadata"]["authors"] == ["Ada Researcher"]
         assert Path(payload["original_path"]).is_file()
+
+    def test_source_content_reports_document_sha256_and_keeps_flat_text_contract(
+        self, client, location: Path
+    ):
+        project_path = self._create_project(client, location)
+        raw = b"Attention lets a model retrieve relevant context.\n\nSecond block stays flat."
+        source = client.post(
+            "/api/project/sources/import",
+            data={"project_path": str(project_path)},
+            files={"file": ("page-aware-notes.txt", raw, "text/plain")},
+        ).json()
+        stored_path = Path(source["original_path"])
+
+        response = client.get(
+            f"/api/project/sources/{source['id']}/content",
+            params={"project_path": str(project_path)},
+        )
+        assert response.status_code == 200
+        payload = response.json()
+
+        expected_text = raw.decode("utf-8").strip()
+        assert payload["document_sha256"] == hashlib.sha256(raw).hexdigest()
+        assert payload["document_sha256"] == hashlib.sha256(stored_path.read_bytes()).hexdigest()
+        assert payload["text"] == expected_text
+        assert payload["chars"] == len(expected_text)
+        assert payload["pages"] == 1
+        assert isinstance(payload["pages"], int)
+        assert payload["source_id"] == source["id"]
+        assert payload["version"] == "original"
+        assert "page_texts" not in payload
+        assert set(payload) == {
+            "source_id",
+            "title",
+            "version",
+            "text",
+            "pages",
+            "chars",
+            "document_sha256",
+        }
+
+    def test_source_content_include_pages_wraps_flat_text_in_one_page(self, client, location: Path):
+        project_path = self._create_project(client, location)
+        raw = b"# Evidence\n\nProject-scoped source text."
+        source = client.post(
+            "/api/project/sources/import",
+            data={"project_path": str(project_path)},
+            files={"file": ("flat-source.md", raw, "text/markdown")},
+        ).json()
+
+        response = client.get(
+            f"/api/project/sources/{source['id']}/content",
+            params={"project_path": str(project_path), "include_pages": "true"},
+        )
+        assert response.status_code == 200
+        payload = response.json()
+
+        assert payload["pages"] == 1
+        assert len(payload["page_texts"]) == payload["pages"]
+        assert [page["page_num"] for page in payload["page_texts"]] == [1]
+        assert set(payload["page_texts"][0]) == {"page_num", "text"}
+        assert payload["page_texts"][0]["text"].strip() == payload["text"]
+
+    def test_source_content_include_pages_keeps_one_entry_per_pdf_page(
+        self, client, location: Path, tmp_path: Path
+    ):
+        import fitz
+
+        markers = ["PAGEMARKERONE", "PAGEMARKERTWO", "PAGEMARKERTHREE"]
+        pdf_path = tmp_path / "three-page-paper.pdf"
+        document = fitz.open()
+        try:
+            for marker in markers:
+                page = document.new_page()
+                page.insert_text((72, 150), f"{marker} body text kept for page provenance.")
+            document.save(str(pdf_path))
+        finally:
+            document.close()
+
+        project_path = self._create_project(client, location)
+        source = client.post(
+            "/api/project/sources/import",
+            data={"project_path": str(project_path)},
+            files={"file": (pdf_path.name, pdf_path.read_bytes(), "application/pdf")},
+        ).json()
+        assert source["metadata"]["pages"] == 3
+
+        response = client.get(
+            f"/api/project/sources/{source['id']}/content",
+            params={"project_path": str(project_path), "include_pages": "true"},
+        )
+        assert response.status_code == 200
+        payload = response.json()
+
+        page_texts = payload["page_texts"]
+        assert payload["pages"] == 3
+        assert isinstance(payload["pages"], int)
+        assert len(page_texts) == payload["pages"]
+        assert [page["page_num"] for page in page_texts] == [1, 2, 3]
+        for marker, page in zip(markers, page_texts, strict=True):
+            assert marker in page["text"]
+            assert page["text"].strip() in payload["text"]
+        order = [payload["text"].index(marker) for marker in markers]
+        assert order == sorted(order)
+
+    def test_import_persists_document_sha256_without_page_texts_in_manifest(
+        self, client, location: Path
+    ):
+        project_path = self._create_project(client, location)
+        raw = b"# Full text\n\nManifest provenance stays flat."
+        response = client.post(
+            "/api/project/sources/import",
+            data={"project_path": str(project_path)},
+            files={"file": ("manifest-provenance.md", raw, "text/markdown")},
+        )
+        assert response.status_code == 200
+        source = response.json()
+        digest = hashlib.sha256(raw).hexdigest()
+
+        assert source["metadata"]["document_sha256"] == digest
+        assert "page_texts" not in source["metadata"]
+
+        manifest = json.loads(
+            (project_path / ".yanmo" / "sources.json").read_text(encoding="utf-8")
+        )
+        stored = next(item for item in manifest["sources"] if item["id"] == source["id"])
+        assert stored["metadata"]["document_sha256"] == digest
+        assert "page_texts" not in stored["metadata"]
+        assert stored["metadata"]["chars"] == len(raw.decode("utf-8").strip())
+        assert stored["metadata"]["pages"] == 1
 
 
 class TestProjectExportHistory:

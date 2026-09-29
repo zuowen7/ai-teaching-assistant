@@ -238,25 +238,28 @@ async function indexSource(source: ProjectSource): Promise<ProjectSource> {
   let queuedSource = source
   try {
     queuedSource = await updateSource(source, { rag_status: 'queued' })
-    const content = await readSource(queuedSource)
     const docId = `project:${source.id}`
-    const response = await fetch(`${API_BASE}/api/rag/ingest`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        doc_id: docId,
-        title: source.title,
-        text: content.text,
-        project_root: projectPath(),
-        source_id: source.id,
-      }),
-    })
+    const pageAware = isEvidenceIndexable(queuedSource)
+    const response = pageAware
+      ? await fetch(`${API_BASE}/api/literature/index`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            project_path: projectPath(),
+            source_id: source.id,
+          }),
+        })
+      : await ingestFlatText(queuedSource, docId)
     if (!response.ok) throw new Error(await parseError(response))
     const payload = (await response.json()) as { chunk_count?: number }
-    return await updateSource(queuedSource, {
+    // The literature service owns metadata.literature. Echoing the pre-index
+    // metadata back would be rejected as a client-side literature mutation, so
+    // re-read the source the service just rewrote before patching rag_status.
+    const current = pageAware ? await refreshSource(source.id, queuedSource) : queuedSource
+    return await updateSource(current, {
       rag_status: 'ready',
       metadata: {
-        ...queuedSource.metadata,
+        ...current.metadata,
         rag_doc_id: docId,
         chunk_count: payload.chunk_count ?? 0,
         indexed_at: new Date().toISOString(),
@@ -269,6 +272,37 @@ async function indexSource(source: ProjectSource): Promise<ProjectSource> {
   } finally {
     indexingSourceId.value = ''
   }
+}
+
+/**
+ * Page-level evidence indexing needs a real page structure, so it is limited to
+ * PDF attachments of sources that carry normalized literature metadata. Every
+ * other source keeps the flat-text path and stays non-evidence.
+ */
+function isEvidenceIndexable(source: ProjectSource): boolean {
+  const originalPath = typeof source.original_path === 'string' ? source.original_path : ''
+  return Boolean(source.metadata?.literature) && originalPath.toLowerCase().endsWith('.pdf')
+}
+
+/** Reload the source list and return the server's current view of one source. */
+async function refreshSource(sourceId: string, fallback: ProjectSource): Promise<ProjectSource> {
+  await loadSources().catch(() => undefined)
+  return sources.value.find((item) => item.id === sourceId) ?? fallback
+}
+
+async function ingestFlatText(source: ProjectSource, docId: string): Promise<Response> {
+  const content = await readSource(source)
+  return fetch(`${API_BASE}/api/rag/ingest`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      doc_id: docId,
+      title: source.title,
+      text: content.text,
+      project_root: projectPath(),
+      source_id: source.id,
+    }),
+  })
 }
 
 async function querySources(query: string, sourceIds?: string[]): Promise<SourceQueryHit[]> {

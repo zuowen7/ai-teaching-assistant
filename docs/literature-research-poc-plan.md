@@ -1,12 +1,14 @@
 # 科研辅助 PoC 规划与实施合同
 
-> 状态：生效；G0、P1、P2A 已完成；P2B–P5 尚未完成，科研辅助 PoC 尚未整体跑通
+> 状态：生效；G0、P1、P2A、P2B 已完成；P3、P4、A1 及后续候选 P5 尚未完成，科研辅助 PoC 尚未整体跑通
 >
 > 当前基线：`teaching-refactor@071c6b0`
 >
 > 生效日期：2026-09-20
 >
 > 暂定题目：**面向科研辅助的证据可追溯多文献检索问答系统设计与实现**
+>
+> 2026-09-29 开题稿建议题目：**基于智能体的科研文献检索与可溯源问答系统设计与实现**。用于体现用户要求保留的 Agent 特色，尚非正式备案题目；范围补充见 §2.4、D-025–D-027。
 >
 > 方向来源：据用户转述并确认，教师已明确本阶段只需跑通技术链路、证明技术可行；知网合作、学校算力、正式部署等属于后续学校工程化事项。
 >
@@ -113,10 +115,22 @@
 - 基于已有证据生成带引用的研究主题分类或对比矩阵；
 - 增加 OpenAlex 等第二个公开元数据适配器；
 - 把 Review 或 Argument Map 作为独立后续工作流接入；
-- 将该闭环包装成 Agent 工具或多角色协作场景；
+- 将该闭环扩展为多角色协作场景（单 Agent 接入见 §2.4）；
 - 优化排序、混合检索和 rerank。
 
 这些项目不得阻塞 M1–M10。
+
+### 2.4 单 Agent 科研流程接入（2026-09-29 补充）
+
+用户在正式开题讨论中明确要求保留 Agent 特色。为此，在 M1–M10 及 P4 阶段门完成后增加 A1 单 Agent 接入，作为本次毕设计划交付的一部分；原有证据链不改为多智能体调度研究。
+
+- 复用 Agent V2，围绕研究问题提出可见的任务计划和检索式，依据真实工具结果选择下一步，支持当前项目内的连续追问。
+- 检索式变更与论文选择由用户确认；Agent 通过确定性文献、全文、索引及证据问答服务完成操作，不维护第二套文献或索引状态。
+- 每次检索和证据问答都继承 `project_root` 与已确认的 `source_ids`；不得用旧 Agent 无范围 `rag_search` 或原始 arXiv 响应替代本合同服务。
+- 工具结果进入执行记录；参数非法、失败、证据不足及达到调用上限时必须显式停止或请求用户调整，不能仅凭模型文字宣称操作成功。
+- A1 验收覆盖：新问题下的计划与确认；已有索引下跳过重复处理；证据不足时补充范围内检索或提出新的检索计划；用户取消；工具失败与调用上限；跨项目及未选文献拒绝；最终证据与普通服务入口一致。
+- 证据问答可对所选论文的方法、条件和差异作有出处的文字归纳，供用户形成综述笔记和收敛选题。全面综述、选题新颖性保证、自主实验设计、导师匹配和多智能体协作不成为首版承诺。
+- A1 实现时需要工具/服务/会话的后端覆盖及计划、确认、状态、引用展示的前端覆盖。本次仅更新开题规划，不宣称 A1 已实现或验收通过。
 
 ## 3. 当前代码基线与缺口
 
@@ -272,9 +286,10 @@ indexing  -> index_failed
 | G0 范围冻结 | 本规划生效；旧路线标为历史；记录暂定题目和非目标 | 无 | 后续任务均能映射到 M1–M10 | 已完成（2026-09-20） |
 | P1 合同与夹具 | 建立规范化模型、Provider 接口、失败语义、FixtureProvider 和契约测试 | G0 | FixtureProvider 完整通过同一公开接口；无 UI 依赖 | 已完成（2026-09-20） |
 | P2A 文献发现与入库 | ArxivProvider、搜索 API、去重、选择、项目入库、全文状态 | P1 | 固定查询可在线或从明确标记的缓存返回结构化记录；重复加入不产生重复条目 | 已完成（2026-09-21；范围仅为文献发现、去重和项目入库） |
-| P2B 页级解析与索引 | 项目内容 API 保留页结构；页内 chunk；证据元数据；索引过期规则 | P1 | 任一检索 hit 均能解析回同一哈希文档的真实页码与精确原文 | 未开始 |
+| P2B 页级解析与索引 | 项目内容 API 保留页结构；页内 chunk；证据元数据；索引过期规则 | P1 | 任一检索 hit 均能解析回同一哈希文档的真实页码与精确原文 | 已完成（2026-09-22，见 5.6、5.8；含 M5 开放 PDF 获取） |
 | P3 证据问答 | 多文献选择、项目隔离检索、Evidence Answer Service、证据 UI、无证据拒答 | P2A + P2B | 每个渲染结论的证据均通过机器校验；无范围查询被拒绝 | 未开始 |
 | P4 演示与技术评测 | 固定公开论文包、缓存路径、失败场景、重复运行、指标记录 | P3 | 在线与缓存模式均能完成同一演示脚本；失败不被伪装为成功 | 未开始 |
+| A1 单 Agent 接入 | 复用 Agent V2 规划任务、调用已验收服务、处理真实反馈与连续追问 | P4、M1–M10 全部门通过 | §2.4 场景通过；范围、证据和失败语义与服务入口一致；工具记录可复核 | 未开始（2026-09-29 新增计划） |
 | P5 后续候选 | 主题分类、第二公开源、Review/Argument Map、检索优化 | P4 | 逐项另行立项，不反向改变首版验收 | 未开始 |
 
 P2A 与 P2B 在 P1 合同冻结后可以并行；P3 不得在两者任一阶段门失败时提前开始。
@@ -329,8 +344,86 @@ P2A 与 P2B 在 P1 合同冻结后可以并行；P3 不得在两者任一阶段�
 - 仍未完成：缓存或 Fixture provider 未注册进运行中的应用，因此 §5.4 的 cache/fixture 标记路径与 M10 仍留待 P4；API 层仍不向前端透出服务端错误 `details`；结果分页与无障碍修饰属于 P3/P4 范围。
 - 本节结果仍只证明工程行为与失败路径，不构成检索质量、回答正确性或教学效果证据。
 
-## 6. 验证与毕设方法边界
+### 5.6 P2B 页级解析与索引完成证据（2026-09-22）
 
+- 新增 `python/src/literature/evidence.py`：冻结 `normalized_page_text_v1` 归一化规则（统一换行、行内空白折叠、空行折叠、页首尾裁剪）、页内切块（默认 1400/180，窗口不跨页）、由 artifact 哈希+页码+字符坐标+chunker 版本派生的稳定 `chunk_id`、索引指纹（artifact 哈希 + parser/chunker/embedding/index 版本）、以及只从坐标**派生**引文的 `resolve_evidence_span`。引用文本不由调用方提供，因此无法伪造。
+- `python/routers/project.py` 的内容接口不再只返回展平文本：新增 `include_pages` 参数返回逐页原文，并始终返回 `document_sha256`；`text`/`chars`/`pages`（仍为整数计数）保持不变，逐页文本不写入 `sources.json`。
+- `python/routers/rag.py` 新增页级索引通道：chunk 元数据携带 artifact SHA-256、`page_start`/`page_end`、`char_start`/`char_end`、`chunk_id`、parser/chunker/embedding/index 版本与索引指纹；同一 artifact 与指纹重复索引时复用，配置或文件变化时必须重建。原展平文本通道（翻译自动入库、上传、手写文本）行为不变。
+- `python/src/literature/service.py` 新增 `index_source` 与 `resolve_evidence`，并驱动 §4.4 状态机：`metadata_only → fulltext_ready → parsing → parsed → indexing → indexed`，失败时落到 `parse_failed` / `index_failed` 并保留 artifact 字段与失败原因。证据解析会重新读取并重新哈希附件、重新按页解析，再校验坐标、块身份与块文本，任何不一致都以显式 `evidence_unresolved`（含 `artifact_hash_mismatch` / `stale_index` / `quote_mismatch` 等子码）失败。
+- API：`POST /api/literature/index` 与 `POST /api/literature/evidence`；两者都在服务端查索引，调用方不能提交坐标或引文。Source Library 的"建立索引"动作对"PDF + 文献条目"改走页级通道，其它来源保持展平通道（因此永不成为证据）。
+- 阶段门证据：`python/tests/unit/test_literature_indexing.py` 用 PyMuPDF 生成真实两页 PDF，逐块调用 `resolve_evidence`，断言每块 `page_start == page_end`、坐标切片等于归一化页文本中的精确原文、引文非空、页码覆盖两页、第 1 页的引文不包含第 2 页的标记文本；另覆盖替换 PDF（`artifact_hash_mismatch`）、版本变化与嵌入模型变化（`stale_index`）、无页元数据的翻译块（`missing_page_metadata`）、跨来源块、缺块、非 PDF 附件、不可解析 PDF、无可提取文本、缺附件、未启用索引与未知来源。
+- `python/tests/unit/test_literature_router.py` 另用真实项目存储与 HTTP 客户端跑通同一条链路：文献入库 → 通过既有项目导入接口附加 PDF → `index` → 取指定页的 `chunk_id` → `evidence`，并验证 409/404 的显式失败映射。
+- 未完成部分：自动获取 arXiv 开放 PDF（M5 前半）仍未实现，当前唯一取得全文的方式是用户在项目内附加本地 PDF；Parser 只产出页文本，没有 bbox 或页内字符坐标来源，因此坐标空间定义为归一化页文本而非 PDF 布局坐标；`project_scoped` 查询模式已加入 `/api/rag/query` 但尚未被 Agent 工具使用（§10 的 `academic_tools.py` 行仍未开始）。
+- 定向测试：`python/tests/unit/test_literature_evidence.py` 94 例覆盖归一化规则、页内切片覆盖与重叠上界、块坐标往返、块身份与指纹对每个输入的敏感性、引文派生与上下文边界，以及每个失败码；该套件在首轮报告一例失败，暴露 `evidence_metadata` 缺少 `page_end` 存在性检查、会抛 `KeyError` 而不是结构化失败；接口已修复，并有两例测试固化"缺失键必须结构化拒绝"。Python 单元回归为 `1621 passed, 5 skipped`。
+- 真实向量库冒烟（一次性、非自动化）：临时目录中的 chromadb 接受并原样返回全部页级元数据（`page_start` 保持整数），且带 `project_root` + `source_id` 过滤的查询不会召回同一集合中的展平翻译块。该冒烟不进入自动化测试，因此"真实 Chroma 持久化"仍只由这一次人工观察支撑。
+- 本节结果只证明"检索块可核验回真实页码与精确原文"这一机制，不证明检索质量、回答正确性或教学效果。
+
+### 5.7 P2B 分层验收规格（2026-09-22，文档先行）
+
+以下规格在补写集成与端到端测试之前冻结：测试先写、再修实现；任一层暴露缺陷时先修实现并保留回归测试，不得通过放宽断言或跳过测试来"通过"。
+
+| 层 | 位置 | 必须证明 | 依赖 |
+|---|---|---|---|
+| 单元 | `python/tests/unit/test_literature_evidence.py` | 归一化规则、页内切片、坐标往返、块身份与指纹、引文派生、每个失败码 | 纯函数，离线 |
+| 单元 | `python/tests/unit/test_literature_indexing.py` | 服务编排与状态机：真实两页 PDF 逐块回链、替换 PDF/版本/嵌入变化、无页元数据、非 PDF、解析失败、幂等与强制重建 | 真实 PDF + 内存索引存储 |
+| 单元 | `python/tests/unit/test_literature_router.py` | 两个新路由的 HTTP 契约与失败码映射（真实项目存储） | TestClient + 假索引存储 |
+| 集成 | `python/tests/integration/test_literature_page_index_integration.py` | 真实 ChromaDB 持久化：页级元数据写入/读回、页码为整数、`get_chunk` 往返、重建删除旧块、`project_scoped` 查询只召回范围内的页级块并排除展平块 | 真实 chromadb（缺失时显式跳过） |
+| 端到端 | `python/tests/integration/test_literature_evidence_e2e.py` | 真实应用（`create_app` + TestClient，离线 fixture provider）：列出文献源 → 检索 → 批量入库 → 附加本地 PDF → 建立页级索引 → 范围内多文献检索 → 命中 → 证据解析，且解析出的引文等于该页归一化文本的对应切片；无范围查询被显式拒绝 | 真实 chromadb + 真实项目目录，无网络 |
+
+约束：三层都必须离线可跑，禁止依赖 arXiv 或任何外网；依赖缺失只能以显式 `skip` 表达，不得用空断言或吞异常代替；每层结果分别记录，不允许用低层结果替代高层结论。
+
+- 客户端契约（D-022）：`/api/literature/index` 成功后，服务端已重写 `metadata.literature`，因此客户端必须**重新读取**该项目文献后再更新 `rag_status`；把索引前的旧 `literature` 元数据回传会被项目接口以"literature metadata 只能由文献服务维护"拒绝，导致索引成功却被报告为失败。该约束由前端单测固化（断言最终 upsert 携带的是索引后的元数据）。
+
+分层结果（2026-09-22）：
+
+- 单元层：`1622 passed, 5 skipped`。其中 `test_literature_evidence.py` 94 例、`test_literature_indexing.py` 17 例（含"替换 PDF 后重建并淘汰旧块"的服务级回归）、`test_literature_router.py` 28 例（含 1 例新的索引/证据 HTTP 契约）。
+- 集成层：`test_literature_page_index_integration.py` 3 例通过（真实 ChromaDB：元数据往返、重建删除旧块、范围内查询只召回页级块且排除展平块）。
+- 端到端层：`test_literature_evidence_e2e.py` 1 例通过（真实应用 + 离线 fixture provider；研究问题→检索→入库→附加 PDF→页级索引→范围内检索→证据解析，且引文等于该页归一化文本切片；无范围查询 400）。
+- 全量后端为 `2781 passed, 14 skipped, 8 failed`，8 个失败仍全部是 §5.3–5.5 已记录且可在 `071c6b0` 复现的既存/环境问题。
+- 集成层在首轮暴露一个单元层无法发现的真实缺陷：`_embedding_identity()` 在集合尚未打开时返回默认身份、打开后返回真实类名，导致索引指纹依赖调用顺序——重复索引不再复用，且新建索引后立刻解析证据会被误判为 `stale_index`。修复方式是先打开存储再读取嵌入身份，并把"同一存储两次读取身份必须一致"写成集成断言。该缺陷未出现在任何单元测试中，说明假存储不能替代真实持久化层。
+
+### 5.8 M5 开放 PDF 获取规格（2026-09-22，文档先行）
+
+P2B 只完成了 M5 的"用户手工附加"一半；本节在实现之前冻结自动获取的接口与规则，用于补齐 M5。自动获取复用既有项目 `references/` 存储与 P2B 索引链路，不新建第二套全文存储。
+
+接口：
+
+- 新增 `python/src/literature/fulltext.py`：`FullTextDownloader` 协议、`HttpFullTextDownloader`（httpx 实现）、`DownloadedArtifact`（content/sha256/size/mime_type/source_url）与 `FullTextDownloadError`（含 `invalid_url` / `not_open_access` / `download_failed` / `too_large` / `unexpected_content_type` / `not_a_pdf` 等显式码）。
+- 服务新增 `LiteratureService.acquire_fulltext(*, project_path, source_id, force=False) -> LiteratureFullTextResult`，并驱动 §4.4 的 `metadata_only → acquiring → fulltext_ready`（失败为 `access_unavailable` / `acquire_failed`）。
+- 项目存储协议新增 `store_source_artifact(project_path, source_id, filename, content) -> str`：写入 `<project>/references/` 内，拒绝路径逃逸、拒绝覆盖同名文件（自动加后缀），返回项目内绝对路径。
+- 路由新增 `POST /api/literature/fulltext`，请求 `{project_path, source_id, force}`。
+
+规则（冻结）：
+
+1. 只接受 `https://` 位置，且只使用 `PaperRecord.access_locations` 中 `kind=pdf` 且 `access_status=open` 的条目（优先 `is_primary`）；没有这样的位置时不得尝试其它来源。
+2. 单文件上限 25 MiB；连接与读取超时 30 秒；最多 3 次重定向；请求带明确 User-Agent。
+3. 必须同时满足 Content-Type ∈ {`application/pdf`, `application/octet-stream`} 且响应体以 `%PDF-` 开头；任一不满足即失败，不写文件。
+4. 成功后写入 source_url、sha256（以落盘字节计算）、file_size_bytes、mime_type、acquired_at，状态置 `fulltext_ready`；`artifact_id` 由 `source_id + sha256` 派生。
+5. 无开放位置 → `access_unavailable`；网络、超限、类型或魔数校验失败 → `acquire_failed`；两者都必须带 failure_reason，并保留既有的检索 provenance 与元数据。
+6. 失败不写文件、不改动已有 artifact；已存在 file-present 状态（`fulltext_ready`/`parsed`/`indexed`/失败态带文件）时默认拒绝并要求 `force`，避免静默替换用户已核验的全文。
+7. 状态迁移必须落盘：先写 `acquiring`，再写终态；任何失败都不能表现为成功。
+8. 获取成功后，既有的 `/api/literature/index` 与证据解析链路必须直接可用（不新增索引路径）。
+
+分层验收：
+
+| 层 | 必须证明 |
+|---|---|
+| 单元 | 下载器对非 https、非开放位置、HTTP 错误、超时、超限、错误 Content-Type、非 PDF 魔数分别给出对应错误码且不返回内容；成功路径返回字节与哈希。服务层状态迁移（含 `acquiring` 落盘）、失败态与 failure_reason、已存在 artifact 时不覆盖且 `force` 才重取。路由层请求校验与错误码到 HTTP 的映射。 |
+| 集成 | 真实项目存储：文件确实落在项目 `references/` 内、`original_path` 指向它、manifest 里 sha256/大小/MIME/状态正确；随后真实页级索引能把这份自动获取的 PDF 建成可解析证据的索引。 |
+| 端到端 | 真实应用 + 注入下载器（离线）：检索 → 入库 → **自动获取开放 PDF** → 页级索引 → 范围内检索 → 证据解析，且解析出的引文等于该 PDF 页文本切片；无开放位置时返回显式 `access_unavailable`。 |
+
+决策 D-024：端到端必须离线，因此测试在 `create_app` 之前替换下载器实现（与替换 `ArxivProvider` 同理）；真实网络的下载只做一次性人工冒烟并在本节记录，不进入自动化测试，避免把网络波动当作回归信号。
+
+分层结果（2026-09-22）：
+
+- 单元层 `python/tests/unit/test_literature_fulltext.py` 31 例：位置选择（只认 open + https + PDF，优先 primary）、非 https/HTTP 错误/超时/传输错误/超限/错误 Content-Type/非 PDF 魔数各自的错误码、重定向跟随、以及服务层状态迁移（`acquiring` 落盘可被观察）、无开放位置 → `access_unavailable`、下载失败 → `acquire_failed` 且不写文件、已有 artifact 默认拒绝且 `force` 才重取、下载器谎报哈希被拒、获取后可直接进入页级索引。路由层另加 1 例覆盖 404（未知来源）/503（未接下载器）/422（禁止客户端指定路径）。
+- 集成层 `python/tests/integration/test_literature_fulltext_integration.py` 1 例：真实项目目录与真实 ChromaDB 下，文件确实落在 `<project>/references/`、`original_path` 指向它、manifest 的 sha256/大小/MIME/状态正确，随后索引、范围内检索、证据解析全部通过，且引文等于对已落盘文件的重新解析结果。
+- 端到端层 `test_literature_evidence_e2e.py` 2 例：手工附加路径与自动获取路径；自动获取用例同时验证"无开放位置"的记录返回显式 `access_unavailable`。
+- 本阶段测试先行抓到两处实现问题并已修复：(1) 清单中的 sha256 一度采信下载器自报值，与 D-023 第 4 条"以落盘字节计算"不符——改为由服务端对将写入的字节重新计算，且下载器自报不一致时显式 `acquire_failed`；(2) 注入客户端默认不跟随重定向，导致 302 被判成下载失败——改为按请求显式 `follow_redirects=True`，使获取语义不依赖注入实现。
+- 仍未完成：前端尚未提供"获取开放全文"按钮（P3 范围，当前只能通过 API 触发）；真实网络的 arXiv PDF 下载只做一次性人工冒烟，不作为自动化证据。
+- 汇总：Python 单元 `1654 passed, 5 skipped`；P2B/M5 集成与端到端共 6 例通过；前端 `845 passed` 且未受影响；Ruff 静态与格式检查通过；全量后端为 `2815 passed, 14 skipped, 8 failed`，8 个失败仍是 §5.3–5.5 记录的既存/环境问题。
+
+## 6. 验证与毕设方法边界
 ### 6.1 当前可冻结的工程目标
 
 - 验证完整技术链路可执行；
@@ -427,6 +520,14 @@ P2A 与 P2B 在 P1 合同冻结后可以并行；P3 不得在两者任一阶段�
 | D-017 | `result_snapshot_id` 仅作为结果内容指纹；每次成功搜索另发随机 `search_execution_id`，服务端以它绑定不可分离的 `SearchPage + SearchPlan`，入库只接受该执行标识与其中的 `paper_id` | 本文冻结 | 相同查询和结果可以产生相同内容快照；独立执行标识防止后一次不同研究问题覆盖前一次计划并导致错误 provenance |
 | D-018 | arXiv 返回条数少于 `totalResults` 估算的短页属于合法响应；只有超过 `totalResults`、`start`、`max_results` 所能解释的条数才判 `invalid_response`。fixture 的 `RELEVANCE` 固定为配置顺序，不随方向反转；显式版本号查询不匹配时必须 `not_found` | 本文冻结（2026-09-22） | `totalResults` 是估算值，把估算漂移当失败会制造假失败；反向"相关性"与跨版本命中会把离线夹具伪装成真实排序或真实版本 |
 | D-019 | 合同模型的集合字段必须真正不可变：禁止对冻结集合重新 `__init__`，`model_copy(update=…)` 必须重新冻结集合字段，冻结模型必须可哈希 | 本文冻结（2026-09-22） | §5.1 声称"可变集合在合同边界转换为不可变快照"；修复前该保证可被 `__init__` 与 `model_copy` 两条公开路径绕过，使快照哈希与实例内容不一致 |
+| D-020 | 证据坐标空间固定为 `normalized_page_text_v1`（统一换行、行内空白折叠、空行折叠、页首尾裁剪）；页内切块默认 1400/180 且不跨页；`chunk_id` 由 artifact SHA-256、页码、字符坐标与 chunker 版本派生；索引指纹由 artifact SHA-256 与 parser/chunker/embedding/index 版本派生；证据引文只能从坐标派生，调用方提供的引文一律不采信 | 本文冻结（2026-09-22） | 冻结归一化规则才能让"精确原文"可机器复算；派生引文与派生块身份使页码或引文无法被伪造，版本进入指纹使配置变化自动作废旧索引 |
+| D-021 | 首版只为 PDF 附件建立页码级证据索引；其它解析器合成的单页 `page_num=1` 不能作为诚实页码；翻译等展平入库的 chunk 永不作为证据（显式 `missing_page_metadata`）；自动获取 arXiv 开放 PDF 未实现，当前取得全文的唯一方式是用户在项目内附加本地 PDF，复用既有项目导入接口 | 本文冻结（2026-09-22） | 合成页码会让"第 1 页"变成假坐标；把展平块排除在证据之外，避免用无坐标文本凑出看似可核验的引用；明确 M5 只完成"手工附加"这一半 |
+| D-022 | 页级索引成功后，`metadata.literature` 已由服务端重写，客户端必须先重新读取该项目文献、再更新 `rag_status`；禁止把索引前的旧 `literature` 元数据回传 | 本文冻结（2026-09-22） | 项目接口拒绝客户端修改 literature 元数据；回传旧值会让一次成功的索引被报告为失败，并可能把界面状态与实际索引状态分离 |
+| D-023 | 自动获取开放全文只使用 `access_locations` 中 `kind=pdf` 且 `access_status=open` 的 https 位置；上限 25 MiB、超时 30 秒、最多 3 次重定向；必须同时通过 Content-Type 白名单与 `%PDF-` 魔数校验；失败不写文件并保留 failure_reason；已存在 file-present artifact 时默认拒绝、仅 `force` 重取 | 本文冻结（2026-09-22） | 只认 provider 声明的开放位置，避免绕过机构认证或抓取受限全文；魔数校验防止把 HTML 错误页当成论文；不覆盖规则保护用户已核验的全文与既有证据 |
+| D-024 | 端到端测试在 `create_app` 前替换下载器实现以保持离线；真实网络下载只做一次性人工冒烟，不进入自动化测试 | 本文冻结（2026-09-22） | 把网络波动当成回归信号会污染测试结论；同时保留“真实链路过一次”的人工证据 |
+| D-025 | 正式开题沿用用户提供的八部分模板；学校为哈尔滨工业大学（威海），专业为测控技术与仪器；研墨及现有项目为用户个人独立开发的前期基础 | 用户确认（2026-09-29） | 不再写成课题组成果；姓名、学号、导师和日期未提供则留空，进度只作暂定安排 |
+| D-026 | 增加 §2.4 的单 Agent 接入与 A1 验收，在 M1–M10/P4 完成后实施；开题稿建议题目突出智能体，最终备案题目仍待确认 | 用户要求保留 Agent 特色；具体边界由本次规划明确（2026-09-29） | 拒绝仅改名称的聊天包装、平行 Agent 状态库及恢复多智能体调度主线；新增工具集成覆盖，不改变证据数据模型，当前不使既有索引或缓存失效 |
+| D-027 | 本次验证目标仍为技术可行性；演示选工科或计算机文献；本地设备为天选4，拟使用 GPT/DeepSeek 接口，GLM 为后续候选，经费与额外指导支持尚未落实 | 用户确认（2026-09-29） | 不编造准确率门槛、经费金额、学校算力或指导资源已获批；文献综述理解为所选论文的有据归纳，实验建议留作后续拓展 |
 
 ### 9.2 待确认但不阻塞 P1–P3 的事项
 
@@ -458,17 +559,19 @@ P2A 与 P2B 在 P1 合同冻结后可以并行；P3 不得在两者任一阶段�
 | 新增 | `python/src/literature/providers/base.py` | LiteratureProvider 契约 | P1 已实现 |
 | 新增 | `python/src/literature/providers/arxiv.py` | arXiv 结构化实现 | P2A.1 已实现 |
 | 新增 | `python/src/literature/providers/fixture.py` | 离线契约测试与缓存演示实现 | P1 已实现 |
-| 新增 | `python/src/literature/service.py` | 搜索执行、强身份去重、项目批量入库和初始全文状态编排；完成并持久化检索计划 | P2A.2–P2A.3 已实现 |
-| 新增 | `python/src/literature/evidence.py` | 证据校验与回答结构化 | 未开始 |
-| 新增 | `python/routers/literature.py` | Literature API 与现有 Project 存储的窄适配层；接收检索计划草案 | P2A.2–P2A.3 已实现 |
-| 修改 | `python/api_factory.py` | 注册 Literature API，并在应用生命周期关闭 Provider 资源 | P2A.2 后端已实现 |
-| 修改 | `python/routers/project.py` | P2A.2 共享清单事务锁、内部路径与 manifest 版本边界；P2B 再补页结构 | P2A.2 后端已实现 |
+| 新增 | `python/src/literature/service.py` | 搜索执行、强身份去重、项目批量入库和初始全文状态编排；完成并持久化检索计划；P2B 增加页级索引与证据解析；M5 增加开放全文获取与状态机 | P2A.2–P2A.3、P2B、M5 已实现 |
+| 新增 | `python/src/literature/evidence.py` | 页内切块、坐标/块身份派生、索引指纹与证据校验；回答结构化仍属于 P3 | P2B 证据校验已实现 |
+| 新增 | `python/src/literature/fulltext.py` | M5 开放全文获取：只认 open + https 的 PDF 位置，大小/超时/Content-Type/魔数校验，显式错误码 | 已实现（2026-09-22） |
+| 新增 | `python/routers/literature.py` | Literature API 与现有 Project 存储的窄适配层；接收检索计划草案；P2B 增加索引与证据路由；M5 增加全文获取路由 | P2A.2–P2A.3、P2B、M5 已实现 |
+| 修改 | `python/api_factory.py` | 注册 Literature API，并在应用生命周期关闭 Provider 资源；P2B 注入 RAG 页级索引适配器 | P2A.2、P2B 已实现 |
+| 修改 | `python/routers/project.py` | P2A.2 共享清单事务锁、内部路径与 manifest 版本边界；P2B 补页结构与文档哈希 | P2A.2、P2B 已实现 |
 | 修改 | `python/src/utils/atomic_io.py` | 提供同进程路径级可重入事务锁；不承诺跨进程协调 | P2A.2 后端已实现 |
-| 修改 | `python/routers/rag.py` | 页级 chunk、证据 metadata、索引版本和范围约束 | 未开始 |
+| 修改 | `python/routers/rag.py` | 页级 chunk、证据 metadata、索引版本和范围约束 | P2B 已实现（新增 `project_scoped` 查询模式；展平通道保持不变） |
+| 修改 | `src/composables/useSourceLibrary.ts` | P2B：把"建立索引"动作切到页级证据通道（PDF + 文献条目），其它来源保持展平通道 | P2B 已实现 |
 | 修改 | `python/src/agent_v2/tools/academic_tools.py` | 用结构化 Literature/RAG 工具替代原始 XML 与无范围查询 | 未开始 |
 | 新增 | `src/composables/useLiteratureDiscovery.ts` | 检索、选择、入库和状态管理 | P2A.3 已实现 |
 | 修改 | `src/components/SourceLibraryView.vue` | P2A.3：公开发现、检索计划确认、结果回执和多选入库；P3 再增加多文献问答与证据展示 | P2A.3 已实现；P3 未开始 |
-| 新增/修改 | `python/tests/`、`src/__tests__/` | 契约、状态机、页码证据和端到端回归 | P1–P2A 已实现；P2B 以后未开始 |
+| 新增/修改 | `python/tests/`、`src/__tests__/` | 契约、状态机、页码证据和端到端回归；A1 增加 Agent 工具接入与计划、确认、失败处理覆盖 | P1–P2B 已实现；P3 以后未开始 |
 | 后续新增 | `methods/literature_poc/` | 正式 RQ、语料、gold、协议和运行记录 | 未开始 |
 
 ## 11. 首版完成定义
@@ -485,5 +588,7 @@ P2A 与 P2B 在 P1 合同冻结后可以并行；P3 不得在两者任一阶段�
 8. 文档、实现、测试和演示口径一致；
 9. 未把技术验证外推成教学效果、生产能力或商业数据库适配完成；
 10. Git 基线、模型、provider、parser、chunker 与 embedding 配置可追踪。
+
+依据 D-026，正式开题所承诺的智能体版本还须通过 A1。M1–M10 全部通过但 A1 未通过时，可报告“确定性文献证据链已跑通、Agent 接入待完成”，不得报告整个毕设系统已经完成。
 
 在此之前，只能报告“部分链路已完成”，不能报告“系统已跑通”。
