@@ -110,9 +110,10 @@ function actionLabel(step: AgentExecutionStep): string {
     return t('agent.execution.editFile', { target })
   if (step.toolName === 'grep_files' || step.toolName === 'glob_files')
     return t('agent.execution.searchFiles')
-  if (step.toolName === 'rag_search') return t('agent.execution.searchLibrary')
-  if (step.toolName === 'web_search' || step.toolName === 'arxiv_search')
-    return t('agent.execution.searchWeb')
+  if (step.toolName === 'rag_search' || step.toolName === 'literature_search')
+    return t('agent.execution.searchLibrary')
+  if (step.toolName === 'literature_answer') return t('agent.execution.answerFromEvidence')
+  if (step.toolName === 'web_search') return t('agent.execution.searchWeb')
   if (step.toolName === 'run_command') return t('agent.execution.runCommand')
   return t('agent.execution.useTool', { tool: step.toolName })
 }

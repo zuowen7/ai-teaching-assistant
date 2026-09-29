@@ -384,6 +384,7 @@
       "editFile": "Edit {target}",
       "searchFiles": "Search project files",
       "searchLibrary": "Search project sources",
+      "answerFromEvidence": "Answer from evidence",
       "searchWeb": "Search external sources",
       "runCommand": "Run project command",
       "useTool": "Use {tool}"

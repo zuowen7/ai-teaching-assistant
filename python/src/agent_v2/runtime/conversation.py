@@ -54,7 +54,8 @@ _SELECTION_SAFE_TOOLS = frozenset(
     {
         "str_replace",
         "rag_search",
-        "arxiv_search",
+        "literature_search",
+        "literature_answer",
         "web_search",
         "web_fetch",
         "read_argument_graph",

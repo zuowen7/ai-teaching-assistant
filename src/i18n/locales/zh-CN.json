@@ -387,6 +387,7 @@
       "editFile": "修改 {target}",
       "searchFiles": "检索项目文件",
       "searchLibrary": "检索项目文献",
+      "answerFromEvidence": "基于证据回答",
       "searchWeb": "检索外部文献",
       "runCommand": "运行项目命令",
       "useTool": "使用 {tool}"

@@ -289,7 +289,7 @@ indexing  -> index_failed
 | P2B 页级解析与索引 | 项目内容 API 保留页结构；页内 chunk；证据元数据；索引过期规则 | P1 | 任一检索 hit 均能解析回同一哈希文档的真实页码与精确原文 | 已完成（2026-09-22，见 5.6、5.8；含 M5 开放 PDF 获取） |
 | P3 证据问答 | 多文献选择、项目隔离检索、Evidence Answer Service、证据 UI、无证据拒答 | P2A + P2B | 每个渲染结论的证据均通过机器校验；无范围查询被拒绝 | 已完成（2026-09-29，见 5.9） |
 | P4 演示与技术评测 | 固定公开论文包、缓存路径、失败场景、重复运行、指标记录 | P3 | 在线与缓存模式均能完成同一演示脚本；失败不被伪装为成功 | 已完成（2026-09-29，见 5.10；"在线模式"由离线注入的 live provider 承担，真实 arXiv 运行仍为一次性人工冒烟） |
-| A1 单 Agent 接入 | 复用 Agent V2 规划任务、调用已验收服务、处理真实反馈与连续追问 | P4、M1–M10 全部门通过 | §2.4 场景通过；范围、证据和失败语义与服务入口一致；工具记录可复核 | 未开始（2026-09-29 新增计划） |
+| A1 单 Agent 接入 | 复用 Agent V2 规划任务、调用已验收服务、处理真实反馈与连续追问 | P4、M1–M10 全部门通过 | §2.4 场景通过；范围、证据和失败语义与服务入口一致；工具记录可复核 | 工具层已完成（2026-09-29，见 5.11）；前端展示、连续追问与 §2.4 会话级验收未完成 |
 | P5 后续候选 | 主题分类、第二公开源、Review/Argument Map、检索优化 | P4 | 逐项另行立项，不反向改变首版验收 | 未开始 |
 
 P2A 与 P2B 在 P1 合同冻结后可以并行；P3 不得在两者任一阶段门失败时提前开始。
@@ -572,10 +572,50 @@ M10 缓存路径规则：
 - 全量后端为 `2979 passed, 14 skipped, 8 failed`；8 个失败仍是 §5.3–5.5 已记录且可在 `071c6b0` 复现的既存/环境问题，未出现 P4 改造引入的新失败。
 - 本节结果只证明"同一演示脚本能在缓存与在线两种模式下跑完，且失败与不足如实记录"，不证明检索质量、回答正确性或教学效果。
 
+### 5.11 A1 单 Agent 接入规格（2026-09-29，文档先行）
+
+本节按 §2.4 与 D-031 冻结 A1 的工具层契约。A1 只在 M1–M10 与 P4 已验收的确定性服务之上增加"由 Agent 组织调用"的一层，**不新增第二套文献、索引或证据状态**。
+
+影响文件：
+
+| 类型 | 路径 | 职责 |
+|---|---|---|
+| 修改 | `python/src/agent_v2/tools/academic_tools.py` | 移除 `arxiv_search`；新增 `literature_search` / `literature_import` / `literature_answer`；`rag_search` 改为强制范围内 |
+| 新增 | `python/tests/unit/test_literature_agent_tools.py` | 工具层契约：工作区范围、确认元数据、结构化结果、失败码 |
+| 修改 | `python/tests/agent_v2/test_academic_tools.py`、`test_router_prompt.py` | 按 D-031 重写旧 arXiv 工具与工具清单用例 |
+
+规则（冻结）：
+
+1. **只包装确定性服务**。工具只调用 `/api/literature/search`、`/import`、`/fulltext`、`/index`、`/answer` 与范围内的 `/api/rag/query`；Agent 不保存文献身份、索引状态或证据坐标，也不自行解释 PDF。
+2. **项目范围来自工作区**。`project_root` 一律取工具注册表的工作区根，**调用方不能通过参数指定别的项目**；需要项目范围的工具（`literature_import`、`literature_answer`、`rag_search`）在工作区缺失时以 `project_scope_unavailable` 显式失败，不得回退到无范围查询。`literature_search` 本身不携带项目范围，因此不需要工作区，也不发送任何项目路径。
+3. **三个确认点复用既有审批契约**。`literature_search`（确认检索式）、`literature_import`（确认论文选择）、`literature_answer`（确认问题与文献范围）以 `approval_scope="exact-input"` 注册，Agent 的调用停在既有 `await_approval` / `approval_received` 上；用户批准的参数就是实际提交的参数。
+4. **移除旧路径**。`arxiv_search`（原始 Atom XML 截断）与"无 `source_ids` 也能查"的 `rag_search` 一并移除；`rag_search` 仍可用于扁平文本库，但必须显式给出 `source_ids`，否则显式失败并要求改用范围内工具。
+5. **结果必须可核验**。检索结果返回结构化字段（`paper_id`、题名、作者、年份、访问状态、`result_mode`）；入库返回 `created/reused` 计数；应答返回 `status`、`insufficient_reason`、每条结论与 `evidence`（题名、页码、精确原文、`evidence_id`）。证据不足时工具只返回不足状态与原因，**不得被模型改写为肯定回答**。
+6. **失败与上限沿用既有语义**。服务端错误码原样进入工具结果并标注 `is_error`；调用上限与停止条件使用 Agent V2 现有机制，工具层不额外重试或降级。
+
+分层验收：
+
+| 层 | 位置 | 必须证明 |
+|---|---|---|
+| 单元 | `python/tests/unit/test_literature_agent_tools.py` | 三个工具的注册元数据（`approval_scope=exact-input`、网络范围、权限）；工作区缺失即 `project_scope_unavailable`；`project_root` 恒为工作区而非入参；请求体字段与确认参数一致；结构化结果字段；服务端错误码进入 `is_error`；`rag_search` 缺 `source_ids` 时显式失败；`arxiv_search` 已不存在 |
+| 单元 | `python/tests/agent_v2/test_academic_tools.py` | 重写后的工具清单与既有网络/路径安全用例；不含对原始 arXiv 响应的断言 |
+
+本阶段（A1 后端工具层）明确不做：Agent 侧的前端计划/确认/引用展示改造、连续追问的会话级编排、以及真实在线 arXiv 的自动化运行。这些仍属于 A1 未完成部分，必须在报告中与已完成的工具层分开陈述。
+
+分层结果（2026-09-29，仅 A1 工具层）：
+
+- 新增 `literature_search` / `literature_import` / `literature_answer`：三者分别包装 `/api/literature/search`、`/import`、`/answer`，全部以 `approval_scope="exact-input"` 注册（另有 `network_scope`），因此检索式、论文选择与问答范围都停在既有 `await_approval` / `approval_received` 契约上；工具 schema 中**没有** `project_path` / `project_root` 参数。
+- 移除 `arxiv_search`（原始 Atom XML）与无范围 `rag_search`：`rag_search` 现在必须显式给出 `source_ids`，并以工作区为 `project_root` 发送 `project_scoped=true`；缺工作区时 `literature_import` / `literature_answer` / `rag_search` 以 `project_scope_unavailable` 显式失败，而 `literature_search` 本身不含项目范围、不发送任何项目路径。
+- 工具结果结构化：检索返回 `result_mode`、`search_execution_id`、`total_results` 与每条记录的 `paper_id`/题名/作者/年份/访问状态；入库返回 `created`/`reused` 计数；应答返回 `status`、`insufficient_reason`、结论及其证据（题名、页码、精确原文）与未解析计数。服务端错误码（如 `rate_limited`、`source_not_found`）原样进入 `is_error` 结果，不重试、不降级。
+- 单元层 `python/tests/unit/test_literature_agent_tools.py` 19 例覆盖上述全部规则，包括"入参伪造 `project_path` 不生效""入库缺执行句柄/空选择被拒""应答缺 `source_ids` 或空问题被拒""`arxiv_search` 已不存在"。
+- 按 D-031 重写的既有用例：`tests/agent_v2/test_academic_tools.py` 的 arXiv 工具用例改为结构化服务用例；`tests/agent_v2/test_router_prompt.py` 的工具自省与 skill 工具契约表改用 `literature_search` / `literature_answer`；`runtime/conversation.py` 的选择期安全工具集与 `skills.py` 的 nature_citation 文本同步更新。`tests/agent_v2/` 全量为 `860 passed`。
+- 全量后端为 `2998 passed, 14 skipped, 8 failed`；8 个失败仍是 §5.3–5.5 已记录且可在 `071c6b0` 复现的既存/环境问题，未出现 A1 工具层改造引入的新失败；前端全量为 `862 passed` 并通过 Prettier、ESLint 与 `vue-tsc`。
+- **仍未完成（A1 剩余部分）**：Agent 前端侧的计划展示、确认交互、状态与引用渲染未改造（`AgentExecutionGroup.vue` 只补了工具名到标签的映射：`literature_search` → 检索项目文献、`literature_answer` → 基于证据回答）；连续追问的会话级编排、证据不足时由 Agent 主动补充范围内检索或提出新检索计划的策略、以及 §2.4 八项验收场景的会话级覆盖都还没有实现或测试。**因此 A1 未通过阶段门，不能报告"智能体版本已完成"。**
+- 本节结果只证明"Agent 只能通过确定性服务、在项目范围内、经用户确认地访问文献与证据"，不证明检索质量、回答正确性、教学效果或 A1 整体验收通过。
+
 ## 6. 验证与毕设方法边界
 
 ### 6.1 当前可冻结的工程目标
-
 - 验证完整技术链路可执行；
 - 验证文献身份、项目隔离和证据坐标满足本合同；
 - 验证失败路径可观察、可恢复且不会伪造成功；
@@ -686,6 +726,7 @@ M10 缓存路径规则：
 | D-033 | 固定公开论文包（`config/literature_demo_corpus.json`）只用于演示与回归：应用在语料可加载时额外注册 `fixture` provider，但 `result_mode` 必须保持 `live`/`fixture` 区分，语料缺失或损坏时只降级为"无缓存 provider"，不得阻止启动，也不得让缓存结果冒充在线 | 本文冻结（2026-09-29） | §2.1 M10 要求"具备带来源标记的缓存语料，公网失败时仍可演示同一条技术链路"；§0 禁止缓存结果与真实在线结果混写。被否决方案：把缓存作为 arxiv 的静默回退（会让在线失败看起来像检索成功） |
 | D-034 | 固定演示脚本以 CLI 形式按 §7.1 顺序驱动既有 HTTP API，不新增服务端"一键演示"端点；检索式与文献选择仍由调用方显式给出 | 本文冻结（2026-09-29） | §7.1 的第 2、4 步是用户确认点；服务端自动跑完全程会把"确认过的检索式"和"用户选择"变成脚本内部行为，无法再声称链路包含确认环节 |
 | D-035 | 每次演示运行写一份 JSON 记录到 `methods/literature_poc/runs/`，含步骤状态/原因/耗时、计数、模式与确认检索式；该目录只存运行记录，正式方法协议仍单独冻结 | 本文冻结（2026-09-29） | §5 的 P4 要求"重复运行、指标记录"，§6.2 要求正式评测前另建方法协议；把运行记录与方法协议混在一处会让"过程记录"被误当成"评测协议已冻结" |
+| D-036 | A1 的 Agent 工具只包装 §5.9 的确定性服务：`project_root` 恒取工具注册表的工作区且不可由入参覆盖，检索式/论文选择/问答范围三个确认点以 `approval_scope="exact-input"` 复用既有 `await_approval` 契约，`arxiv_search` 与"无 `source_ids` 的 `rag_search`"直接移除而非保留兼容分支 | 本文冻结（2026-09-29） | §2.4 要求"Agent 通过确定性服务完成操作，不维护第二套状态"且"参数非法、失败、证据不足必须显式停止"；保留旧路径会让 Agent 能在无范围、无证据校验的情况下给出答案（违反 §4.5）。被否决方案：保留 `arxiv_search` 并标注"仅调试用"（调试路径同样会进入模型上下文并可能被当成证据） |
 
 ### 9.2 待确认但不阻塞 P1–P3 的事项
 

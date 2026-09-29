@@ -380,7 +380,7 @@ _BUILTIN_SKILLS = [
         description="Find and map credible literature support to manuscript claims without fabricating citations",
         content="""## Nature-style citation support
 - Split the supplied passage into independently supportable claims before searching.
-- Use arxiv_search, rag_search, web_search, and web_fetch only as available; verify title, authors, venue, year, and claim relevance before recommending a source.
+- Use literature_search, literature_answer, rag_search, web_search, and web_fetch only as available; verify title, authors, venue, year, and claim relevance before recommending a source.
 - Never manufacture a DOI, bibliographic field, quotation, or source-to-claim relationship.
 - Distinguish direct support, contextual background, contrasting evidence, and unverified candidate sources.
 - Return a claim-to-source map and clearly label anything that still needs database or publisher verification.""",
