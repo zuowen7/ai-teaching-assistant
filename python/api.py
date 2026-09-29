@@ -24,6 +24,10 @@ from pathlib import Path
 os.environ.setdefault("ANONYMIZED_TELEMETRY", "FALSE")
 
 from api_factory import create_app
+from src.net_env import normalize_proxy_env
+
+# A bracketed IPv6 entry in NO_PROXY makes httpx fail at client construction.
+normalize_proxy_env()
 
 logging.basicConfig(
     level=logging.INFO,

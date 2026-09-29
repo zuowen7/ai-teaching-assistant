@@ -43,9 +43,14 @@ from src.literature.demo_run import (  # noqa: E402
     StepStatus,
     write_run_record,
 )
+from src.net_env import normalize_proxy_env  # noqa: E402
 
 API_PREFIX = "/api/literature"
 PROJECT_PREFIX = "/api/project"
+
+
+class DemoClientError(RuntimeError):
+    """The demo could not even build its HTTP client."""
 
 
 class DemoStepFailed(RuntimeError):
@@ -171,6 +176,8 @@ def run_demo(
     recorder = DemoRunRecorder(
         mode=mode,
         provider=provider,
+        project_path=project_path,
+        expected_failures=corpus.expected_failures,
         confirmed_query=corpus.confirmed_query,
         question=corpus.question,
         started_at=started_at,
@@ -371,10 +378,25 @@ def _http_client(base_url: str) -> Any:
     return httpx.Client(base_url=base_url, timeout=120.0)
 
 
+def _build_client(factory, base_url: str) -> Any:
+    """Build the HTTP client, turning a broken proxy setup into a clear error."""
+
+    try:
+        return factory(base_url)
+    except Exception as exc:  # noqa: BLE001 - the CLI must explain, not traceback
+        raise DemoClientError(f"{type(exc).__name__}: {exc}") from exc
+
+
 def main(argv: Sequence[str] | None = None, *, client_factory=None) -> int:
     parser = argparse.ArgumentParser(description="Run the fixed literature PoC demo")
     parser.add_argument("--base-url", default="http://127.0.0.1:18088")
-    parser.add_argument("--project-path", required=True)
+    parser.add_argument("--project-path", default=None, help="an existing project directory")
+    parser.add_argument(
+        "--create-location",
+        default=None,
+        help="create the project under this directory instead of using --project-path",
+    )
+    parser.add_argument("--project-name", default="Literature PoC Demo")
     parser.add_argument("--provider", default="fixture", choices=["fixture", "arxiv"])
     parser.add_argument("--corpus", default=None)
     parser.add_argument("--workspace", default=None)
@@ -384,24 +406,92 @@ def main(argv: Sequence[str] | None = None, *, client_factory=None) -> int:
     )
     args = parser.parse_args(argv)
 
+    if bool(args.project_path) == bool(args.create_location):
+        print(
+            json.dumps(
+                {
+                    "error": "project_target_required",
+                    "message": "pass exactly one of --project-path or --create-location",
+                },
+                ensure_ascii=False,
+            )
+        )
+        return 4
+
     try:
         corpus = load_demo_corpus(args.corpus)
     except DemoCorpusError as exc:
         print(json.dumps({"error": exc.code, "message": str(exc)}, ensure_ascii=False))
         return 2
 
+    # A bracketed IPv6 entry in NO_PROXY makes httpx fail while building a client.
+    normalize_proxy_env()
+
     factory = client_factory or _http_client
-    with factory(args.base_url) as client:
+    try:
+        client = _build_client(factory, args.base_url)
+    except DemoClientError as exc:
+        print(json.dumps({"error": "client_unavailable", "message": str(exc)}, ensure_ascii=False))
+        return 3
+
+    with client:
+        project_path, error = _resolve_project(client, args)
+        if error is not None:
+            print(json.dumps(error, ensure_ascii=False))
+            return 4
         run = run_demo(
             client,
-            project_path=args.project_path,
+            project_path=project_path,
             provider=args.provider,
             corpus=corpus,
             workspace=Path(args.workspace) if args.workspace else None,
             write_records_to=Path(args.records_dir),
         )
     print(json.dumps(json.loads(run.model_dump_json()), ensure_ascii=False, indent=2))
-    return 0 if run.totals["failed"] == 0 else 1
+    # A failure the corpus declared is still a failure in the record; it just is
+    # not a regression, so it does not make the run exit non-zero.
+    unexpected = [
+        step
+        for step in run.steps
+        if step.status is StepStatus.FAILED and step.detail.get("expected") != "true"
+    ]
+    return 1 if unexpected else 0
+
+
+def _resolve_project(client: Any, args: argparse.Namespace) -> tuple[str, dict | None]:
+    """Return the project to run against, creating one when asked.
+
+    The demo writes into an existing project's source library, so a target that is
+    not a project must fail up front with a clear message instead of surfacing as a
+    confusing ``import`` failure.
+    """
+
+    if args.create_location:
+        created = client.post(
+            f"{PROJECT_PREFIX}/create",
+            json={
+                "name": args.project_name,
+                "location": str(args.create_location),
+                "template_id": "research_paper",
+                "init_git": False,
+            },
+        )
+        if created.status_code != 200:
+            return "", {
+                "error": _error_code(created),
+                "message": f"could not create a project under {args.create_location}",
+            }
+        return str(created.json()["project_path"]), None
+
+    project_path = str(args.project_path)
+    probe = client.get(f"{PROJECT_PREFIX}/sources", params={"project_path": project_path})
+    if probe.status_code != 200:
+        return "", {
+            "error": "project_not_found",
+            "message": f"{project_path} is not a project directory",
+            "hint": "create one in the app, or pass --create-location",
+        }
+    return project_path, None
 
 
 if __name__ == "__main__":  # pragma: no cover - CLI entry point

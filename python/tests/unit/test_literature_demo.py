@@ -221,8 +221,16 @@ class _StubResponse:
 class _StubClient:
     """Minimal HTTP client for driving run_demo without a server."""
 
-    def __init__(self, responses: dict[str, _StubResponse]) -> None:
+    def __init__(
+        self,
+        responses: dict[str, _StubResponse],
+        *,
+        get_responses: dict[str, _StubResponse] | None = None,
+        create_project_path: str | None = None,
+    ) -> None:
         self._responses = responses
+        self._get_responses = get_responses or {}
+        self._create_project_path = create_project_path
         self.calls: list[str] = []
 
     def __enter__(self) -> _StubClient:
@@ -231,8 +239,17 @@ class _StubClient:
     def __exit__(self, *_args) -> None:
         return None
 
+    def get(self, url: str, params=None):
+        self.calls.append(url)
+        for suffix, response in self._get_responses.items():
+            if url.endswith(suffix):
+                return response
+        raise AssertionError(f"unexpected GET: {url}")
+
     def post(self, url: str, json=None, data=None, files=None):
         self.calls.append(url)
+        if url.endswith("/api/project/create") and self._create_project_path is not None:
+            return _StubResponse({"project_path": self._create_project_path})
         for suffix, response in self._responses.items():
             if url.endswith(suffix):
                 return response
@@ -433,7 +450,10 @@ class TestDemoCli:
         from scripts.literature_demo import main
 
         records = tmp_path / "runs"
-        client = _StubClient(self._happy_responses())
+        client = _StubClient(
+            self._happy_responses(),
+            get_responses={"/api/project/sources": _StubResponse({"sources": []})},
+        )
         code = main(
             [
                 "--project-path",
@@ -455,9 +475,192 @@ class TestDemoCli:
         assert len(written) == 1
         record = json.loads(written[0].read_text(encoding="utf-8"))
         assert record["totals"] == {"step": 7, "ok": 6, "failed": 0, "skipped": 1}
+        assert record["project_path"] == str(tmp_path)
         assert record["answer_status"] == "answered"
         assert record["answer_model_config_hash"] == "b" * 64
         assert record["mode"] == "live"
+
+    def test_create_location_creates_the_project_and_uses_it(self, tmp_path: Path) -> None:
+        from scripts.literature_demo import main
+
+        created = str(tmp_path / "Made By Cli")
+        client = _StubClient(
+            self._happy_responses(),
+            create_project_path=created,
+        )
+
+        code = main(
+            [
+                "--create-location",
+                str(tmp_path),
+                "--project-name",
+                "Made By Cli",
+                "--provider",
+                "arxiv",
+                "--corpus",
+                str(REPO_CORPUS),
+                "--records-dir",
+                str(tmp_path / "runs"),
+            ],
+            client_factory=lambda _url: client,
+        )
+
+        assert code == 0
+        assert any(call.endswith("/api/project/create") for call in client.calls)
+        record = json.loads(next((tmp_path / "runs").glob("*.json")).read_text(encoding="utf-8"))
+        assert record["project_path"] == created
+
+    def test_a_directory_that_is_not_a_project_exits_four(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture
+    ) -> None:
+        from scripts.literature_demo import main
+
+        client = _StubClient(
+            self._happy_responses(),
+            get_responses={
+                "/api/project/sources": _StubResponse(
+                    {"detail": "项目元数据不存在"}, status_code=404
+                )
+            },
+        )
+
+        code = main(
+            [
+                "--project-path",
+                str(tmp_path),
+                "--corpus",
+                str(REPO_CORPUS),
+                "--records-dir",
+                str(tmp_path / "runs"),
+            ],
+            client_factory=lambda _url: client,
+        )
+
+        assert code == 4
+        assert "project_not_found" in capsys.readouterr().out
+        assert list((tmp_path / "runs").glob("*.json")) == []
+
+    def test_two_targets_are_rejected_before_any_client_is_built(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture
+    ) -> None:
+        from scripts.literature_demo import main
+
+        code = main(
+            [
+                "--project-path",
+                str(tmp_path),
+                "--create-location",
+                str(tmp_path),
+                "--corpus",
+                str(REPO_CORPUS),
+            ],
+            client_factory=lambda _url: pytest.fail("the client must not be built"),
+        )
+
+        assert code == 4
+        assert "project_target_required" in capsys.readouterr().out
+
+    def _fixture_responses(self) -> dict[str, _StubResponse]:
+        """Payloads whose ids match the shipped corpus, so attach/index run."""
+
+        corpus = load_demo_corpus(REPO_CORPUS)
+        indexed = list(corpus.records_to_index())
+        responses = self._happy_responses()
+        responses["/api/literature/import"] = _StubResponse(
+            {
+                "created_count": len(indexed),
+                "reused_count": 0,
+                "results": [
+                    {"paper_id": record.paper_id, "source_id": f"src_demo_{index:04d}"}
+                    for index, record in enumerate(indexed, start=1)
+                ],
+            }
+        )
+        responses["/api/project/sources/import"] = _StubResponse(
+            {"source": {"id": "src_demo_0001"}}
+        )
+        return responses
+
+    def test_a_declared_expected_failure_keeps_the_exit_code_zero(self, tmp_path: Path) -> None:
+        from scripts.literature_demo import main
+
+        responses = self._fixture_responses()
+        responses["/api/literature/fulltext"] = _StubResponse(
+            {"detail": {"code": "access_unavailable"}}, status_code=409
+        )
+        responses["/api/literature/index"] = _StubResponse(
+            {"source_id": "src_demo_0001", "status": "indexed", "reused": False}
+        )
+        responses["/api/literature/answer"] = _StubResponse(
+            {
+                "status": "answered",
+                "insufficient_reason": None,
+                "claims": [],
+                "evidence": [],
+                "rejected_claims": [],
+                "unresolved": [],
+            }
+        )
+        client = _StubClient(
+            responses,
+            get_responses={"/api/project/sources": _StubResponse({"sources": []})},
+        )
+
+        code = main(
+            [
+                "--project-path",
+                str(tmp_path),
+                "--provider",
+                "fixture",
+                "--corpus",
+                str(REPO_CORPUS),
+                "--workspace",
+                str(tmp_path / "workspace"),
+                "--records-dir",
+                str(tmp_path / "runs"),
+            ],
+            client_factory=lambda _url: client,
+        )
+
+        assert code == 0
+        record = json.loads(next((tmp_path / "runs").glob("*.json")).read_text(encoding="utf-8"))
+        acquire = next(step for step in record["steps"] if step["name"] == "acquire_fulltext")
+        # Still recorded as a failure, now marked as one the corpus declared.
+        assert acquire["status"] == "failed"
+        assert acquire["reason"] == "access_unavailable"
+        assert acquire["detail"]["expected"] == "true"
+        assert record["totals"]["failed"] == 1
+        assert record["totals"]["ok"] == 5
+
+    def test_an_undeclared_failure_still_exits_one(self, tmp_path: Path) -> None:
+        from scripts.literature_demo import main
+
+        responses = self._fixture_responses()
+        responses["/api/literature/index"] = _StubResponse(
+            {"detail": {"code": "source_artifact_missing"}}, status_code=409
+        )
+        client = _StubClient(
+            responses,
+            get_responses={"/api/project/sources": _StubResponse({"sources": []})},
+        )
+
+        code = main(
+            [
+                "--project-path",
+                str(tmp_path),
+                "--provider",
+                "fixture",
+                "--corpus",
+                str(REPO_CORPUS),
+                "--workspace",
+                str(tmp_path / "workspace"),
+                "--records-dir",
+                str(tmp_path / "runs"),
+            ],
+            client_factory=lambda _url: client,
+        )
+
+        assert code == 1
 
     def test_a_failed_step_exits_one(self, tmp_path: Path) -> None:
         from scripts.literature_demo import main
@@ -467,7 +670,8 @@ class TestDemoCli:
                 "/api/literature/search": _StubResponse(
                     {"detail": {"code": "rate_limited"}}, status_code=429
                 )
-            }
+            },
+            get_responses={"/api/project/sources": _StubResponse({"sources": []})},
         )
         code = main(
             [

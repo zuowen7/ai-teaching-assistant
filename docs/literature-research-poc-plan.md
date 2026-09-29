@@ -2,7 +2,7 @@
 
 > 状态：生效；G0、P1、P2A、P2B、P3、P4 已完成；A1 的工具层、会话级验收与前端引用展示已完成，真实在线 arXiv 已做一次性人工冒烟、真实模型行为仍未验证（见 5.11、5.12）；后续候选 P5 未开始
 >
-> 当前基线：`teaching-refactor@df20abb`（§5.13 复核记录提交后；本轮修复见 5.13 的 V-10…V-15）
+> 当前基线：`teaching-refactor@6ae2e1b`（复核订正提交后；第三轮修复见 5.13 的 V-16…V-21）
 >
 > 生效日期：2026-09-20
 >
@@ -540,6 +540,13 @@ M10 缓存路径规则：
 
 固定演示脚本（§7.1 的可执行版本）：按顺序执行并逐步记录——检索（只用调用方已确认的检索式）→ 选择全部返回记录并入库 → 获取全文（在线走开放 PDF，缓存走离线包）→ 建立页级索引 → 对选定文献提问 → 解析一条证据。每步记录 `status`（`ok` / `failed` / `skipped`）、`reason`、`duration_ms` 与计数。
 
+调用方式与退出码（2026-09-29 补充，见 D-041）：CLI 必须先确认目标项目，再执行固定七步。
+
+- 目标项目二选一：`--project-path <已存在项目>`，或 `--create-location <目录>` 配合 `--project-name`（脚本先调用既有 `POST /api/project/create` 再使用其返回路径）。两者都不给或都给出 → `project_target_required`，退出码 4，且**不构造客户端、不写记录**。
+- `--project-path` 指向的不是项目目录（服务端返回非 200）→ `project_not_found`，退出码 4，不写记录；不得把它伪装成"入库失败"。
+- 退出码：`0` 七步全部执行且没有**未声明**的失败；`1` 存在未声明失败；`2` 语料缺失/损坏；`3` HTTP 客户端无法构造（例如代理变量不可解析）；`4` 项目目标非法。
+- 语料可**声明预期失败**：`demo.expected_failures` 是「步骤名 → 原因码」映射（本仓库语料声明 `acquire_fulltext: access_unavailable`，因为它不声明任何开放全文位置）。命中的步骤在记录里**仍然是 `failed`**，只额外带 `detail.expected="true"`，并因此不计入退出码 1。**声明不得改变记录的状态与原因**，只用于区分"预期失败"与"回归"。
+
 失败场景（必须显式记录，不得静默跳过）：
 
 1. 无开放全文的记录 → 该步 `failed` 且 `reason=access_unavailable`；脚本继续处理其余文献。
@@ -549,7 +556,7 @@ M10 缓存路径规则：
 
 运行记录：
 
-- 每次运行写一份 JSON 记录，至少含 `run_id`、`mode`（`live` / `fixture`）、`provider`、`confirmed_query`、`steps`、`totals`（step/ok/failed/skipped）、`started_at`、`finished_at`、`duration_ms`、`answer_status`、`answer_model_config_hash`（答案步实际使用的模型配置哈希，取自该步应答）、`git_commit`。
+- 每次运行写一份 JSON 记录，至少含 `run_id`、`mode`（`live` / `fixture`）、`provider`、`project_path`（本次作用的项目，便于两份记录逐字段比对）、`confirmed_query`、`steps`、`totals`（step/ok/failed/skipped）、`started_at`、`finished_at`、`duration_ms`、`answer_status`、`answer_model_config_hash`（答案步实际使用的模型配置哈希，取自该步应答）、`git_commit`。
 - 同一语料与同一确认检索式下重复运行必须产生**结构相同、逐字段可比**的记录（时间戳与 `run_id` 除外）；记录写入 `methods/literature_poc/runs/`（运行记录，不是方法协议）。由于 `run_id` 由内容派生、重复运行相同，同一秒内的两次运行必须靠文件名后缀区分，**不得互相覆盖**。
 - 记录不得包含任何密钥：既拒绝密钥类**键名**，也拒绝以 `sk-`、`ghp_`、`Bearer ` 等前缀开头的**值**；`answer_model_config_hash` 沿用 §5.9 的无密钥口径。
 - 四类失败场景都必须有独立原因码并使用户可读：`rate_limited`/`unavailable`（provider 失败 → 检索步 failed）、`access_unavailable`（无开放全文 → 获取步 failed 后仍继续）、`source_artifact_missing` 等（解析/索引失败 → 该步 failed，依赖步 `dependency_failed`）、`no_indexed_source`（确实没有可索引来源）。
@@ -560,6 +567,7 @@ M10 缓存路径规则：
 |---|---|---|
 | 单元 | `python/tests/unit/test_literature_demo.py` | 语料解析与稳定顺序、缺失/损坏语料的显式失败、fixture 记录的 `result_mode=fixture`、步骤状态与计数聚合、四类失败场景的原因码、记录中不出现密钥 |
 | 集成 | `python/tests/integration/test_literature_demo_e2e.py` | 真实应用 + 真实 ChromaDB：在线模式（离线注入元数据 provider）与缓存模式（fixture provider）跑同一脚本，步骤结构一致，且两种模式都能得到带页码与精确原文的回答；失败场景以 `failed` / `insufficient` 记录而不是成功 |
+| 端到端（真实服务器） | `python/tests/integration/test_literature_demo_live_server.py` | 真实 uvicorn 子进程 + 真实 HTTP + 真实 ChromaDB：CLI 用 `--create-location` 建项目后跑完七步并写出记录；非项目目录在跑任何步骤前以 `project_not_found` 退出 4 |
 
 本阶段明确不做：服务端"一键演示"端点（D-034）、演示指标阈值（属于 §6.3 的候选指标，须由方法协议冻结）、把缓存结果包装成在线结果。
 
@@ -569,7 +577,8 @@ M10 缓存路径规则：
 - 单元层 `python/tests/unit/test_literature_demo.py` 23 例：语料加载与记录顺序、每条记录都带逐页文本、标识不可能被误认成真实论文、缺失/损坏/版本不符/类型不符/空记录/引用不存在记录等六类结构错误、`fixture` provider 的 `result_mode` 与来源标签、离线 PDF 物化后可被重新解析回同一页文本、运行记录的步骤顺序与计数、`run_id` 只随结果变化、非 ok 步骤必须带原因、密钥类键被拒绝、记录文件名逐次运行唯一。
 - 集成层 `python/tests/integration/test_literature_demo_e2e.py` 4 例（真实应用 `create_app` + 真实 ChromaDB，离线替换元数据 provider、下载器与答案模型）：`fixture` provider 确实注册进运行中的应用且 `result_mode=fixture`；同一脚本在缓存模式与在线模式跑出**相同的七步顺序**，缓存模式的 `acquire_fulltext` 记为 `failed/access_unavailable`（3 条记录都无开放全文）后由 `attach_fulltext` 走既有本地附加路径完成，在线模式则相反（获取成功、附加 `skipped/user_attachment_required`），两者最终都得到 `answered` 且证据回链到真实页码与坐标空间；重复运行产生逐字段可比、`run_id` 相同的记录；无答案问题记为 `answer=ok` + `answer_status=insufficient`，证据步 `skipped/no_evidence_to_resolve`。
 - 回归影响：M10 让运行中的应用多出一个名为 `fixture` 的 provider，与既有端到端测试注入的 fixture 实现同名。应用侧改为"同名已存在时只记警告不再注册"，而不是让服务在构造时抛错；P2A/P2B/P3 的既有端到端用例因此未被削弱或跳过。
-- 仍未完成：CLI 只做了一次性人工检查（`--help` 与语料缺失时返回 `corpus_missing` 且退出码 2），完整脚本的自动化覆盖在集成层，**没有**在真实服务器上自动化运行 CLI；真实在线（arXiv）模式下的演示运行仍未自动化，按 D-024 只做一次性人工冒烟；方法协议 `methods/literature_poc/METHODOLOGY.md` 仍未建立，因此"指标记录"只记录过程事实，不含任何效果指标；`methods/literature_poc/runs/` 当前只由 CLI 写入，集成测试写到临时目录。
+- 仍未完成：真实在线（arXiv）模式下的**Agent 会话**仍未自动化，按 D-024 只做一次性人工冒烟（arXiv 检索本身已于 2026-09-29 人工跑通，见 §5.13）；方法协议 `methods/literature_poc/METHODOLOGY.md` 目前是未生效骨架，因此"指标记录"只记录过程事实，不含任何效果指标；`methods/literature_poc/runs/` 当前只由 CLI 写入，集成测试写到临时目录。
+- 2026-09-29 补充（D-041）：CLI 的目标项目确认、`--create-location`、退出码 0/1/2/3/4 与语料声明式预期失败已实现并有单元覆盖；`test_literature_demo_live_server.py` 另用真实 uvicorn 子进程把"CLI 在真实服务器上跑完七步"自动化，因此本节原来"CLI 未在真实服务器上运行"的缺口已关闭。真实**模型**的答案质量与 Agent 会话语义仍未验证。
 - 全量后端为 `2979 passed, 14 skipped, 8 failed`；8 个失败仍是 §5.3–5.5 已记录且可在 `071c6b0` 复现的既存/环境问题，未出现 P4 改造引入的新失败。
 - 本节结果只证明"同一演示脚本能在缓存与在线两种模式下跑完，且失败与不足如实记录"，不证明检索质量、回答正确性或教学效果。
 
@@ -668,7 +677,7 @@ M10 缓存路径规则：
 
 **验证方法（可复现）**
 
-- 全量后端：`cd python && pytest tests/ -q` → **`3068 passed, 14 skipped, 0 failed`**（V-14/V-15 修复后；修复前为 `3046 passed, 14 skipped, 8 failed`）。
+- 全量后端：`cd python && pytest tests/ -q` → **`3097 passed, 14 skipped, 0 failed`**（含真实 uvicorn 子进程的 CLI 用例；V-14/V-15 修复前为 `3046 passed, 14 skipped, 8 failed`）。
 - "那 8 个失败是既存问题"：`git worktree add <tmp> 071c6b0` 后在干净基线单跑这 8 个用例 → `8 failed, 17 passed`，失败集合与修复前逐项相同。**该说法已独立复现，不再只继承自 §5.5 的记录**；其中 5 例（多文章拆分）由 V-15 修复、3 例（`NO_PROXY` 解析）由 V-14 修复，现全部通过。§5.1–§5.12 各阶段记录中的失败数保持不变，它们是当时的真实观测。
 - P3 历史快照：`git worktree add <tmp> b856dcf` 后 `pytest tests/unit/ -q` → `1788 passed, 5 skipped`，与 §5.9 一致。
 - 例数：`pytest --collect-only -q <file>` 逐文件实测（参数化用例按实际收集数计）。
@@ -711,12 +720,23 @@ M10 缓存路径规则：
 
 V-14 与 V-15 是本次复核顺带修掉的**与文献链路无关的既存缺陷**，此前一直被记为"环境问题"与"既存失败"；两者现在都有可复现的测试证据。
 
+**第三轮（2026-09-29 真实服务器验证后）新增**
+
+| # | 项 | 处理 |
+|---|---|---|
+| V-16 | `NO_PROXY` 含方括号 IPv6 时 httpx **在构造客户端时就抛异常**，真实服务器上的 CLI 直接以 traceback 退出（不只是测试失败） | 抽出 `src/net_env.py::normalize_proxy_env()`，在三个入口统一调用：`api.py`、`api_factory.create_app()`（服务端所有 httpx 客户端）与演示 CLI（另加 `client_unavailable` → 退出码 3 的可读错误）；`tests/conftest.py` 改用同一实现（6 例单测） |
+| V-17 | 演示 CLI 指向非项目目录时，失败被归因成"存档导入失败"，不可操作 | CLI 先做项目预检，`project_not_found` → 退出码 4 且不写记录；新增 `--create-location`/`--project-name` 走既有 `POST /api/project/create`，使离线演示可一条命令跑通 |
+| V-18 | 没有任何模型时整条链无法离线演示 | 新增 D-040 的确定性抽取式 fixture 答案模型（显式开关、身份可区分、不读问题、只抽取引用内原文），16 例单测 |
+| V-19 | fixture 语料天然无开放全文，导致演示永远以退出码 1 结束 | 语料可声明 `demo.expected_failures`；命中时记录仍是 `failed/access_unavailable`，只加 `detail.expected="true"`，退出码按"是否存在未声明失败"判定（含"声明不改变状态"与"未声明失败仍为 1"两例单测） |
+| V-20 | 运行记录缺少本次作用的项目，两份记录无法逐字段比对 | 记录新增 `project_path` |
+| V-21 | "CLI 只在真实服务器上人工跑过" | 新增 `test_literature_demo_live_server.py` 2 例：真实 uvicorn 子进程 + 真实 HTTP + 真实 ChromaDB，`--create-location` 跑完七步并写出记录（退出码 0），非项目目录在跑任何步骤前退出 4 |
+
 **仍未验证 / 已知限制**
 
-- 真实**模型**的会话行为未自动化（D-024、D-030）：脚本模型只证明"按提示行动时链路成立"。
+- 真实**模型**的会话行为未自动化（D-024、D-030）：脚本模型只证明"按提示行动时链路成立"。本机既无 Ollama 也无任何云端凭据，因此本轮**无法**做真实模型验证；D-040 的 fixture 答案模型让链路可离线演示，但它**不是**模型，其结论不得用于任何回答质量主张。
 - 真实**在线 arXiv** 已按 D-024 做一次性人工冒烟（2026-09-29）：`all:"retrieval augmented generation"` 返回 `result_mode=live`、`total_results=6011`、3 条真实记录（`2411.18583`、`2502.00306`、`2510.22344`，年份 2024/2025），三条均声明开放 PDF。这是一次人工观测，**不是**自动化用例，也不构成任何质量指标。
 - 页码伪造检测仍是**有限枚举**的定位词表（中/英/西/德/日/葡/意/法），未收录语言的定位词（如 `página` 之外的写法）仍可绕过。
-- CLI 自身的逻辑（参数、退出码 0/1/2、运行记录落盘）已由注入式客户端自动化覆盖；但**在真实 uvicorn 服务上的完整 CLI 运行**仍是人工步骤。
+- CLI 的七步已在真实 uvicorn 服务上自动化（V-21），但**真实在线模式下的 Agent 会话**仍是人工步骤。
 - `methods/literature_poc/METHODOLOGY.md` 目前只是**未生效的骨架**：正式 RQ、语料、gold、指标与阈值均标注【待确认】，需用户与指导教师填写后才成为协议（§6.2 与 D-039；§5.10、§5.12 记录中的"仍未建立"指当时的提交状态）。
 
 ## 6. 验证与毕设方法边界
@@ -838,6 +858,8 @@ V-14 与 V-15 是本次复核顺带修掉的**与文献链路无关的既存缺�
 | D-037 | 修复独立复核发现的缺陷时，**只修可证伪的行为**并同时补回归测试；若某条承诺无法在离线环境证伪（如真实模型行为），则改文档措辞而不是加"看起来通过"的测试 | 本文冻结（2026-09-29） | §5.13 的 V-1…V-9 中，凡是"测试没红过"的承诺都被改为可证伪（例如故意构造 `insufficient` + 非空 claims 的违约载荷、用计数传输层实测请求路径）；真实模型行为与在线会话仍列在"仍未验证"，不以脚本模型的结果冒充。被否决方案：把在线/真实模型场景写成 `xfail` 或跳过（会掩盖未验证状态） |
 | D-038 | 与文献链路无关但阻塞全量回归的既存缺陷一并修复：`NO_PROXY` 中的方括号 IPv6 条目在测试基础设施层规范化；多文章拆分的"孤立首字母"边界在检测器中新增策略 C | 本文冻结（2026-09-29） | 两者都让全量套件长期带红（`8 failed`），使"新增失败"与"既存失败"难以区分，直接削弱回归证据的价值。修复都带可复现测试（合成夹具 + 真实样例），且不改变对外契约。被否决方案：继续在文档里把它们记作"环境问题/既存失败"（读者无法据此判断回归是否引入新问题） |
 | D-039 | `methods/literature_poc/METHODOLOGY.md` 先落**未生效骨架**：只列必须冻结的字段并逐项标注【待确认】，不代填 RQ、语料、gold、指标或阈值 | 本文冻结（2026-09-29） | AGENTS.md 与本合同 §6.2 一致要求这些取值由用户与指导教师确认；骨架让"缺什么"可见，同时不产生任何可被误读为协议的约束力。被否决方案：由我拟定一套指标与阈值（会把未经确认的取值伪装成协议）；或继续不建文件（缺项不可见） |
+| D-040 | 增设**确定性、非 LLM** 的 fixture 答案模型（`provider="fixture"`、`model="deterministic-extractive-v1"`），仅在 `literature.answer.mode: fixture` 或 `SCHOLAR_LITERATURE_ANSWER_MODE=fixture` 时启用 | 本文冻结（2026-09-29） | 无模型/无网络时（答辩笔记本、CI）整条链仍须可演示，但**不得**让 fixture 结果看起来像模型产出：该模型不读问题、不做摘要，只为每条检索到的证据抽取一句原文作为结论，因此每条结论都字面存在于它的引用里；身份字段随答案落盘，fixture 与 live 始终可区分。被否决方案：离线时静默回退到某个云端模型（需要网络与密钥）；或让演示在没有模型时直接失败（无法离线演示） |
+| D-041 | 演示 CLI 先确认项目目标再跑七步：`--project-path` 或 `--create-location`+`--project-name` 二选一；退出码细化为 0/1/2/3/4；语料可用 `demo.expected_failures` **声明**预期失败 | 本文冻结（2026-09-29） | 在真实服务器上的端到端运行暴露出两个问题：新目录直接以"存档导入失败"告终（归因错误、不可操作），以及 `access_unavailable` 这个**由语料自身性质决定**的失败让演示永远以非零码结束。声明只是让调用方区分"预期失败"与"回归"：记录中的状态与原因**一律照旧**（仍是 `failed/access_unavailable`），仅额外标记 `detail.expected="true"`。被否决方案：把预期失败记成 `skipped`（掩盖真实失败）；或让 fixture 语料谎称有开放全文（会把演示建立在不成立的网络假设上） |
 
 ### 9.2 待确认但不阻塞 P1–P3 的事项
 

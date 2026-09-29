@@ -55,6 +55,8 @@ class DemoRun(BaseModel):
     run_id: str
     mode: str = Field(min_length=1, max_length=32)
     provider: str = Field(min_length=1, max_length=64)
+    #: Project the run acted on, so two records are comparable field by field.
+    project_path: str | None = Field(default=None, max_length=1024)
     confirmed_query: str = Field(min_length=1, max_length=2000)
     question: str = Field(default="", max_length=2000)
     steps: tuple[DemoStep, ...]
@@ -99,6 +101,8 @@ class DemoRunRecorder:
         provider: str,
         confirmed_query: str,
         question: str = "",
+        project_path: str | None = None,
+        expected_failures: Mapping[str, str] | None = None,
         started_at: datetime | None = None,
         git_commit: str | None = None,
     ) -> None:
@@ -106,6 +110,10 @@ class DemoRunRecorder:
         self._provider = provider.strip()
         self._confirmed_query = confirmed_query.strip()
         self._question = question.strip()
+        self._project_path = project_path.strip() if project_path else None
+        self._expected_failures = {
+            str(step): str(reason) for step, reason in (expected_failures or {}).items()
+        }
         self._started_at = (started_at or datetime.now(UTC)).astimezone(UTC)
         self._git_commit = git_commit
         self._steps: list[DemoStep] = []
@@ -128,6 +136,13 @@ class DemoRunRecorder:
             raise ValueError("a step that is not ok must carry a reason")
         normalized_counts = {str(key): int(value) for key, value in (counts or {}).items()}
         normalized_detail = {str(key): str(value) for key, value in (detail or {}).items()}
+        # The failure stays in the record; the mark only says the corpus declared it.
+        if (
+            status is not StepStatus.OK
+            and reason
+            and self._expected_failures.get(str(name)) == str(reason)
+        ):
+            normalized_detail["expected"] = "true"
         _assert_no_secret_keys(normalized_counts, field="counts")
         _assert_no_secret_keys(normalized_detail, field="detail")
         step = DemoStep(
@@ -180,6 +195,7 @@ class DemoRunRecorder:
             run_id=run_id,
             mode=self._mode,
             provider=self._provider,
+            project_path=self._project_path,
             confirmed_query=self._confirmed_query,
             question=self._question,
             steps=tuple(self._steps),

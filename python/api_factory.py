@@ -383,10 +383,24 @@ def _apply_local_overrides(cfg: dict) -> None:
             cfg.update(_deep_merge(cfg, local_cfg))
 
 
+def _literature_answer_mode(config: dict) -> str:
+    """Return the configured answer mode: ``model`` (default) or ``fixture``."""
+
+    literature = config.get("literature") if isinstance(config, dict) else None
+    answer = literature.get("answer") if isinstance(literature, dict) else None
+    raw = answer.get("mode") if isinstance(answer, dict) else None
+    return "fixture" if str(raw or "").strip().casefold() == "fixture" else "model"
+
+
 def _apply_env_overrides(cfg: dict) -> None:
     env_key = os.environ.get("SCHOLAR_CLOUD_API_KEY", "").strip()
     if env_key:
         cfg.setdefault("translator", {}).setdefault("cloud", {})["api_key"] = env_key
+    # Offline runs (defense laptop, CI) may force the deterministic extractive
+    # answer model without touching the user's config file.
+    answer_mode = os.environ.get("SCHOLAR_LITERATURE_ANSWER_MODE", "").strip()
+    if answer_mode:
+        cfg.setdefault("literature", {}).setdefault("answer", {})["mode"] = answer_mode
 
 
 _save_config_lock = threading.Lock()
@@ -639,6 +653,11 @@ def create_app(*, cloud_only: bool = False) -> FastAPI:
 
     from prompts.loader import validate_required_prompt_bundle
     from src._version import __version__
+    from src.net_env import normalize_proxy_env
+
+    # Every httpx client in this process (providers, health probes) is built from
+    # the environment; an unparsable NO_PROXY entry would break them at construction.
+    normalize_proxy_env()
 
     # Academic safety prompts are production resources, not optional cosmetic
     # text. Refuse to start a weakened backend when packaging omitted them.
@@ -985,6 +1004,7 @@ def create_app(*, cloud_only: bool = False) -> FastAPI:
         build_fixture_provider,
         load_demo_corpus,
     )
+    from src.literature.fixture_answer_model import FIXTURE_MODEL_NAME, FixtureAnswerModel
     from src.literature.fulltext import HttpFullTextDownloader
     from src.literature.providers.arxiv import ArxivProvider
     from src.literature.service import LiteratureService
@@ -1010,40 +1030,52 @@ def create_app(*, cloud_only: bool = False) -> FastAPI:
 
     # P3 answer model: reuse the existing Agent provider factory instead of
     # introducing a second provider-selection path (decision D-028).
+    # ``literature.answer.mode: fixture`` (or SCHOLAR_LITERATURE_ANSWER_MODE) swaps
+    # in the deterministic extractive model so the chain stays demonstrable
+    # offline; its identity keeps fixture answers distinguishable (decision D-040).
     _answer_config = _load_config()
-    try:
-        _answer_provider = _create_provider(_answer_config)
-    except Exception as exc:  # pragma: no cover - misconfigured local environment
-        logger.warning("Literature answer model is unavailable: %s", type(exc).__name__)
-        _answer_provider = None
-
     _answer_model = None
-    if _answer_provider is not None:
-        # temperature=0 is only honoured when thinking is off; this provider
-        # instance belongs to the answer model alone (plan 5.9 rule 8).
-        _previous_thinking = force_deterministic_thinking(_answer_provider)
-        if _previous_thinking is not None and _previous_thinking != "disabled":
-            logger.info(
-                "Literature answer provider pinned from thinking=%s to disabled",
-                _previous_thinking,
+    if _literature_answer_mode(_answer_config) == "fixture":
+        _answer_model = FixtureAnswerModel()
+        logger.info(
+            "Literature answer model is the deterministic fixture model (%s)",
+            FIXTURE_MODEL_NAME,
+        )
+    else:
+        try:
+            _answer_provider = _create_provider(_answer_config)
+        except Exception as exc:  # pragma: no cover - misconfigured local environment
+            logger.warning("Literature answer model is unavailable: %s", type(exc).__name__)
+            _answer_provider = None
+
+        if _answer_provider is not None:
+            # temperature=0 is only honoured when thinking is off; this provider
+            # instance belongs to the answer model alone (plan 5.9 rule 8).
+            _previous_thinking = force_deterministic_thinking(_answer_provider)
+            if _previous_thinking is not None and _previous_thinking != "disabled":
+                logger.info(
+                    "Literature answer provider pinned from thinking=%s to disabled",
+                    _previous_thinking,
+                )
+            _agent_config = (
+                (_answer_config.get("agent") or {}) if isinstance(_answer_config, dict) else {}
             )
-        _agent_config = (
-            (_answer_config.get("agent") or {}) if isinstance(_answer_config, dict) else {}
-        )
-        _answer_model = AgentProviderAnswerModel(
-            provider=_answer_provider,
-            provider_name=str(
-                getattr(_answer_provider, "provider_name", None)
-                or _agent_config.get("provider")
-                or type(_answer_provider).__name__
-            ),
-            model=str(
-                getattr(_answer_provider, "model", None) or _agent_config.get("model") or "unknown"
-            ),
-            base_url=str(
-                getattr(_answer_provider, "base_url", "") or _agent_config.get("base_url") or ""
-            ),
-        )
+            _answer_model = AgentProviderAnswerModel(
+                provider=_answer_provider,
+                provider_name=str(
+                    getattr(_answer_provider, "provider_name", None)
+                    or _agent_config.get("provider")
+                    or type(_answer_provider).__name__
+                ),
+                model=str(
+                    getattr(_answer_provider, "model", None)
+                    or _agent_config.get("model")
+                    or "unknown"
+                ),
+                base_url=str(
+                    getattr(_answer_provider, "base_url", "") or _agent_config.get("base_url") or ""
+                ),
+            )
 
     state_literature = register_literature_routes(
         app,

@@ -166,3 +166,6 @@ argument_output_v2/
 
 # Local archive — untracked, kept on disk only, never pushed to the cloud repo
 docs/_archive/
+
+# Demo CLI default workspace (materialised corpus PDFs)
+python/demo-workspace/

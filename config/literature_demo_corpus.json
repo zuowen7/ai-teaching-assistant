@@ -6,7 +6,11 @@
   "demo": {
     "confirmed_query": "all:\"evidence traceable question answering\"",
     "question": "What evaluation protocol do the demo papers use for evidence checking?",
-    "index_records": ["demo-0001", "demo-0002"]
+    "index_records": ["demo-0001", "demo-0002"],
+    "expected_failures": {
+      "acquire_fulltext": "access_unavailable"
+    },
+    "expected_failures_note": "本语料不声明任何开放全文位置，因此「获取开放全文」这一步必然记为 failed/access_unavailable（规范 5.10 第 1 条）。该声明只用于区分「预期失败」与「回归」，不影响运行记录：记录里这一步仍然是 failed。"
   },
   "records": [
     {

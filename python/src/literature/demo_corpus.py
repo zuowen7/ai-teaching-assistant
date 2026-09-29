@@ -18,7 +18,7 @@ from __future__ import annotations
 import json
 import sys
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -65,6 +65,14 @@ class DemoCorpus:
     pages: Mapping[str, tuple[tuple[int, str], ...]]
     index_paper_ids: tuple[str, ...]
     access_locations: Mapping[str, tuple[AccessLocation, ...]]
+    #: Step name -> the reason this corpus cannot avoid; its synthetic records
+    #: declare no open full text, so ``acquire_fulltext`` is expected to fail with
+    #: ``access_unavailable``.  The run record still shows that failure; the
+    #: declaration only lets a caller tell an expected failure from a regression.
+    expected_failures: Mapping[str, str] = field(default_factory=dict)
+
+    def expectation_for(self, step_name: str) -> str | None:
+        return self.expected_failures.get(step_name)
 
     def pages_for(self, paper_id: str) -> tuple[tuple[int, str], ...]:
         return self.pages.get(paper_id, ())
@@ -261,12 +269,37 @@ def load_demo_corpus(path: str | Path | None = None) -> DemoCorpus:
         pages=pages,
         index_paper_ids=tuple(index_paper_ids),
         access_locations=access,
+        expected_failures=_expected_failures(payload),
     )
+
+
+def _expected_failures(data: Mapping[str, Any]) -> Mapping[str, str]:
+    """Read the corpus's declared expected failures (step name -> reason)."""
+
+    demo = data.get("demo")
+    raw = demo.get("expected_failures") if isinstance(demo, Mapping) else None
+    if raw is None:
+        return {}
+    if not isinstance(raw, Mapping):
+        raise DemoCorpusError(
+            "corpus_invalid",
+            "expected_failures 必须是对象",
+            details={"field": "expected_failures"},
+        )
+    declared: dict[str, str] = {}
+    for step, reason in raw.items():
+        if not isinstance(step, str) or not isinstance(reason, str) or not reason.strip():
+            raise DemoCorpusError(
+                "corpus_invalid",
+                "expected_failures 的每一项都必须是「步骤名: 原因码」",
+                details={"field": "expected_failures", "step": str(step)},
+            )
+        declared[step.strip()] = reason.strip()
+    return declared
 
 
 def build_fixture_provider(corpus: DemoCorpus) -> FixtureProvider:
     """Build the offline provider the demo corpus declares."""
-
     return FixtureProvider(
         fixture_name=corpus.corpus_id,
         snapshot_at=datetime(2026, 9, 29, tzinfo=UTC),
