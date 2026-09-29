@@ -26,6 +26,20 @@ from urllib.parse import urlparse
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from src.literature.answer import (
+    AnswerEvidenceCandidate,
+    AnswerResponseError,
+    AnswerStatus,
+    InsufficientReason,
+    RejectedClaim,
+    RejectedClaimReason,
+    UnresolvedEvidence,
+    build_answer_prompt,
+    build_answer_system_prompt,
+    parse_answer_response,
+    validate_answer_claims,
+)
+from src.literature.answer_model import EvidenceAnswerModel
 from src.literature.evidence import (
     CHUNKER_VERSION,
     INDEX_VERSION,
@@ -47,6 +61,7 @@ from src.literature.models import (
     AccessKind,
     AccessLocation,
     AccessStatus,
+    AnswerClaim,
     EvidenceSpan,
     ExternalIdentifiers,
     FullTextArtifact,
@@ -82,6 +97,9 @@ _FILE_PRESENT_STATUSES = {
 }
 _SAFE_SOURCE_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,64}$")
 _SAFE_SEARCH_EXECUTION_ID_RE = re.compile(r"^search_exec_[0-9a-f]{32}$")
+DEFAULT_ANSWER_TOP_K = 8
+MAX_ANSWER_TOP_K = 20
+MAX_ANSWER_SOURCES = 50
 
 
 @runtime_checkable
@@ -152,6 +170,32 @@ class ArtifactStore(Protocol):
         ...
 
 
+class RetrievedChunk(BaseModel):
+    """One scoped retrieval hit: a chunk identity plus the source it belongs to."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    chunk_id: str = Field(min_length=1, max_length=128)
+    source_id: str = Field(min_length=1, max_length=64)
+    text: str = Field(default="", max_length=100_000)
+
+
+@runtime_checkable
+class EvidenceRetriever(Protocol):
+    """Scoped page retrieval: the only route by which an answer finds evidence."""
+
+    async def retrieve(
+        self,
+        *,
+        project_root: str,
+        source_ids: Sequence[str],
+        query: str,
+        top_k: int,
+    ) -> Sequence[RetrievedChunk]:
+        """Return page-level hits inside one project and its selected sources."""
+        ...
+
+
 class LiteratureServiceErrorCode(StrEnum):
     UNKNOWN_PROVIDER = "unknown_provider"
     SEARCH_EXECUTION_NOT_FOUND = "search_execution_not_found"
@@ -174,6 +218,12 @@ class LiteratureServiceErrorCode(StrEnum):
     INDEX_STORE_UNAVAILABLE = "index_store_unavailable"
     CHUNK_NOT_FOUND = "chunk_not_found"
     EVIDENCE_UNRESOLVED = "evidence_unresolved"
+    SCOPE_REQUIRED = "scope_required"
+    ANSWER_REQUEST_INVALID = "answer_request_invalid"
+    ANSWER_MODEL_UNAVAILABLE = "answer_model_unavailable"
+    ANSWER_GENERATION_FAILED = "answer_generation_failed"
+    ANSWER_INVALID_RESPONSE = "answer_invalid_response"
+    RETRIEVAL_UNAVAILABLE = "retrieval_unavailable"
 
 
 class LiteratureServiceError(RuntimeError):
@@ -294,6 +344,43 @@ class LiteratureFullTextResult(BaseModel):
     mime_type: str | None = None
     acquired_at: datetime | None = None
     failure_reason: str | None = None
+
+
+class LiteratureAnswerResult(BaseModel):
+    """One evidence-grounded answer inside a project and source scope (P3)."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    question: str
+    project_root: str
+    source_ids: list[str]
+    status: AnswerStatus
+    insufficient_reason: InsufficientReason | None = None
+    claims: list[AnswerClaim]
+    evidence: list[LiteratureEvidenceResult]
+    rejected_claims: list[RejectedClaim]
+    unresolved: list[UnresolvedEvidence]
+    retrieved_chunk_count: int = Field(ge=0)
+    model_provider: str
+    model_name: str
+    model_config_hash: str
+    generated_at: datetime
+
+    @model_validator(mode="after")
+    def validate_result_scope(self) -> LiteratureAnswerResult:
+        evidence_ids = {item.span.evidence_id for item in self.evidence}
+        for claim in self.claims:
+            if not set(claim.evidence_ids) <= evidence_ids:
+                raise ValueError("a claim cites evidence that is missing from the result")
+        requested = set(self.source_ids)
+        for item in self.evidence:
+            if item.source_id not in requested:
+                raise ValueError("evidence falls outside the requested source scope")
+        if self.status is AnswerStatus.ANSWERED and not self.claims:
+            raise ValueError("an answered result must carry at least one claim")
+        if self.status is AnswerStatus.INSUFFICIENT and self.claims:
+            raise ValueError("an insufficient result cannot carry claims")
+        return self
 
 
 def _normalized_text(value: str) -> str:
@@ -604,6 +691,8 @@ class LiteratureService:
         index_store: PageIndexStore | None = None,
         downloader: FullTextDownloader | None = None,
         artifact_store: ArtifactStore | None = None,
+        retriever: EvidenceRetriever | None = None,
+        answer_model: EvidenceAnswerModel | None = None,
         snapshot_capacity: int = 64,
         now_factory: Callable[[], datetime] | None = None,
         source_id_factory: Callable[[], str] | None = None,
@@ -628,11 +717,17 @@ class LiteratureService:
             raise TypeError("project_store does not satisfy ProjectSourceStore")
         if index_store is not None and not isinstance(index_store, PageIndexStore):
             raise TypeError("index_store does not satisfy PageIndexStore")
+        if retriever is not None and not isinstance(retriever, EvidenceRetriever):
+            raise TypeError("retriever does not satisfy EvidenceRetriever")
+        if answer_model is not None and not isinstance(answer_model, EvidenceAnswerModel):
+            raise TypeError("answer_model does not satisfy EvidenceAnswerModel")
 
         self._providers = registry
         self._project_store = project_store
         self._index_store = index_store
         self._downloader = downloader
+        self._retriever = retriever
+        self._answer_model = answer_model
         self._artifact_store = (
             artifact_store
             if artifact_store is not None
@@ -1298,6 +1393,219 @@ class LiteratureService:
             span=span,
         )
 
+    async def answer_question(
+        self,
+        *,
+        project_path: str,
+        question: str,
+        source_ids: Sequence[str],
+        top_k: int = DEFAULT_ANSWER_TOP_K,
+    ) -> LiteratureAnswerResult:
+        """Answer a question from evidence scoped to one project and its sources.
+
+        The order of operations is part of the contract: scope is validated first,
+        every retrieval hit is resolved back to a real page quote, and the model is
+        only called when at least one verifiable piece of evidence exists.  When
+        there is no evidence the result says so without consulting a model.
+        """
+
+        normalized_question = question.strip() if isinstance(question, str) else ""
+        if not normalized_question:
+            raise LiteratureServiceError(
+                LiteratureServiceErrorCode.ANSWER_REQUEST_INVALID,
+                "研究问题不能为空",
+            )
+        if (
+            isinstance(top_k, bool)
+            or not isinstance(top_k, int)
+            or not 1 <= top_k <= MAX_ANSWER_TOP_K
+        ):
+            raise LiteratureServiceError(
+                LiteratureServiceErrorCode.ANSWER_REQUEST_INVALID,
+                f"top_k 必须是 1 到 {MAX_ANSWER_TOP_K} 之间的整数",
+                details={"top_k": top_k},
+            )
+
+        scoped_source_ids: list[str] = []
+        for raw_source_id in source_ids or []:
+            normalized_source_id = str(raw_source_id).strip()
+            if normalized_source_id and normalized_source_id not in scoped_source_ids:
+                scoped_source_ids.append(normalized_source_id)
+        if not scoped_source_ids:
+            raise LiteratureServiceError(
+                LiteratureServiceErrorCode.SCOPE_REQUIRED,
+                "多文献证据问答必须显式选择至少一篇项目文献",
+            )
+        if len(scoped_source_ids) > MAX_ANSWER_SOURCES:
+            raise LiteratureServiceError(
+                LiteratureServiceErrorCode.ANSWER_REQUEST_INVALID,
+                f"单次问答最多选择 {MAX_ANSWER_SOURCES} 篇文献",
+                details={"source_count": len(scoped_source_ids)},
+            )
+        for source_id in scoped_source_ids:
+            self._require_literature_source(project_path, source_id)
+
+        retriever = self._require_retriever()
+        answer_model = self._require_answer_model()
+        generated_at = self._now_datetime()
+
+        hits = await retriever.retrieve(
+            project_root=project_path,
+            source_ids=list(scoped_source_ids),
+            query=normalized_question,
+            top_k=top_k,
+        )
+        unique_hits: list[RetrievedChunk] = []
+        seen_chunk_ids: set[str] = set()
+        for hit in hits:
+            if hit.chunk_id in seen_chunk_ids:
+                continue
+            seen_chunk_ids.add(hit.chunk_id)
+            unique_hits.append(hit)
+
+        candidates: dict[str, AnswerEvidenceCandidate] = {}
+        resolved: dict[str, LiteratureEvidenceResult] = {}
+        unresolved: list[UnresolvedEvidence] = []
+        for hit in unique_hits:
+            if hit.source_id not in scoped_source_ids:
+                unresolved.append(
+                    UnresolvedEvidence(
+                        source_id=hit.source_id,
+                        chunk_id=hit.chunk_id,
+                        reason="out_of_scope_chunk",
+                        detail="检索块不属于本次选定的文献范围",
+                    )
+                )
+                continue
+            try:
+                evidence = await self.resolve_evidence(
+                    project_path=project_path,
+                    source_id=hit.source_id,
+                    chunk_id=hit.chunk_id,
+                )
+            except LiteratureServiceError as exc:
+                unresolved.append(
+                    UnresolvedEvidence(
+                        source_id=hit.source_id,
+                        chunk_id=hit.chunk_id,
+                        reason=str(exc.details.get("code") or exc.code.value),
+                        detail=str(exc),
+                    )
+                )
+                continue
+            span = evidence.span
+            candidates[span.evidence_id] = AnswerEvidenceCandidate(
+                evidence_id=span.evidence_id,
+                source_id=evidence.source_id,
+                title=evidence.title,
+                page_start=span.page_start,
+                page_end=span.page_end,
+                chunk_id=span.chunk_id,
+                exact_quote=span.exact_quote,
+                context_before=span.context_before,
+                context_after=span.context_after,
+            )
+            resolved[span.evidence_id] = evidence
+
+        envelope: dict[str, Any] = {
+            "question": normalized_question,
+            "project_root": project_path,
+            "source_ids": list(scoped_source_ids),
+            "model_provider": answer_model.identity.provider,
+            "model_name": answer_model.identity.model,
+            "model_config_hash": answer_model.identity.config_hash,
+            "generated_at": generated_at,
+            "retrieved_chunk_count": len(unique_hits),
+            "unresolved": unresolved,
+        }
+
+        if not unique_hits:
+            return LiteratureAnswerResult(
+                **envelope,
+                status=AnswerStatus.INSUFFICIENT,
+                insufficient_reason=InsufficientReason.NO_RETRIEVAL_HITS,
+                claims=[],
+                evidence=[],
+                rejected_claims=[],
+            )
+        if not candidates:
+            return LiteratureAnswerResult(
+                **envelope,
+                status=AnswerStatus.INSUFFICIENT,
+                insufficient_reason=InsufficientReason.NO_RESOLVABLE_EVIDENCE,
+                claims=[],
+                evidence=[],
+                rejected_claims=[],
+            )
+
+        prompt = build_answer_prompt(
+            question=normalized_question,
+            candidates=list(candidates.values()),
+        )
+        try:
+            raw_response = await answer_model.complete(
+                system_prompt=build_answer_system_prompt(),
+                prompt=prompt,
+            )
+        except Exception as exc:  # noqa: BLE001 - every provider failure is explicit
+            raise LiteratureServiceError(
+                LiteratureServiceErrorCode.ANSWER_GENERATION_FAILED,
+                "证据问答模型调用失败",
+                details={
+                    "exception_type": type(exc).__name__,
+                    "source_ids": list(scoped_source_ids),
+                },
+            ) from exc
+
+        try:
+            parsed = parse_answer_response(raw_response)
+        except AnswerResponseError as exc:
+            raise LiteratureServiceError(
+                LiteratureServiceErrorCode.ANSWER_INVALID_RESPONSE,
+                "证据问答模型未返回约定的结构化结果",
+                details={"reason": str(exc)},
+            ) from exc
+
+        claims, rejected_claims = validate_answer_claims(
+            parsed=parsed,
+            candidates=candidates,
+            identity=answer_model.identity,
+            generated_at=generated_at,
+        )
+
+        cited_ids: list[str] = []
+        for claim in claims:
+            for evidence_id in claim.evidence_ids:
+                if evidence_id not in cited_ids:
+                    cited_ids.append(evidence_id)
+
+        if claims:
+            return LiteratureAnswerResult(
+                **envelope,
+                status=AnswerStatus.ANSWERED,
+                insufficient_reason=None,
+                claims=claims,
+                evidence=[resolved[evidence_id] for evidence_id in cited_ids],
+                rejected_claims=rejected_claims,
+            )
+
+        declined = bool(rejected_claims) and all(
+            item.reason is RejectedClaimReason.MODEL_REPORTED_INSUFFICIENT
+            for item in rejected_claims
+        )
+        return LiteratureAnswerResult(
+            **envelope,
+            status=AnswerStatus.INSUFFICIENT,
+            insufficient_reason=(
+                InsufficientReason.MODEL_REPORTED_INSUFFICIENT
+                if not parsed or declined
+                else InsufficientReason.ALL_CLAIMS_REJECTED
+            ),
+            claims=[],
+            evidence=[],
+            rejected_claims=rejected_claims,
+        )
+
     async def aclose(self) -> None:
         failures: list[Exception] = []
         seen: set[int] = set()
@@ -1882,6 +2190,22 @@ class LiteratureService:
                 "页级索引未启用",
             )
         return self._index_store
+
+    def _require_retriever(self) -> EvidenceRetriever:
+        if self._retriever is None:
+            raise LiteratureServiceError(
+                LiteratureServiceErrorCode.RETRIEVAL_UNAVAILABLE,
+                "范围内检索未启用",
+            )
+        return self._retriever
+
+    def _require_answer_model(self) -> EvidenceAnswerModel:
+        if self._answer_model is None:
+            raise LiteratureServiceError(
+                LiteratureServiceErrorCode.ANSWER_MODEL_UNAVAILABLE,
+                "证据问答模型未配置",
+            )
+        return self._answer_model
 
     def _require_literature_source(self, project_path: str, source_id: str) -> Mapping[str, Any]:
         sources = self._project_store.read_sources(project_path)

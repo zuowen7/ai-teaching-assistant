@@ -141,6 +141,17 @@ def _text_hash(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
+def canonical_hash(value: Any) -> str:
+    """Public access to the canonical hash used by contract identifiers.
+
+    Callers outside this module (for example the P3 answer-model identity) must
+    hash configuration the same way contract identifiers do, so that a recorded
+    hash can be recomputed from the same inputs.
+    """
+
+    return _canonical_hash(value)
+
+
 def _require_aware_datetime(value: datetime, field_name: str) -> datetime:
     if value.tzinfo is None or value.utcoffset() is None:
         raise ValueError(f"{field_name} must include a timezone")
