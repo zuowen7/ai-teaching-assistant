@@ -926,23 +926,34 @@ V-14 与 V-15 是本次复核顺带修掉的**与文献链路无关的既存缺�
 | 新增 | `python/src/literature/providers/base.py` | LiteratureProvider 契约 | P1 已实现 |
 | 新增 | `python/src/literature/providers/arxiv.py` | arXiv 结构化实现 | P2A.1 已实现 |
 | 新增 | `python/src/literature/providers/fixture.py` | 离线契约测试与缓存演示实现 | P1 已实现 |
-| 新增 | `python/src/literature/service.py` | 搜索执行、强身份去重、项目批量入库和初始全文状态编排；完成并持久化检索计划；P2B 增加页级索引与证据解析；M5 增加开放全文获取与状态机；P3 增加 `answer_question` 与答案结果信封 | P2A.2–P2A.3、P2B、M5 已实现；P3 未开始 |
-| 新增 | `python/src/literature/evidence.py` | 页内切块、坐标/块身份派生、索引指纹与证据校验；回答结构化仍属于 P3 | P2B 证据校验已实现 |
+| 新增 | `python/src/literature/service.py` | 搜索执行、强身份去重、项目批量入库和初始全文状态编排；完成并持久化检索计划；P2B 增加页级索引与证据解析；M5 增加开放全文获取与状态机；P3 增加 `answer_question` 与答案结果信封 | P2A.2–P2A.3、P2B、M5、P3 已实现（复核后 `index_store_unavailable` / `retrieval_unavailable` 不再被折叠成 `insufficient`） |
+| 新增 | `python/src/literature/evidence.py` | 页内切块、坐标/块身份派生、索引指纹与证据校验；回答结构化仍属于 P3 | P2B、P3 已实现 |
 | 新增 | `python/src/literature/fulltext.py` | M5 开放全文获取：只认 open + https 的 PDF 位置，大小/超时/Content-Type/魔数校验，显式错误码 | 已实现（2026-09-22） |
-| 新增 | `python/src/literature/answer.py` | P3 提示构造、模型输出解析、白名单与页码一致性校验、拒答原因（§5.9） | 未开始 |
-| 新增 | `python/src/literature/answer_model.py` | P3 `ModelIdentity`、`EvidenceAnswerModel` 窄协议与既有 Provider 适配器（D-028） | 未开始 |
-| 新增 | `python/routers/literature.py` | Literature API 与现有 Project 存储的窄适配层；接收检索计划草案；P2B 增加索引与证据路由；M5 增加全文获取路由；P3 增加答案路由与范围检索适配器 | P2A.2–P2A.3、P2B、M5 已实现；P3 未开始 |
-| 修改 | `python/api_factory.py` | 注册 Literature API，并在应用生命周期关闭 Provider 资源；P2B 注入 RAG 页级索引适配器；P3 用既有 Provider 工厂装配答案模型（D-028） | P2A.2、P2B 已实现；P3 未开始 |
+| 新增 | `python/src/literature/answer.py` | P3 提示构造、模型输出解析、白名单与页码一致性校验、拒答原因（§5.9） | P3 已实现（复核后定位词表扩展为多语言，仍属有限枚举） |
+| 新增 | `python/src/literature/answer_model.py` | P3 `ModelIdentity`、`EvidenceAnswerModel` 窄协议与既有 Provider 适配器（D-028）；D-042 增加 JSON Output 模式、8192 输出预算、thinking/温度如实记录与空响应显式报错 | P3 已实现；D-042 已落地（2026-09-29） |
+| 新增 | `python/src/literature/fixture_answer_model.py` | D-040 确定性抽取式答案模型：不读问题、只抽取证据原文，身份为 `fixture / deterministic-extractive-v1`，仅显式开启时使用 | 已实现（2026-09-29） |
+| 新增 | `python/src/literature/demo_corpus.py`、`demo_run.py` | 固定演示语料的读取/校验/离线 PDF 物化；演示运行记录（步骤、状态、原因、耗时、计数、模式、`project_path`、语料声明的预期失败） | 已实现（2026-09-29，P4） |
+| 新增 | `python/src/net_env.py` | 入口级网络环境整理：丢弃 httpx 无法解析的 `NO_PROXY` 条目（方括号 IPv6 会让客户端构造直接抛错）；`api.py`、`create_app()`、演示 CLI 与测试共用 | 已实现（2026-09-29，V-16/V-14） |
+| 新增 | `python/routers/literature.py` | Literature API 与现有 Project 存储的窄适配层；接收检索计划草案；P2B 增加索引与证据路由；M5 增加全文获取路由；P3 增加答案路由与范围检索适配器 | P2A.2–P2A.3、P2B、M5、P3 已实现（复核后错误体携带 `details`） |
+| 修改 | `python/api_factory.py` | 注册 Literature API，并在应用生命周期关闭 Provider 资源；P2B 注入 RAG 页级索引适配器；P3 用既有 Provider 工厂装配答案模型（D-028）；D-040/D-042 增加 `literature.answer.mode` 与 `max_tokens`、入口级代理环境整理 | P2A.2、P2B、P3、P4、A1 已实现 |
+| 修改 | `python/api.py` | 启动时整理代理环境，避免 httpx 在客户端构造阶段抛错（V-16） | 已实现（2026-09-29） |
+| 修改 | `python/src/agent_v2/providers/openai_compat.py` | D-042：非流式 `chat` 增加可选 `response_format`（答案调用用 JSON Output，Agent 循环不受影响） | 已实现（2026-09-29） |
+| 修改 | `python/src/llm_request_policy.py` | 官方把 V4.1 Flash 改名为 `deepseek-flash` 后，思考模式默认与 `reasoning_effort` 开关仍须匹配该系列（同时保留旧别名） | 已实现（2026-09-29，V-22） |
+| 新增 | `python/scripts/literature_demo.py` | 固定演示 CLI：按 §7.1 顺序驱动既有 HTTP API，先确认项目目标，写运行记录（D-034、D-041） | 已实现（2026-09-29，P4） |
+| 新增 | `python/scripts/literature_live_check.py` | 对运行中的服务做真实模型答案契约检查：打印结论、证据页码/原文、被拒结论与未解析项；退出码 0/1/2 | 新增（2026-09-29，§5.14 的复现入口） |
+| 新增 | `config/literature_demo_corpus.json` | 固定合成演示语料（3 条记录、逐页文本、无 DOI/arXiv 编号、声明预期失败 `acquire_fulltext: access_unavailable`） | 已实现（2026-09-29，P4） |
 | 修改 | `python/routers/project.py` | P2A.2 共享清单事务锁、内部路径与 manifest 版本边界；P2B 补页结构与文档哈希 | P2A.2、P2B 已实现 |
 | 修改 | `python/src/utils/atomic_io.py` | 提供同进程路径级可重入事务锁；不承诺跨进程协调 | P2A.2 后端已实现 |
-| 修改 | `python/routers/rag.py` | 页级 chunk、证据 metadata、索引版本和范围约束；P3 把范围检索抽成路由与问答服务共用的调用，并按 D-032 把存储键改为 `<doc_id>::<chunk_id>` | P2B 已实现（新增 `project_scoped` 查询模式；展平通道保持不变）；P3 进行中 |
+| 修改 | `python/routers/rag.py` | 页级 chunk、证据 metadata、索引版本和范围约束；P3 把范围检索抽成路由与问答服务共用的调用，并按 D-032 把存储键改为 `<doc_id>::<chunk_id>` | P2B、P3 已实现（新增 `project_scoped` 查询模式；展平通道保持不变） |
 | 修改 | `src/composables/useSourceLibrary.ts` | P2B：把"建立索引"动作切到页级证据通道（PDF + 文献条目），其它来源保持展平通道 | P2B 已实现 |
-| 修改 | `python/src/agent_v2/tools/academic_tools.py` | 用结构化 Literature/RAG 工具替代原始 XML 与无范围查询；A1 增加 `literature_sources` 与证据不足后的 `next_actions` | A1 工具层已实现（2026-09-29，见 5.11、5.12） |
+| 修改 | `python/src/agent_v2/tools/academic_tools.py` | 用结构化 Literature/RAG 工具替代原始 XML 与无范围查询；A1 增加 `literature_sources`、`literature_providers` 与证据不足后的 `next_actions` | A1 工具层已实现（2026-09-29，见 5.11、5.12、D-043） |
 | 新增 | `src/composables/useLiteratureDiscovery.ts` | 检索、选择、入库和状态管理 | P2A.3 已实现 |
-| 新增 | `src/composables/useLiteratureAnswer.ts` | P3 多文献范围选择、问答请求、结论与证据状态（§5.9） | 未开始 |
-| 修改 | `src/components/SourceLibraryView.vue` | P2A.3：公开发现、检索计划确认、结果回执和多选入库；P3 增加多文献问答、证据展开与"获取开放全文"入口 | P2A.3 已实现；P3 未开始 |
-| 新增/修改 | `python/tests/`、`src/__tests__/` | 契约、状态机、页码证据和端到端回归；A1 增加 Agent 工具接入与计划、确认、失败处理覆盖 | P1–P2B 已实现；P3 以后未开始 |
-| 后续新增 | `methods/literature_poc/` | 正式 RQ、语料、gold、协议和运行记录 | 未开始 |
+| 新增 | `src/composables/useLiteratureAnswer.ts` | P3 多文献范围选择、问答请求、结论与证据状态（§5.9）；复核后按 `status` 收敛 claims/evidence | P3 已实现（2026-09-29，V-2） |
+| 新增 | `src/components/AgentLiteratureEvidence.vue` | A1：把 Agent 的 `literature_answer` 工具结果渲染为结论卡片与可展开证据；非 JSON 回退原文 | A1 已实现（2026-09-29） |
+| 修改 | `src/components/SourceLibraryView.vue` | P2A.3：公开发现、检索计划确认、结果回执和多选入库；P3 增加多文献问答、证据展开与"获取开放全文"入口；复核后禁用未建索引的来源 | P2A.3、P3、A1 已实现 |
+| 新增/修改 | `python/tests/`、`src/__tests__/` | 契约、状态机、页码证据和端到端回归；A1 增加 Agent 工具接入与计划、确认、失败处理覆盖；此后新增真实 uvicorn 子进程的 CLI 端到端、以及 `tests/conftest.py` 的代理环境整理 | P1–P4、A1 已实现；全量 3118 passed / 0 failed（2026-09-29） |
+| 新增 | `methods/literature_poc/METHODOLOGY.md` | 正式 RQ、语料、gold、协议和运行记录 | **未生效骨架**：逐项标注【待确认】，需用户与指导教师填写（D-039） |
+| 新增 | `methods/literature_poc/runs/` | 每次演示运行一份 JSON 记录 | 已实现（由 CLI 写入；目录本身不入库） |
 
 ## 11. 首版完成定义
 
@@ -959,6 +970,10 @@ V-14 与 V-15 是本次复核顺带修掉的**与文献链路无关的既存缺�
 9. 未把技术验证外推成教学效果、生产能力或商业数据库适配完成；
 10. Git 基线、模型、provider、parser、chunker 与 embedding 配置可追踪。
 
-依据 D-026，正式开题所承诺的智能体版本还须通过 A1。M1–M10 全部通过但 A1 未通过时，可报告“确定性文献证据链已跑通、Agent 接入待完成”，不得报告整个毕设系统已经完成。
+依据 D-026，正式开题所承诺的智能体版本还须通过 A1。截至 2026-09-29 的诚实口径：
 
-在此之前，只能报告“部分链路已完成”，不能报告“系统已跑通”。
+- **十项技术条件**（上表 1–10）现均有实现与分层验证证据：M1–M10 + P4 的分层结果见 §5.2–§5.10，A1 的工具层/会话级/前端展示见 §5.11–§5.12，独立复核与订正见 §5.13，真实模型一次性观测见 §5.14；全量回归 3118 passed / 0 failed。
+- **A1 阶段门**：工具层、会话级验收（真实运行时 + 脚本模型）、前端引用展示均已完成；真实 arXiv 与真实模型的行为已各做一次性观测，但**只覆盖一个模型、一套配置**（§5.14），因此 A1 视为"证据齐备但观测面窄"，报告中必须同时写出这一限制。
+- **仍不满足"效果已跑通"**：第十一节谈的是技术链路，不是效果。正式 RQ、语料、gold、指标与阈值仍在 `methods/literature_poc/METHODOLOGY.md` 中标注【待确认】（D-039），在此之前不得报告检索质量、回答正确性、教学效果或生产可用性。
+
+因此当前可报告的准确说法是："**证据可追溯的文献检索问答链路已实现并通过分层验证，含一次真实模型观测；质量结论待方法协议冻结后另行测量。**"在此之前，不得报告"整个系统已完成"或"效果良好"。

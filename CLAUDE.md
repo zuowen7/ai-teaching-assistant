@@ -59,7 +59,7 @@ cd python && python api.py            # Start API server on :18088
 SSE events (all prefixed `translate.`): `progress` -> `parsed` -> `cleaned` -> `chunked` -> `block_translated`(xN) -> `complete`. Side events: `chunk_done` / `chunk_error` / `qa_warnings`; fatal: `error`. **Keep backend and frontend event names in sync.**
 
 **Agent V2** (ConversationRuntime, `useAgentChat.ts` -> `src/agent_v2/router.py` -> `src/agent_v2/runtime/conversation.py`):
-Architecture inspired by [ultraworkers/claw-code](https://github.com/ultraworkers/claw-code). SSE events: `session_started` / `token` / `thought` / `tool_call` / `tool_result` / `await_approval` / `approval_received` / `response` / `error` / `done` / `aborted` / `checkpoint`. Agent operates on workspace folder, calling `read_file / write_file / str_replace / grep_files / glob_files / list_dir / run_command / rag_search / web_search / web_fetch / translate_document / export_document / arxiv_search / run_sub_agent`. File modifications trigger `checkpoint` SSE → frontend refreshes file tree + editor. Approval flow pauses SSE stream for user decision (accept/reject).
+Architecture inspired by [ultraworkers/claw-code](https://github.com/ultraworkers/claw-code). SSE events: `session_started` / `token` / `thought` / `tool_call` / `tool_result` / `await_approval` / `approval_received` / `response` / `error` / `done` / `aborted` / `checkpoint`. Agent operates on workspace folder, calling `read_file / write_file / str_replace / grep_files / glob_files / list_dir / run_command / rag_search / web_search / web_fetch / translate_document / export_document / run_sub_agent` plus the seven evidence-traceable literature tools (`literature_search / literature_providers / literature_sources / literature_import / literature_acquire_fulltext / literature_index / literature_answer`; `arxiv_search` was removed in D-031). File modifications trigger `checkpoint` SSE → frontend refreshes file tree + editor. Approval flow pauses SSE stream for user decision (accept/reject). **This file is background: `AGENTS.md` is the current map for agent, tool and provider behaviour.**
 
 **Provider auto-detection**: `ANTHROPIC_API_KEY` → Anthropic, `OPENAI_API_KEY` → OpenAI-compat, config `agent.*` → any provider, `translator.cloud.*` → DeepSeek, fallback to local Ollama. Model aliases from config (`haiku`, `sonnet`, `opus`, `ds`, `4o`).
 
@@ -94,7 +94,9 @@ Key `src/` modules:
   - `runtime/compact.py` — Context compaction (950K threshold, summary generation)
   - `runtime/usage.py` — `UsageTracker` + `ModelPricing` (Claude/GPT/DeepSeek/Ollama per-1M-token pricing)
   - `tools/registry.py` — `ToolRegistry` (read_file/write_file/str_replace/grep/glob/list_dir/run_command); run_command uses bash_validation pipeline
-  - `tools/academic_tools.py` — translate_document/export_document/arxiv_search/rag_search/web_search/web_fetch
+  - `tools/academic_tools.py` — translate_document/export_document/rag_search/web_search/web_fetch + the 7 literature tools (search / providers / sources / import / acquire_fulltext / index / answer)
+  - `src/literature/` — the deterministic literature service behind those tools: `service.py`, `answer.py` (prompt + claim validation), `evidence.py` (coordinates → quote), `providers/` (arxiv + offline fixture corpus), `demo_corpus.py` / `demo_run.py` / `fixture_answer_model.py`
+  - `src/net_env.py` — `normalize_proxy_env()`: drops `NO_PROXY` entries httpx cannot parse (a bracketed `[::1]` makes client construction raise)
   - `tools/sub_agent.py` — `run_sub_agent` (audit/explain/implement/translate presets)
   - `providers/openai_compat.py` — `OpenAiCompatProvider` (streaming + non-streaming, 20+ providers)
   - `providers/quirks.py` — Per-provider behavioral flags (auto-detected from model/base_url)
@@ -161,7 +163,7 @@ vue-i18n v11 (Composition API). Locales in `src/i18n/locales/{zh-CN,en-US}.json`
 
 ### Cross-Cutting Patterns
 
-- **Windows proxy**: `httpx` hangs on import when `HTTP_PROXY` is set. `start_dev.bat` and Rust side clear proxy vars before spawning Python.
+- **Windows proxy**: `httpx` hangs on import when `HTTP_PROXY` is set. `start_dev.bat` and Rust side clear proxy vars before spawning Python. A `NO_PROXY` entry in bracketed IPv6 form (`[::1]`) makes httpx raise at client construction; `src/net_env.py` normalizes the list in `api.py`, `create_app()` and the demo CLI.
 - **SSE everywhere**: Backend `sse-starlette`, frontend shared `streamReader.ts`. `useTranslate.ts` retries up to 3x with 2s delay.
 - **PyInstaller dual-dir**: `BUNDLED_DIR` (read-only, `_MEIPASS`) vs `RUNTIME_DIR` (writable, beside exe). Config copied from bundle to runtime on first run.
 - **Docker mode**: `DOCKER_MODE` env var switches config to `docker.yaml`.
@@ -181,6 +183,7 @@ vue-i18n v11 (Composition API). Locales in `src/i18n/locales/{zh-CN,en-US}.json`
 | AI Editor (Monaco + Ghost Text + AI Panel + mid-stream reload) | B+ |
 | Cloud LLM providers (Claude/GPT/DeepSeek/Ollama, auto-detect, model aliases, provider quirks) | B+ |
 | RAG / Library (on-demand `rag_search`, translation auto-ingest) | B- |
+| Literature PoC (M1–M10 + A1: search → import → full text → page index → scoped evidence answer; 7 Agent tools; Source Library QA UI) | Feature-complete for the thesis chain; layered tests green, one real-model run recorded in `docs/literature-research-poc-plan.md` §5.14. No quality metrics yet — `methods/literature_poc/METHODOLOGY.md` is an unfilled skeleton |
 | Zotero integration (keyless local fallback + credential merge) | B- |
 | Vision / OCR (settings UI, cloud vision, Tesseract/PaddleOCR local fallback) | B- |
 
@@ -192,6 +195,9 @@ vue-i18n v11 (Composition API). Locales in `src/i18n/locales/{zh-CN,en-US}.json`
 - **Ledger routes use `?doc_id=` query param** (not path param) — doc_id is a full file path that may contain `/`.
 - **Agent V2 streaming**: ToolUseBlock not yielded individually in streaming — must extract from ProviderResponse.blocks.
 - **sudo -n/-i/-S flags**: `extract_sudo_inner()` in `bash_validation.py` — `-n`, `-i`, `-S` are sudo boolean flags (no argument). Do NOT add them to `flags_with_arg`. Adding them causes the parser to skip the actual command as if it were a flag argument.
+- **Thinking mode eats `max_tokens`**: with `thinking` enabled the reasoning tokens share the output budget, so a small budget returns `finish_reason=length` with empty content (the literature answer call hit this at 2048). Raise the budget (8192) and/or use the provider's JSON Output mode; never silently disable the user's thinking mode to work around it.
+- **Vendor model renames break request policies**: `src/llm_request_policy.py` matches model-name prefixes; DeepSeek's rename to `deepseek-flash` silently disabled the non-thinking default and the `reasoning_effort` gate until the prefix list was updated.
+- **`NO_PROXY` with a bracketed IPv6 entry**: httpx raises `InvalidURL: Invalid port: ':1]'` at client construction, breaking health probes, literature providers and the demo CLI. `src/net_env.py` normalizes it at every entry point.
 
 ## Dependency Management
 

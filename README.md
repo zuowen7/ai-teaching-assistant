@@ -54,7 +54,7 @@ Pre-built installers: [Releases](https://github.com/zuowen7/scholar-assistant-ag
 > **Positioning: Claude Code for Papers.** Treat your research project as a workspace; the Agent reads/writes PDFs, drafts, bib files, and data directly — just like Claude Code edits source code. Agent V2 architecture inspired by [ultraworkers/claw-code](https://github.com/ultraworkers/claw-code).
 
 - **Agent V2 Runtime** — ConversationRuntime unified loop, real-time SSE streaming token-by-token; 3-retry error recovery; planning detection + auto-retry; 9 runtime modules independently reimplemented in Python, with architecture inspired by Claw Code (bash_validation, git_context, lsp_client, policy_engine, prompt_cache, recovery, sandbox, session_control, trident)
-- **17 Built-in Tools** — `read_file / write_file / str_replace / grep_files / glob_files / list_dir / run_command / rag_search / web_search / web_fetch / translate_document / export_document / arxiv_search / run_sub_agent` (4 presets: audit/explain/implement/translate); `run_command` protected by bash validation pipeline (read-only mode, destructive command warnings, path validation, command classification)
+- **Built-in Tools** — `read_file / write_file / str_replace / grep_files / glob_files / list_dir / run_command / rag_search / web_search / web_fetch / translate_document / export_document / run_sub_agent`, the argument readers (`read_argument_graph / read_argument_ledger / read_reviewer_state`), `todo_write`, and **7 evidence-traceable literature tools** (`literature_search / literature_providers / literature_sources / literature_import / literature_acquire_fulltext / literature_index / literature_answer`); `run_command` protected by bash validation pipeline (read-only mode, destructive command warnings, path validation, command classification)
 - **5-Tier Permission System** — ReadOnly / WorkspaceWrite / DangerFullAccess / Prompt / Allow with allow/deny/ask rule engine; all file ops locked to workspace boundary; sudo wrapping and sed -i blocked in read-only mode
 - **Real-time File Refresh** — Checkpoint SSE events after Agent writes; file tree and editor tabs update instantly
 - **Approval Flow with Pause** — SSE stream pauses on write_file/str_replace; editor shows diff preview (red/green highlights) with Accept/Reject
@@ -68,6 +68,7 @@ Pre-built installers: [Releases](https://github.com/zuowen7/scholar-assistant-ag
 - **Provider Auto-detection** — Anthropic/OpenAI/DeepSeek/Ollama auto-detect; model aliases (haiku/sonnet/opus/ds/4o); provider quirks auto-adapt
 - **Cost Tracking** — Per-model pricing (Claude/GPT/DeepSeek/Ollama), real-time token and cost statistics
 - **Library (RAG)** — `rag_search` tool queries local vector DB; post-translation auto-ingest
+- **Evidence-Traceable Literature QA (毕设链路)** — the full research chain: confirmed query → arXiv (or the offline demo corpus) → normalized import into the project library → open PDF or a local attachment → page-level indexing → project/source-scoped retrieval → evidence-grounded multi-paper answer. Every displayed claim must resolve to a real page and an exact quote; quotes and coordinates are derived server-side (a caller cannot submit either), claims are machine-validated before rendering, and "no evidence" is an explicit insufficiency instead of an invented citation. In the UI: Source Library → **文献证据问答** (scope + question + expandable citations), and the Agent renders `literature_answer` results as citation cards. Offline demo: `SCHOLAR_LITERATURE_ANSWER_MODE=fixture` uses a deterministic extractive model — it is **not** a language model and its output is labelled as such
 - **AI Polish / Expand / Coherence / Compliance** — Operate on selected text via the AI Panel
 - **Inline Ghost Text** — Monaco Editor auto-requests completions 1.5s after typing; Tab to accept
 
@@ -268,6 +269,30 @@ MSYS_NO_PATHCONV=1 docker run --rm \
 
 Translation SSE event order: `progress` → `parsed` → `cleaned` → `chunked` → `chunk_done`(×N) → `complete`
 
+### Literature demo & verification
+
+```bash
+cd python
+
+# Fixed 7-step demo (search → import → full text → index → answer), writes one run record
+python scripts/literature_demo.py --create-location /tmp/poc --provider fixture
+
+# Same demo against the live arXiv API (needs network + a configured model)
+python scripts/literature_demo.py --create-location /tmp/poc --provider arxiv
+
+# Answer-contract check against an already running server: prints claims, evidence
+# pages/quotes, rejected claims and unresolved items
+python scripts/literature_live_check.py --provider fixture
+
+# Offline/no-model fallback: deterministic extractive answering, clearly labelled
+SCHOLAR_LITERATURE_ANSWER_MODE=fixture python api.py
+```
+
+Run records land in `methods/literature_poc/runs/`. The offline demo corpus is
+synthetic (`config/literature_demo_corpus.json`) and exists for demos and
+regression only — it is not evaluation data, and the project's metrics protocol
+(`methods/literature_poc/METHODOLOGY.md`) is still an unfilled skeleton.
+
 ### Translation
 | Method | Path | Description |
 |--------|------|-------------|
@@ -312,6 +337,17 @@ Translation SSE event order: `progress` → `parsed` → `cleaned` → `chunked`
 | `POST` | `/api/rag/upload` | Upload file to RAG |
 | `POST` | `/api/rag/ingest` | Ingest text into RAG |
 | `DELETE` | `/api/rag/documents/{doc_id}` | Delete RAG document |
+
+### Literature / Evidence
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/api/literature/providers` | Registered providers with their `result_mode` (`live` / `fixture`) |
+| `POST` | `/api/literature/search` | Run a confirmed query; returns normalized records with access state |
+| `POST` | `/api/literature/import` | Import a search execution into the project source library |
+| `POST` | `/api/literature/fulltext` | Acquire the declared open PDF (`access_unavailable` / `acquire_failed` on failure) |
+| `POST` | `/api/literature/index` | Build the page-level index for one source |
+| `POST` | `/api/literature/answer` | Multi-paper evidence answer: claims + page-level evidence, or an explicit `insufficient` |
+| `POST` | `/api/literature/evidence` | Resolve one chunk back to page + exact quote (coordinates are server-derived) |
 
 ### Argument Map (v2)
 | Method | Path | Description |
